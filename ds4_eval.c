@@ -1574,10 +1574,15 @@ static ds4_backend parse_backend(const char *s, const char *opt) {
 #else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
 #endif
+#ifdef DS4_VULKAN_BUILD
+    if (!strcmp(s, "vulkan")) return DS4_BACKEND_VULKAN;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-eval: invalid value for %s: %s\n", opt, s);
 #ifdef DS4_ROCM_BUILD
     fprintf(stderr, "ds4-eval: valid backends are: metal, rocm, cpu\n");
+#elif defined(DS4_VULKAN_BUILD)
+    fprintf(stderr, "ds4-eval: valid backends are: metal, vulkan, cpu\n");
 #else
     fprintf(stderr, "ds4-eval: valid backends are: metal, cuda, cpu\n");
 #endif
@@ -1589,6 +1594,8 @@ static ds4_backend default_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_VULKAN_BUILD)
+    return DS4_BACKEND_VULKAN;
 #else
     return DS4_BACKEND_CUDA;
 #endif
@@ -1714,6 +1721,10 @@ static eval_config parse_options(int argc, char **argv) {
 #else
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = DS4_BACKEND_CUDA;
+#endif
+#ifdef DS4_VULKAN_BUILD
+        } else if (!strcmp(arg, "--vulkan")) {
+            c.backend = DS4_BACKEND_VULKAN;
 #endif
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;

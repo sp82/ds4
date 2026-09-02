@@ -153,6 +153,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
+#elif defined(DS4_VULKAN_BUILD)
+    opt(fp, c, "--metal | --vulkan | --cpu", "Select the backend explicitly.");
+    opt(fp, c, "--backend NAME", "Backend name: metal, vulkan, or cpu.");
 #else
     opt(fp, c, "--metal | --cuda | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, cuda, or cpu.");

@@ -14301,10 +14301,15 @@ static ds4_backend parse_backend_arg(const char *s, const char *arg) {
 #else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
 #endif
+#ifdef DS4_VULKAN_BUILD
+    if (!strcmp(s, "vulkan")) return DS4_BACKEND_VULKAN;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
 #ifdef DS4_ROCM_BUILD
     server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, rocm, cpu");
+#elif defined(DS4_VULKAN_BUILD)
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, vulkan, cpu");
 #else
     server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
 #endif
@@ -14316,6 +14321,8 @@ static ds4_backend default_server_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_VULKAN_BUILD)
+    return DS4_BACKEND_VULKAN;
 #else
     return DS4_BACKEND_CUDA;
 #endif
@@ -14518,6 +14525,10 @@ static server_config parse_options(int argc, char **argv) {
 #else
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+#endif
+#ifdef DS4_VULKAN_BUILD
+        } else if (!strcmp(arg, "--vulkan")) {
+            c.engine.backend = DS4_BACKEND_VULKAN;
 #endif
         } else if (!strcmp(arg, "--gpu-vram")) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);

@@ -32933,6 +32933,10 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) 
     (void)bytes;
 }
 
+extern "C" void ds4_gpu_set_streaming_expert_cache_layer_count(uint32_t layers) {
+    (void)layers;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     return 0;
 }

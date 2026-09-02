@@ -33,6 +33,7 @@
 /tests/test_mxfp4_dot
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
+/tests/test_vulkan_smoke
 /tests/test_sampling
 /tests/test_quality_api
 /tests/test_cuda_q8_scratch
@@ -56,3 +57,9 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/vulkan/AGENTS.md
+/vulkan/shaders/ds4_vulkan_shaders.inc
+/vkbench
+/vulkan/tools/vkbench/vkbench.o
+/.clangd
+/compile_commands.json
