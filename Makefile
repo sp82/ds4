@@ -69,7 +69,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm vulkan vkbench test-vulkan-smoke
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
@@ -288,6 +288,8 @@ help:
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make vulkan              Build the Vulkan backend (Linux, single-GPU)"
+	@echo "  make vkbench             Build the GPU benchmark (vulkan/tools/vkbench)"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -309,6 +311,13 @@ cuda:
 		exit 2; \
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
+
+vulkan:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent vkbench \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o ds4_layer_pack.o" \
+		CFLAGS="$(CFLAGS) -DDS4_VULKAN_BUILD" \
+		DS4_LINK="g++ -std=c++17 -pthread -rdynamic" \
+		DS4_LINK_LIBS="-lm -lvulkan"
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
@@ -825,6 +834,62 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_tp.h ds4_gpu_mgpu.h ds4_
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
+VULKAN_SHADER_INC = vulkan/shaders/ds4_vulkan_shaders.inc
+
+vulkan/shaders/iq2_tables.hlsl vulkan/shaders/iq2_tables_host.h: vulkan/shaders/gen_iq2_tables.py cuda/mmq/ggml-common.h
+	python3 vulkan/shaders/gen_iq2_tables.py
+
+$(VULKAN_SHADER_INC): vulkan/shaders/gen_shaders.py vulkan/shaders/common.hlsl vulkan/shaders/iq2_tables.hlsl vulkan/shaders/unary.hlsl vulkan/shaders/argmax.hlsl vulkan/shaders/sort.hlsl vulkan/shaders/rmsnorm.hlsl vulkan/shaders/rope.hlsl vulkan/shaders/matmul_q8.hlsl vulkan/shaders/matmul_q8_preq.hlsl vulkan/shaders/matmul_q8_kslice.hlsl vulkan/shaders/quantize_q8.hlsl vulkan/shaders/top1.hlsl vulkan/shaders/f16_conv.hlsl vulkan/shaders/matmul_f16.hlsl vulkan/shaders/matmul_f32.hlsl vulkan/shaders/embed.hlsl vulkan/shaders/kv.hlsl vulkan/shaders/attention.hlsl vulkan/shaders/router.hlsl vulkan/shaders/moe.hlsl vulkan/shaders/moe_iq2.hlsl
+	python3 vulkan/shaders/gen_shaders.py
+
+ds4_vulkan.o: vulkan/ds4_vulkan.c ds4_gpu.h ds4_gpu_mgpu.h $(VULKAN_SHADER_INC)
+	g++ -std=c++17 -fno-finite-math-only -g $(NATIVE_CPU_FLAG) -Wall -Wextra -D_GNU_SOURCE -DDS4_VULKAN_BUILD -I. -Ivulkan -I/usr/include/vulkan -c -o $@ vulkan/ds4_vulkan.c
+
+ds4_vulkan_compat.o: vulkan/ds4_vulkan_compat.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
+	g++ -std=c++17 -fno-finite-math-only -g $(NATIVE_CPU_FLAG) -Wall -Wextra -D_GNU_SOURCE -DDS4_VULKAN_BUILD -I. -I/usr/include/vulkan -c -o $@ vulkan/ds4_vulkan_compat.c
+
+ds4_vulkan_unavailable.o: vulkan/ds4_vulkan_unavailable.c
+	g++ -std=c++17 -fno-finite-math-only -g $(NATIVE_CPU_FLAG) -Wall -Wextra -D_GNU_SOURCE -DDS4_VULKAN_BUILD -I. -c -o $@ vulkan/ds4_vulkan_unavailable.c
+
+tests/test_vulkan_smoke.o: tests/test_vulkan_smoke.c ds4_gpu.h vulkan/shaders/iq2_tables_host.h
+	gcc $(CFLAGS) -I. -c -o $@ tests/test_vulkan_smoke.c
+
+tests/test_vulkan_smoke: tests/test_vulkan_smoke.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
+	g++ -std=c++17 -pthread -o $@ $^ -lvulkan -lm
+
+test-vulkan-smoke: tests/test_vulkan_smoke
+	./tests/test_vulkan_smoke
+
+# --- vkbench GPU benchmark (vulkan/tools/vkbench) ---------------------------
+VKBENCH_DIR = vulkan/tools/vkbench
+VKBENCH_HDRS = $(VKBENCH_DIR)/saxpy_spv.h $(VKBENCH_DIR)/madloop_spv.h
+
+# Grouped target (&:): one recipe run generates BOTH headers.  A plain
+# multi-target rule makes -j run the recipe once per target, racing the
+# shared /tmp/vkbench_spv_tmp.bin and failing builds intermittently.
+$(VKBENCH_HDRS) &: $(VKBENCH_DIR)/gen_vkbench_shaders.py \
+                   $(VKBENCH_DIR)/saxpy.hlsl $(VKBENCH_DIR)/madloop.hlsl
+	python3 $(VKBENCH_DIR)/gen_vkbench_shaders.py
+
+$(VKBENCH_DIR)/vkbench.o: $(VKBENCH_DIR)/vkbench.c $(VKBENCH_HDRS)
+	gcc $(CFLAGS) -I$(VKBENCH_DIR) -c -o $@ $(VKBENCH_DIR)/vkbench.c
+
+vkbench: $(VKBENCH_DIR)/vkbench.o
+	gcc -o $@ $^ -lvulkan -lm
+
+.PHONY: vkbench
+
+# --- kbench kernel microbenchmark (vulkan/tools/kbench, Fase 7 tuning) -------
+KBENCH_DIR = vulkan/tools/kbench
+
+$(KBENCH_DIR)/kbench.o: $(KBENCH_DIR)/kbench.c ds4_gpu.h
+	gcc $(CFLAGS) -I. -c -o $@ $(KBENCH_DIR)/kbench.c
+
+kbench: $(KBENCH_DIR)/kbench.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
+	g++ -std=c++17 -pthread -o $@ $^ -lvulkan -lm
+
+.PHONY: kbench
+
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -1087,7 +1152,7 @@ clean:
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent vkbench vulkan/tools/vkbench/vkbench.o ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_vulkan_smoke tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
 	rm -f speed-bench/session_concurrency_bench
 

@@ -427,13 +427,15 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
+    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA ||
+           backend == DS4_BACKEND_VULKAN;
 }
 
 static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
-    if (backend == DS4_BACKEND_CUDA) {
-#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+    if (backend == DS4_BACKEND_CUDA || backend == DS4_BACKEND_VULKAN) {
+#if defined(DS4_ROCM_BUILD) || defined(DS4_VULKAN_BUILD) || \
+    (!defined(DS4_NO_GPU) && !defined(__APPLE__))
         return true;
 #else
         return false;
@@ -444,21 +446,23 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
 
 static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD)
     if (backend == DS4_BACKEND_CUDA) return true;
-#else
-    (void)backend;
 #endif
+#if defined(DS4_VULKAN_BUILD)
+    if (backend == DS4_BACKEND_VULKAN) return true;
+#endif
+    (void)backend;
     return false;
 }
 
 static bool ds4_backend_supports_glm_streaming_full_layers(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD)
     if (backend == DS4_BACKEND_CUDA) return true;
-#else
-    (void)backend;
 #endif
+    /* GLM is out of scope for the Vulkan backend (see vulkan/SPEC.md). */
+    (void)backend;
     return false;
 }
 
@@ -8381,6 +8385,7 @@ static bool glm_stream_selected_expert_cache_supported(
     return false;
 }
 
+#if !defined(DS4_VULKAN_BUILD)
 static bool glm_stream_decode_experts_are_streamed(
         const ds4_weights       *w,
         const ds4_layer_weights *l,
@@ -8389,6 +8394,7 @@ static bool glm_stream_decode_experts_are_streamed(
     return glm_stream_expert_cache_addr_layout_supported(w, l, il) ||
            glm_stream_selected_expert_cache_supported(l, il);
 }
+#endif
 
 static bool glm_stream_decode_expert_cache_ready(
         const ds4_weights       *w,
@@ -8412,6 +8418,46 @@ static bool glm_stream_decode_expert_cache_ready(
 #endif
 }
 
+#if defined(DS4_VULKAN_BUILD)
+/* The Vulkan expert pool (Fase 6 step 3) serves the routed experts of the
+ * quant formats the engine drives through begin_selected_load /
+ * prepare_selected_batch (IQ2_XXS gate/up + Q2_K down, Q4_K, MXFP4).  For
+ * those formats the decode/static maps must NOT include the full expert
+ * blobs: the pool holds them device-local and the blob tensors spread the
+ * interleaved GGUF over ~80 GiB (progress.md §3l).  Any other format keeps
+ * the pre-pool behaviour (experts read straight from the staged windows). */
+static bool vulkan_streaming_pool_format(const ds4_layer_weights *l) {
+    if (!l || !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
+        return false;
+    }
+    const bool iq2 =
+        l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    const bool q4 =
+        l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        l->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+    const bool mxfp4 =
+        l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+        l->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
+        l->ffn_down_exps->type == DS4_TENSOR_MXFP4;
+    return iq2 || q4 || mxfp4;
+}
+
+static bool vulkan_streaming_pool_active(const ds4_weights *w) {
+    if (!w || DS4_N_LAYER == 0) return false;
+    /* A distributed slice process only loads a contiguous layer range (the
+     * non-sliced path loads layer 0 first), so layer[0] may be NULL there;
+     * check every loaded layer so the pool is considered active also on a
+     * slice whose range starts past 0 (otherwise the decode maps fall back
+     * to the full expert windows, ~1.8 GB/layer instead of the pool). */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (vulkan_streaming_pool_format(&w->layer[il])) return true;
+    }
+    return false;
+}
+#endif
 /*
  * Decode-time spans for one layer. The static set excludes routed expert
  * tensors only when the streaming expert-cache path can really serve them.
@@ -8425,6 +8471,19 @@ static void model_map_span_vec_include_layer_decode(
         uint32_t                il) {
     const ds4_layer_weights *l = &w->layer[il];
     model_map_span_vec_include_layer_decode_static(spans, l);
+    /* Vulkan reads the routed experts straight from the staged model windows
+     * (per-offset MoE, no pointer-table), so the decode layer map must include
+     * them; the streaming-expert cache only substitutes them on the CUDA/ROCm
+     * pointer-table paths.  Exception (Fase 6 step 3): when the Vulkan expert
+     * pool is active the experts are served from the device-local pool, so the
+     * full expert blobs must NOT be mapped here. */
+#if defined(DS4_VULKAN_BUILD)
+    if (!vulkan_streaming_pool_active(w)) {
+        model_map_span_vec_include_one(spans, l->ffn_gate_exps);
+        model_map_span_vec_include_one(spans, l->ffn_up_exps);
+        model_map_span_vec_include_one(spans, l->ffn_down_exps);
+    }
+#else
     if (!weights_streaming_layer_experts_uniform(w, il) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
          !glm_stream_decode_experts_are_streamed(w, l, il)) ||
@@ -8433,10 +8492,20 @@ static void model_map_span_vec_include_layer_decode(
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
         model_map_span_vec_include_one(spans, l->ffn_down_exps);
     }
+#endif
 }
 
 static bool weights_model_map_decode_static_supported(const ds4_weights *w) {
     if (!w) return false;
+#if defined(DS4_VULKAN_BUILD)
+    /* Vulkan stages the model per layer (Fase 6 step 2 staging pool): the
+     * static decode map's span union covers the whole interleaved GGUF (~80
+     * GiB) and cannot be held in one pool, and the decode still needs the
+     * per-layer expert windows.  Exception (Fase 6 step 3): with the expert
+     * pool active the decode maps exclude the expert blobs, so the static map
+     * holds every layer's non-expert tensors and is staged a single time. */
+    return vulkan_streaming_pool_active(w);
+#else
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return g_glm_streaming_runtime_static_map_enabled;
     }
@@ -8448,6 +8517,7 @@ static bool weights_model_map_decode_static_supported(const ds4_weights *w) {
         }
     }
     return true;
+#endif
 }
 
 static void model_map_span_vec_include_output(ds4_model_map_span_vec *spans, const ds4_weights *w) {
@@ -17424,6 +17494,7 @@ typedef struct {
     uint32_t streaming_preload_experts;
     bool ssd_streaming_cold;
     bool streaming_static_decode_map_current;
+    bool streaming_hotlist_seeded;   /* hotlist seeded once (decode-style path) */
     float *cpu_router_norm;
 
     /* Metal network tensor parallelism. These views alias engine-owned
@@ -19708,6 +19779,18 @@ static bool metal_graph_install_model_spans(
         const char                   *label) {
     if (!model || !spans || spans->len == 0) return false;
 
+    if (getenv("DS4_VULKAN_DEBUG_SPANS") != NULL) {
+        fprintf(stderr, "ds4: spans[%s] n=%u max_tensor_bytes=%llu\n",
+                label ? label : "?", spans->len,
+                (unsigned long long)spans->max_tensor_bytes);
+        for (uint32_t i = 0; i < spans->len; i++) {
+            fprintf(stderr, "ds4:   span[%u] off=%llu size=%llu iso=%d\n",
+                    i, (unsigned long long)spans->v[i].off,
+                    (unsigned long long)(spans->v[i].end - spans->v[i].off),
+                    spans->v[i].isolate ? 1 : 0);
+        }
+    }
+
     uint64_t *offsets = xmalloc((size_t)spans->len * sizeof(offsets[0]));
     uint64_t *sizes = xmalloc((size_t)spans->len * sizeof(sizes[0]));
     for (uint32_t i = 0; i < spans->len; i++) {
@@ -19765,6 +19848,16 @@ static bool metal_graph_stream_decode_static_map_state_cache_enabled(void) {
 
 static bool metal_graph_stream_decode_layer_batch_enabled(
         const ds4_gpu_graph *g) {
+#if defined(DS4_VULKAN_BUILD)
+    /* Vulkan submits the whole token as one command buffer in the batched
+     * path; on a decode that is GPU-bound (~1 s/layer with the naive Fase-2
+     * kernels) a single submission runs for ~45 s and trips the amdgpu
+     * watchdog (mode1 GPU reset, "context is innocent").  Keep per-layer
+     * submissions (each well under the timeout) until the kernels are tuned
+     * (Fase 7). */
+    (void)g;
+    return false;
+#else
     return g &&
            g->ssd_streaming &&
            !g_expert_profile.active &&
@@ -19778,6 +19871,7 @@ static bool metal_graph_stream_decode_layer_batch_enabled(
                                   "DS4_METAL_DECODE_STAGE_PROFILE") &&
            !glm_graph_env_present("DS4_ROCM_GRAPH_DUMP_PREFIX",
                                   "DS4_METAL_GRAPH_DUMP_PREFIX");
+#endif
 }
 
 static void metal_graph_stream_readahead_range_impl(
@@ -21698,6 +21792,36 @@ static bool metal_graph_stream_map_decode_static_all(
     return ok;
 }
 
+/* Slice-scoped variant of metal_graph_stream_map_decode_static_all: stages
+ * the non-expert decode windows of [layer_start, layer_end] once (plus the
+ * token embedding and/or the output head when requested), so the distributed
+ * layer-slice decode reuses them across every token instead of re-staging the
+ * layer windows per token (Vulkan: vulkan_set_span_windows destroys+re-uploads
+ * on every call, ~144 MB/layer — the distributed path was ~2x slower). */
+static bool metal_graph_stream_map_decode_static_slice(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               include_token,
+        bool               include_output) {
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_decode_static_slice_spans(weights,
+                                                     layer_start,
+                                                     layer_end,
+                                                     include_token,
+                                                     include_output,
+                                                     &spans)) {
+        fprintf(stderr,
+                "ds4: Metal SSD streaming could not build static decode slice spans\n");
+        return false;
+    }
+    const bool ok = metal_graph_install_model_spans(model, &spans,
+                                                    "static decode slice");
+    free(spans.v);
+    return ok;
+}
+
 static bool metal_graph_stream_map_layer(
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -22443,6 +22567,14 @@ static bool metal_graph_attention_output_dense_quant_batch(
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
 
+/* Forward declaration: the decode-style streaming prefill (Vulkan path,
+ * ca52c53) seeds the expert pool from the hotlist inside the first token
+ * eval, before the layer-major definition below. */
+static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights);
+
 static bool metal_graph_use_pro_q4_cpu_router(void) {
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_PRO_Q4_CPU_ROUTER", &cache);
@@ -22477,7 +22609,8 @@ static bool metal_graph_use_q4_selected_shared_overlap(
 }
 
 static bool metal_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g) {
-#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__) && \
+    !defined(DS4_VULKAN_BUILD)
     return g &&
            g->ssd_streaming &&
            getenv("DS4_CUDA_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL;
@@ -22504,6 +22637,12 @@ static bool metal_graph_q4_selected_paths_allowed(const ds4_gpu_graph *g) {
 }
 
 static bool metal_graph_use_iq2_selected_shared_overlap(const ds4_gpu_graph *g) {
+    /* Fase 7: attivo anche su Vulkan.  Il worker async (sync readback con
+     * fence reale + store su command buffer dedicata + commit fence per-
+     * submit) è stabile e corretto (output identico al path sync).  Fix
+     * applicati: drain in vulkan_dispatch_begin (riuso di g_cmd in volo ->
+     * GPUVM fault) e mutex su vulkan_device_wait (vkResetDescriptorPool
+     * concorrente -> double free RADV). */
     return g &&
            g->ssd_streaming &&
            getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") == NULL &&
@@ -23508,6 +23647,7 @@ static pthread_t g_metal_graph_selected_async_load_thread;
 static bool g_metal_graph_selected_async_load_thread_started = false;
 static bool g_metal_graph_selected_async_load_has_job = false;
 static bool g_metal_graph_selected_async_load_done = false;
+static bool g_metal_graph_selected_async_load_stop = false;
 static metal_graph_selected_async_load g_metal_graph_selected_async_load_job;
 
 static void metal_graph_selected_async_load_run(
@@ -23520,7 +23660,7 @@ static void metal_graph_selected_async_load_run(
         return;
     }
     if (job->event_value != 0) {
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) || defined(DS4_VULKAN_BUILD)
         if (ds4_gpu_tensor_read_after_selected_event(
                     job->router_selected,
                     0,
@@ -23563,7 +23703,7 @@ static void metal_graph_selected_async_load_run(
                                        job->il,
                                        job->gate_expert_bytes,
                                        job->down_expert_bytes);
-    if (ds4_gpu_stream_expert_cache_begin_selected_load(
+    if (ds4_gpu_stream_expert_cache_begin_selected_load_async(
                 &table,
                 job->selected_ids,
                 DS4_N_EXPERT_USED) == 0) {
@@ -23583,9 +23723,15 @@ static void *metal_graph_selected_async_load_worker_main(void *arg) {
 #endif
     for (;;) {
         pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
-        while (!g_metal_graph_selected_async_load_has_job) {
+        while (!g_metal_graph_selected_async_load_has_job &&
+               !g_metal_graph_selected_async_load_stop) {
             pthread_cond_wait(&g_metal_graph_selected_async_load_cond,
                               &g_metal_graph_selected_async_load_mutex);
+        }
+        if (g_metal_graph_selected_async_load_stop &&
+            !g_metal_graph_selected_async_load_has_job) {
+            pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
+            return NULL;
         }
         metal_graph_selected_async_load job =
             g_metal_graph_selected_async_load_job;
@@ -23625,6 +23771,25 @@ static bool metal_graph_selected_async_load_ensure_worker(void) {
     return true;
 }
 
+/* Fase 7: stop and join the async load worker before the backend teardown
+ * frees the pool/staging tensors (otherwise the worker can race the cleanup
+ * and double-free g_pool_staging). */
+static void metal_graph_selected_async_load_stop(void) {
+    pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
+    if (!g_metal_graph_selected_async_load_thread_started) {
+        pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
+        return;
+    }
+    g_metal_graph_selected_async_load_stop = true;
+    pthread_cond_signal(&g_metal_graph_selected_async_load_cond);
+    pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
+    pthread_join(g_metal_graph_selected_async_load_thread, NULL);
+    pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
+    g_metal_graph_selected_async_load_thread_started = false;
+    g_metal_graph_selected_async_load_stop = false;
+    pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
+}
+
 static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
         metal_graph_selected_async_load *job,
         ds4_gpu_tensor                  *router_selected,
@@ -23649,6 +23814,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     if (g_metal_graph_selected_async_load_has_job ||
         g_metal_graph_selected_async_load_done) {
         pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
+        if (getenv("DS4_VULKAN_DEBUG_WORKER") != NULL)
+            fprintf(stderr, "ds4: worker dbg: async_load_start busy\n");
         return false;
     }
     g_metal_graph_selected_async_load_job = *job;
@@ -23682,7 +23849,11 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
 
 static bool metal_graph_selected_async_load_finish(
         metal_graph_selected_async_load *job) {
-    if (!job || !job->active) return false;
+    if (!job || !job->active) {
+        if (getenv("DS4_VULKAN_DEBUG_WORKER") != NULL)
+            fprintf(stderr, "ds4: worker dbg: finish not active\n");
+        return false;
+    }
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
     while (!g_metal_graph_selected_async_load_done) {
         pthread_cond_wait(&g_metal_graph_selected_async_load_done_cond,
@@ -25194,7 +25365,6 @@ static bool metal_graph_encode_decode_layer_phase(
                         DS4_RMS_EPS) == 1;
             }
             if (ok && emit && !comp_finalize_fuse) {
-#if defined(__APPLE__)
                 ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                         g->layer_index_comp_cache[il],
                         (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
@@ -25205,22 +25375,8 @@ static bool metal_graph_encode_decode_layer_phase(
                     ok = ds4_gpu_dsv4_indexer_qat_tensor(index_row_view,
                                                           1,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
+                    ds4_gpu_tensor_free(index_row_view);
                 }
-                ds4_gpu_tensor_free(index_row_view);
-#else
-                ds4_gpu_tensor index_row_view;
-                if (!metal_graph_borrow_tensor_view(
-                        &index_row_view,
-                        g->layer_index_comp_cache[il],
-                        (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
-                        (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float))) {
-                    ok = false;
-                } else {
-                    ok = ds4_gpu_dsv4_indexer_qat_tensor(&index_row_view,
-                                                          1,
-                                                          DS4_N_INDEXER_HEAD_DIM) != 0;
-                }
-#endif
                 DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_qat");
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
@@ -26897,6 +27053,17 @@ static bool metal_graph_encode_decode_layer_phase(
         if (ok && async_early_commit) {
             ok = ds4_gpu_flush_commands() != 0;
         }
+#if defined(DS4_VULKAN_BUILD)
+        /* The Vulkan readback signal submits and CLOSES the router scope;
+         * reopen one so the flush below can submit the shared-expert compute
+         * early (the GPU runs it while the worker stores the routed experts).
+         * Metal/ROCm leave their encoder open after the signal, so the shared
+         * dispatches already land in the open scope there.  The sync fallback
+         * (no worker) keeps the one-shot dispatches as before. */
+        if (ok && async_load_started) {
+            ok = ds4_gpu_begin_commands() != 0;
+        }
+#endif
         if (ok && fuse_shared_gate_up) {
             ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(metal_graph_shared_gate(g),
                                                              metal_graph_shared_up(g),
@@ -26946,6 +27113,12 @@ static bool metal_graph_encode_decode_layer_phase(
                 /* The worker read valid ids but could not stage the load
                  * (it is not allowed to wait on in-flight cache entries).
                  * This thread is, so retry the same load synchronously. */
+#if defined(DS4_VULKAN_BUILD)
+                /* The early flush reopened the shared-expert scope; close it
+                 * so the synchronous retry's one-shot store cannot end/break
+                 * it, then reopen for the MoE dispatch below. */
+                (void)ds4_gpu_end_commands();
+#endif
                 const ds4_gpu_stream_expert_table retry_table =
                     graph_stream_expert_table_make(model,
                                                    layer,
@@ -26960,6 +27133,9 @@ static bool metal_graph_encode_decode_layer_phase(
                     ds4_gpu_routed_moe_set_selected_override(
                             async_load.selected_ids,
                             DS4_N_EXPERT_USED) != 0;
+#if defined(DS4_VULKAN_BUILD)
+                if (finish_ok) ok = ds4_gpu_begin_commands() != 0;
+#endif
             }
             ok = ok && flush_ok && finish_ok;
         } else if (ok) {
@@ -27224,8 +27400,8 @@ static bool metal_graph_encode_decode_layer_phase(
         ds4_gpu_parallel_ffn_abort();
 #endif
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
-    if (ok) {
+        DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+        if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_up_clamped", metal_graph_routed_up(g),
@@ -33355,6 +33531,17 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     if (ok && !static_decode_map && DS4_N_LAYER > 0) {
         metal_graph_stream_readahead_layer_decode(model, weights, 0);
     }
+    /* Seed the expert pool from the static hotlist once, AFTER the static
+     * decode map is staged (the pool budget derives from the remaining free
+     * device-local memory).  The layer-major prefill path seeds from its own
+     * call site; the decode-style path (used on Vulkan, ca52c53) reaches it
+     * here so the pool is warm instead of empty. */
+    if (ok && g->ssd_streaming && !g->streaming_hotlist_seeded) {
+        g->streaming_hotlist_seeded = true;
+        ok = metal_graph_seed_streaming_expert_cache_from_hotlist(g,
+                                                                  model,
+                                                                  weights);
+    }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(g),
@@ -33419,8 +33606,9 @@ static bool metal_graph_eval_token_raw_swa_streaming(
 
     double encode_s = 0.0;
     double execute_s = 0.0;
+    const bool layer_profile = getenv("DS4_METAL_GRAPH_LAYER_PROFILE") != NULL;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        const double tl0 = profile ? now_sec() : 0.0;
+        const double tl0 = (profile || layer_profile) ? now_sec() : 0.0;
         if (!static_decode_map && !metal_graph_stream_map_layer_decode(model, weights, il)) {
             ok = false;
             break;
@@ -33451,12 +33639,21 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             g->after_ffn_hc_by_tier[g->active_tier] = tmp;
             if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
         }
-        const double tl_encoded = profile ? now_sec() : 0.0;
+        const double tl_encoded = (profile || layer_profile) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
-        const double tl_done = profile ? now_sec() : 0.0;
+        const double tl_done = (profile || layer_profile) ? now_sec() : 0.0;
         if (profile) {
             encode_s += tl_encoded - tl0;
             execute_s += tl_done - tl_encoded;
+        }
+        if (layer_profile) {
+            fprintf(stderr,
+                    "ds4: metal layer decode il=%u pos=%u static=%d encode=%.1f ms total=%.1f ms\n",
+                    il,
+                    pos,
+                    static_decode_map ? 1 : 0,
+                    (tl_encoded - tl0) * 1000.0,
+                    (tl_done - tl0) * 1000.0);
         }
     }
 
@@ -33547,6 +33744,7 @@ static bool metal_graph_eval_token_raw_swa(
     return ok;
 }
 
+#if !defined(DS4_VULKAN_BUILD)
 static bool metal_graph_streaming_decode_prefill_wide_default(
         const ds4_weights *weights) {
     if (DS4_MODEL_VARIANT != DS4_VARIANT_FLASH || !weights || DS4_N_LAYER == 0) {
@@ -33557,6 +33755,7 @@ static bool metal_graph_streaming_decode_prefill_wide_default(
            weights->layer[0].ffn_up_exps->type == type &&
            weights->layer[0].ffn_down_exps->type == type;
 }
+#endif
 
 static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
         const ds4_gpu_graph *g,
@@ -33580,11 +33779,23 @@ static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
         }
     }
 
+#if defined(DS4_VULKAN_BUILD)
+    /* The layer-major batch prefill seeds the expert pool with up to
+     * n_tokens*6 distinct experts per layer.  The pool holds 43 layers x
+     * ~22 slots and cannot grow to hold a multi-layer batch's experts
+     * (it would need ~GB per layer), so the seed exceeds pool_max_bytes
+     * and the FFN batch encode fails ("ffn batch encode failed").  Route
+     * every prefill through the decode-style streaming path (correct,
+     * token-at-a-time) until Vulkan has a batch expert-staging path. */
+    (void)weights;
+    return UINT32_MAX;
+#else
     if (DS4_MODEL_VARIANT != DS4_VARIANT_PRO &&
         DS4_MODEL_VARIANT != DS4_VARIANT_FLASH) {
         return 0u;
     }
     return metal_graph_streaming_decode_prefill_wide_default(weights) ? 64u : 18u;
+#endif
 }
 
 static bool metal_graph_use_streaming_decode_prefill(
@@ -59983,6 +60194,7 @@ const char *ds4_backend_name(ds4_backend backend) {
 #else
         return "cuda";
 #endif
+    case DS4_BACKEND_VULKAN: return "vulkan";
     case DS4_BACKEND_CPU:   return "cpu";
     }
     return "unknown";
@@ -71155,6 +71367,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
 #endif
     }
+    if (e->backend == DS4_BACKEND_VULKAN) {
+#ifndef DS4_VULKAN_BUILD
+        fprintf(stderr, "ds4: Vulkan backend requested but this build is not linked with Vulkan\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#endif
+    }
     if (e->backend == DS4_BACKEND_METAL) {
 #ifndef __APPLE__
         fprintf(stderr, "ds4: Metal backend requested but this build is linked with CUDA, not Metal\n");
@@ -71337,6 +71557,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
         }
 #endif
+        ds4_gpu_set_streaming_expert_cache_layer_count(DS4_N_LAYER);
         if (e->ssd_streaming) {
             /*
              * Pin the expert cache's slab size class to the model's uniform
@@ -71396,7 +71617,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
         }
         (void)ds4_gpu_set_model_fd(e->model.fd);
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_VULKAN_BUILD)
         if (e->backend == DS4_BACKEND_CUDA &&
             !load_slice && !tp_shard && !e->ssd_streaming && !ds4_model_is_qwen4()) {
             (void)ds4_gpu_build_derived_artifacts(e->model.map,
@@ -71405,6 +71626,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else if (e->backend == DS4_BACKEND_CUDA && tp_shard) {
             (void)ds4_gpu_build_derived_artifacts_shard(e->model.map,
                 e->model.size, e->model.file_size, opt->model_path, (uint32_t)tp_shard_rank);
+        }
+#endif
+#if defined(DS4_VULKAN_BUILD)
+        if (e->backend == DS4_BACKEND_VULKAN &&
+            !load_slice && !tp_shard && !e->ssd_streaming) {
+            (void)ds4_gpu_build_derived_artifacts(e->model.map,
+                                                  e->model.size,
+                                                  opt->model_path);
         }
 #endif
         int model_map_ok = 0;
@@ -72625,6 +72854,7 @@ void ds4_engine_close(ds4_engine *e) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
     }
+    metal_graph_selected_async_load_stop();
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
@@ -74627,7 +74857,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t hc_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
-    if (n_tokens == 1 && pos0 > 0) {
+    if (n_tokens == 1) {
         if (g->raw_cap == 0) {
             if (errlen) snprintf(err, errlen, "%s layer-slice decode has no raw KV cache",
                                  ds4_backend_name(e->backend));
@@ -74636,7 +74866,17 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
 
         bool ok = true;
-        if (g->ssd_streaming && !input_hc) {
+        /* The slice's non-expert decode windows can be staged once (static
+         * map) instead of re-staging every layer of every token; falls back to
+         * the per-layer non-static map when the pool/static path is off. */
+        const bool stream_slice_static =
+            g->ssd_streaming &&
+            metal_graph_stream_decode_static_map_enabled() &&
+            weights_model_map_decode_static_supported(&e->weights);
+        const bool stream_slice_static_cache =
+            stream_slice_static &&
+            metal_graph_stream_decode_static_map_state_cache_enabled();
+        if (g->ssd_streaming && !input_hc && !stream_slice_static) {
             g->streaming_static_decode_map_current = false;
             ok = metal_graph_stream_map_token(&e->model, &e->weights);
         }
@@ -74659,10 +74899,33 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         const uint32_t split_after_layers = metal_graph_token_split_after_layers();
         uint32_t encoded_layers = 0;
         if (g->ssd_streaming) {
+            /* Close the embed scope first: the static slice map staging must
+             * run with no scope open (vulkan_set_span_windows falls back to
+             * per-window uploads that refuse an open scope, leaving the model
+             * windows empty -> GPUVM fault / device lost). */
             if (ok) ok = ds4_gpu_end_commands() != 0;
-            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+            /* Stage the slice's non-expert decode windows once (static map) so
+             * the per-token loop below never re-stages them; the per-layer
+             * re-map is the non-static fallback. */
+            if (ok && stream_slice_static) {
+                if (!stream_slice_static_cache ||
+                    !g->streaming_static_decode_map_current) {
+                    ok = metal_graph_stream_map_decode_static_slice(
+                            &e->model, &e->weights, layer_start, layer_end,
+                            layer_start == 0, e->weights.output != NULL);
+                    if (ok) {
+                        g->streaming_static_decode_map_current =
+                            stream_slice_static_cache;
+                    }
+                }
+            } else {
                 g->streaming_static_decode_map_current = false;
-                ok = metal_graph_stream_map_layer_decode(&e->model, &e->weights, il);
+            }
+            for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+                if (!stream_slice_static) {
+                    g->streaming_static_decode_map_current = false;
+                    ok = metal_graph_stream_map_layer_decode(&e->model, &e->weights, il);
+                }
                 if (ok) ok = ds4_gpu_begin_commands() != 0;
                 if (ok) {
                     ok = metal_graph_encode_decode_layer(g,
@@ -74682,8 +74945,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 if (ok) ok = ds4_gpu_end_commands() != 0;
             }
             if (ok && output_logits) {
-                g->streaming_static_decode_map_current = false;
-                ok = metal_graph_stream_map_output(&e->model, &e->weights);
+                if (!stream_slice_static) {
+                    g->streaming_static_decode_map_current = false;
+                    ok = metal_graph_stream_map_output(&e->model, &e->weights);
+                }
                 if (ok) ok = ds4_gpu_begin_commands() != 0;
                 if (ok) ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
                 if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -80101,6 +80366,14 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     if (e->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_cuda(items, count, err, errlen);
     }
+#ifdef DS4_VULKAN_BUILD
+    if (e->backend == DS4_BACKEND_VULKAN) {
+        if (err && errlen) {
+            snprintf(err, errlen, "Vulkan batched decode is not implemented yet");
+        }
+        return 1;
+    }
+#endif
     if (ds4_sessions_eval_batch_metal_supported(items, count, e)) {
         return ds4_sessions_eval_batch_native(items, count, e, NULL, NULL, err, errlen);
     }
@@ -80177,6 +80450,15 @@ int ds4_sessions_eval_batch_with_prefill(
         return ds4_sessions_eval_batch_with_prefill_cuda(
                 items, count, prefill_session, prefill_prompt, err, errlen);
     }
+#ifdef DS4_VULKAN_BUILD
+    if (prefill_session->engine->backend == DS4_BACKEND_VULKAN) {
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "Vulkan mixed prefill decode is not implemented yet");
+        }
+        return 1;
+    }
+#endif
     if (ds4_sessions_eval_batch_with_prefill_metal_supported(
                 items, count, prefill_session, prefill_prompt)) {
         return ds4_sessions_eval_batch_with_prefill_metal(

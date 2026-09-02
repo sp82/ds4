@@ -167,7 +167,7 @@ void ds4_gpu_kv_norm_task_end_concurrent(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) || defined(DS4_VULKAN_BUILD)
 int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              uint64_t offset,
                                              void *data,
@@ -344,6 +344,10 @@ int ds4_gpu_qwen4_batch_mm_q8_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
+/* Number of routed-expert layers in the model, so the backend can size its
+ * per-layer expert pool (slots/layer) from the total cache budget instead of
+ * guessing. Called once at engine open; ignored by backends that derive it. */
+void ds4_gpu_set_streaming_expert_cache_layer_count(uint32_t layers);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
@@ -379,6 +383,12 @@ int ds4_gpu_stream_expert_cache_seed_selected(
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
 int ds4_gpu_stream_expert_cache_begin_selected_load(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected);
+/* Fase 7: async expert load (worker thread); the caller waits the store fence
+ * (vulkan_pool_commit_pending) before the MoE that consumes the pool. */
+int ds4_gpu_stream_expert_cache_begin_selected_load_async(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);

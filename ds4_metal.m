@@ -4647,6 +4647,10 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     g_stream_expert_cache_expert_bytes = bytes;
 }
 
+void ds4_gpu_set_streaming_expert_cache_layer_count(uint32_t layers) {
+    (void)layers;
+}
+
 uint64_t ds4_gpu_recommended_working_set_size(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_device) return 0;

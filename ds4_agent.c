@@ -671,6 +671,9 @@ static ds4_backend parse_backend(const char *s) {
 #else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
 #endif
+#ifdef DS4_VULKAN_BUILD
+    if (!strcmp(s, "vulkan")) return DS4_BACKEND_VULKAN;
+#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4-agent: invalid backend: %s\n", s);
 #ifdef DS4_ROCM_BUILD
@@ -686,6 +689,8 @@ static ds4_backend default_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
+#elif defined(DS4_VULKAN_BUILD)
+    return DS4_BACKEND_VULKAN;
 #else
     return DS4_BACKEND_CUDA;
 #endif
@@ -883,6 +888,10 @@ static agent_config parse_options(int argc, char **argv) {
 #else
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+#endif
+#ifdef DS4_VULKAN_BUILD
+        } else if (!strcmp(arg, "--vulkan")) {
+            c.engine.backend = DS4_BACKEND_VULKAN;
 #endif
         } else if (!strcmp(arg, "--gpu-vram")) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
@@ -13533,7 +13542,11 @@ int main(int argc, char **argv) {
         cfg.engine.backend = cfg.gpu_vram_arg &&
                              !strcmp(cfg.gpu_vram_arg, "0")
             ? DS4_BACKEND_CPU
+#ifdef DS4_VULKAN_BUILD
+            : DS4_BACKEND_VULKAN;
+#else
             : DS4_BACKEND_CUDA;
+#endif
     }
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
