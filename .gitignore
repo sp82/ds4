@@ -92,3 +92,4 @@ __pycache__/
 /vulkan/tools/vkbench/vkbench.o
 /.clangd
 /compile_commands.json
+/vulkan/*.md
