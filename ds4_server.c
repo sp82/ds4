@@ -9315,6 +9315,7 @@ struct server {
     server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    bool vulkan_stats;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -13576,6 +13577,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
 
+    if (s->vulkan_stats) {
+        char *stats = ds4_vulkan_stats_report(0);
+        if (stats) {
+            server_log(DS4_LOG_TIMING, "ds4-server: %s", stats);
+            ds4_vulkan_stats_free_text(stats);
+        }
+    }
+
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
     pthread_cond_broadcast(&s->model_cv);
@@ -14193,6 +14202,8 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    /* Log the Vulkan SSD-streaming expert pool stats after each request. */
+    bool vulkan_stats;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -14486,6 +14497,8 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--vulkan-stats")) {
+            c.vulkan_stats = true;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {
@@ -14711,6 +14724,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.vulkan_stats = cfg.vulkan_stats;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {

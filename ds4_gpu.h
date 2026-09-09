@@ -342,6 +342,49 @@ int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
 #endif
+#if defined(DS4_VULKAN_BUILD)
+/* Streaming expert pool telemetry (Vulkan backend).  Every routed-expert
+ * selection the engine hands to the pool is classified by the seed entry
+ * point that produced it: decode (per-token routed seeds, sync + async
+ * worker), prefill (batched seeds) or hotlist (the one-shot priority
+ * preload at decode start).  A "hit" is an expert already resident in the
+ * pool (no load, no device traffic); a "miss" is an expert whose gate/up/
+ * down bytes are copied from the model file map into the pool.  Counters
+ * are cumulative for the process lifetime and cheap to maintain; the engine
+ * reads deltas between two snapshots to report a generation/response. */
+#define DS4_GPU_EXPERT_PHASES 3
+enum {
+    DS4_GPU_EXPERT_PHASE_DECODE = 0,
+    DS4_GPU_EXPERT_PHASE_PREFILL = 1,
+    DS4_GPU_EXPERT_PHASE_HOTLIST = 2
+};
+#define DS4_GPU_EXPERT_TELE_LAYERS 512u
+
+typedef struct ds4_gpu_expert_telemetry {
+    uint64_t requests[DS4_GPU_EXPERT_PHASES];      /* routed selections */
+    uint64_t hits[DS4_GPU_EXPERT_PHASES];          /* already resident */
+    uint64_t misses[DS4_GPU_EXPERT_PHASES];        /* needed a map load */
+    uint64_t loaded_bytes[DS4_GPU_EXPERT_PHASES];  /* expert bytes copied */
+    uint64_t reload_misses[DS4_GPU_EXPERT_PHASES]; /* resident earlier (thrash) */
+    uint64_t evictions;                            /* resident expert replaced */
+    uint64_t wait_us;                              /* expert-load stall time */
+    uint32_t layers_active;                        /* routed layers configured */
+    uint32_t resident_experts;                     /* sum of pool n_used */
+    uint32_t pool_slots;                           /* sum of pool slot capacity */
+    uint64_t resident_bytes;                       /* pool device-local bytes */
+    uint64_t budget_bytes;                         /* pool budget in bytes */
+    uint8_t  ready;                                /* pool configured */
+    /* Per-layer routed-load totals (decode+prefill), layers_active entries. */
+    uint64_t layer_requests[DS4_GPU_EXPERT_TELE_LAYERS];
+    uint64_t layer_misses[DS4_GPU_EXPERT_TELE_LAYERS];
+    uint64_t layer_loaded_bytes[DS4_GPU_EXPERT_TELE_LAYERS];
+} ds4_gpu_expert_telemetry;
+
+/* Fill a consistent snapshot of the pool counters/gauges.  Thread-safe:
+ * per-layer counters are updated under backend-internal per-layer exclusivity
+ * and read here atomically. */
+int ds4_gpu_stream_expert_cache_telemetry_snapshot(ds4_gpu_expert_telemetry *t);
+#endif
 void ds4_gpu_print_memory_report(const char *label);
 
 /* Tensor-parallel per-layer gates (Metal only).  The encoder calls
