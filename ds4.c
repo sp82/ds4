@@ -72981,6 +72981,132 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
 }
 #endif
 
+/* --- Vulkan SSD-streaming expert pool statistics (--vulkan-stats) -------- */
+
+/* Report deltas are measured against the last reported snapshot so that a
+ * caller can emit the block once per response/generation (like the t/s line)
+ * and always see just what happened in that window.  A mutex keeps the
+ * baseline consistent when several decode threads report concurrently (the
+ * batched ds4-server slot workers).  On non-Vulkan builds nothing is tracked
+ * and report() returns NULL so callers print nothing. */
+#if defined(DS4_VULKAN_BUILD)
+static pthread_mutex_t g_vk_stats_mu = PTHREAD_MUTEX_INITIALIZER;
+static ds4_gpu_expert_telemetry g_vk_stats_base;   /* zeroed: first-call base */
+
+/* Small growable text builder for the multi-line report. */
+typedef struct ds4_stats_text {
+    char  *p;
+    size_t len;
+    size_t cap;
+} ds4_stats_text;
+
+static int ds4_stats_text_addf(ds4_stats_text *tb, const char *fmt, ...) {
+    if (!tb) return 0;
+    va_list ap;
+    for (;;) {
+        va_start(ap, fmt);
+        const int need = vsnprintf(tb->p ? tb->p + tb->len : NULL,
+                                   tb->p ? tb->cap - tb->len : 0, fmt, ap);
+        va_end(ap);
+        if (need < 0) return 0;
+        if (tb->p && (size_t)need < tb->cap - tb->len) {
+            tb->len += (size_t)need;
+            return 1;
+        }
+        const size_t want = tb->len + (size_t)need + 1u;
+        size_t ncap = tb->p ? tb->cap * 2u : 256u;
+        if (ncap < want) ncap = want;
+        if (ncap > SIZE_MAX / 2u && ncap < want) return 0;
+        char *np = realloc(tb->p, ncap);
+        if (!np) return 0;
+        tb->p = np;
+        tb->cap = ncap;
+        if (tb->len == 0) tb->p[0] = '\0';
+    }
+}
+#endif /* DS4_VULKAN_BUILD */
+
+void ds4_vulkan_stats_free_text(char *text) {
+    free(text);
+}
+
+#if defined(DS4_VULKAN_BUILD)
+static void ds4_stats_phase_line(ds4_stats_text *tb,
+                                 const ds4_gpu_expert_telemetry *a,
+                                 const ds4_gpu_expert_telemetry *b,
+                                 const char *label, int phase) {
+    const uint64_t req = b->requests[phase] - a->requests[phase];
+    const uint64_t hit = b->hits[phase] - a->hits[phase];
+    const uint64_t miss = b->misses[phase] - a->misses[phase];
+    const uint64_t bytes = b->loaded_bytes[phase] - a->loaded_bytes[phase];
+    const uint64_t reload =
+        b->reload_misses[phase] - a->reload_misses[phase];
+    const double hit_pct = req ? 100.0 * (double)hit / (double)req : 0.0;
+    const double miss_pct = req ? 100.0 * (double)miss / (double)req : 0.0;
+    ds4_stats_text_addf(tb,
+        "vulkan-stats %-7s req=%llu hit=%llu (%.1f%%) miss=%llu (%.1f%%) "
+        "loaded=%llu (%.2f MiB)",
+        label,
+        (unsigned long long)req,
+        (unsigned long long)hit,
+        hit_pct,
+        (unsigned long long)miss,
+        miss_pct,
+        (unsigned long long)miss,
+        (double)bytes / 1048576.0);
+    if (reload != 0) {
+        ds4_stats_text_addf(tb, " reload=%llu", (unsigned long long)reload);
+    }
+    ds4_stats_text_addf(tb, "\n");
+}
+#endif /* DS4_VULKAN_BUILD */
+
+char *ds4_vulkan_stats_report(int decode_tokens) {
+#if defined(DS4_VULKAN_BUILD)
+    ds4_gpu_expert_telemetry now;
+    ds4_gpu_stream_expert_cache_telemetry_snapshot(&now);
+    pthread_mutex_lock(&g_vk_stats_mu);
+    const ds4_gpu_expert_telemetry base = g_vk_stats_base;
+    g_vk_stats_base = now;
+    pthread_mutex_unlock(&g_vk_stats_mu);
+    /* Pool never configured: no streaming expert cache in this run. */
+    if (!now.ready) return NULL;
+    ds4_stats_text tb = {0};
+    for (int p = 0; p < DS4_GPU_EXPERT_PHASES; p++) {
+        const char *label =
+            p == DS4_GPU_EXPERT_PHASE_DECODE ? "decode" :
+            p == DS4_GPU_EXPERT_PHASE_PREFILL ? "prefill" : "hotlist";
+        ds4_stats_phase_line(&tb, &base, &now, label, p);
+    }
+    const uint64_t evict = now.evictions - base.evictions;
+    const uint64_t wait_us = now.wait_us - base.wait_us;
+    const uint64_t miss_decode = now.misses[DS4_GPU_EXPERT_PHASE_DECODE] -
+                                 base.misses[DS4_GPU_EXPERT_PHASE_DECODE];
+    ds4_stats_text_addf(&tb,
+        "vulkan-stats pool   resident=%u/%u (%.1f%%) bytes=%.2f/%.2f GiB\n",
+        now.resident_experts,
+        now.pool_slots,
+        now.pool_slots ?
+            100.0 * (double)now.resident_experts / (double)now.pool_slots : 0.0,
+        (double)now.resident_bytes / 1073741824.0,
+        (double)now.budget_bytes / 1073741824.0);
+    ds4_stats_text_addf(&tb, "vulkan-stats churn   evictions=%llu stall=%.1f ms",
+        (unsigned long long)evict,
+        (double)wait_us / 1000.0);
+    if (decode_tokens > 0) {
+        ds4_stats_text_addf(&tb,
+            " avg_miss/token=%.2f (tokens=%d)",
+            (double)miss_decode / (double)decode_tokens,
+            decode_tokens);
+    }
+    ds4_stats_text_addf(&tb, "\n");
+    return tb.p ? tb.p : ds4_strdup("");
+#else
+    (void)decode_tokens;
+    return NULL;
+#endif
+}
+
 static bool ds4_session_tp_leader(const ds4_session *s) {
     return s && s->engine && s->engine->tp.active && s->engine->tp.rank == 0;
 }

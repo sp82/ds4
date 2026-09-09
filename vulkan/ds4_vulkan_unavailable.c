@@ -133,12 +133,13 @@ VULKAN_UNAVAILABLE_VOID(ds4_gpu_tp_set_big_exchange)
 VULKAN_UNAVAILABLE_VOID(ds4_gpu_tp_shutdown)
 VULKAN_UNAVAILABLE_VOID(ds4_gpu_tp_suspend_expert_sharding)
 
-/* Decode-island graph capture is CUDA-only; Vulkan decodes eagerly. */
+/* Decode-island graph capture is CUDA-only; Vulkan decodes eagerly.
+ * ds4_gpu_decode_graphs_invalidate is implemented (silently) in
+ * ds4_vulkan.c because the engine calls it unconditionally at teardown. */
 VULKAN_UNAVAILABLE_INT(ds4_gpu_decode_graphs_supported)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_decode_graph_begin)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_decode_graph_end)
 VULKAN_UNAVAILABLE_VOID(ds4_gpu_decode_graph_abort)
-VULKAN_UNAVAILABLE_VOID(ds4_gpu_decode_graphs_invalidate)
 
 /* Upstream Vision-Exp / GLM 5.3 multimodal and DSpark GPU surface.  All are
  * unreachable on the Vulkan runtime for the DS4 model family (the engine

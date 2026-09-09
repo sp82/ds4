@@ -40,8 +40,10 @@ extern "C" int ds4_vulkan_stream_seed_batch(
         const int32_t *ids, uint32_t n_tokens, uint32_t n_selected);
 extern "C" int ds4_vulkan_stream_seed_experts(
         const ds4_gpu_stream_expert_table *table,
-        const int32_t *ids, uint32_t n_experts);
+        const int32_t *ids, const uint32_t *priorities, uint32_t n_experts);
 extern "C" void ds4_vulkan_stream_pool_reset(void);
+extern "C" void ds4_vulkan_stream_pool_reset_hotness(void);
+extern "C" void ds4_vulkan_telemetry_snapshot(ds4_gpu_expert_telemetry *t);
 
 static int vulkan_tier_valid(int tier) {
     return tier == 0 && g_n_gpus == 1;
@@ -392,9 +394,9 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts) {
-    (void)expert_priorities;
     if (!vulkan_stream_table_valid(table)) return 0;
-    return ds4_vulkan_stream_seed_experts(table, expert_ids, n_experts);
+    return ds4_vulkan_stream_seed_experts(table, expert_ids,
+                                          expert_priorities, n_experts);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
@@ -419,8 +421,19 @@ extern "C" void ds4_gpu_stream_expert_cache_note_service_thread(void) {
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
+    ds4_vulkan_stream_pool_reset_hotness();
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     ds4_vulkan_stream_pool_reset();
+}
+
+/* Aggregate pool telemetry snapshot (per-layer counters, per-phase totals,
+ * occupancy gauges).  Backend-internal; the engine reads deltas between two
+ * snapshots to report a generation/response (--vulkan-stats). */
+extern "C" int ds4_gpu_stream_expert_cache_telemetry_snapshot(
+        ds4_gpu_expert_telemetry *t) {
+    if (!t) return 0;
+    ds4_vulkan_telemetry_snapshot(t);
+    return 1;
 }

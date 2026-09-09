@@ -639,4 +639,15 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen);
 
+/* Vulkan SSD-streaming expert pool statistics (--vulkan-stats).  Each call
+ * reports the delta since the previous call (or since process start for the
+ * first call) as a malloc'd multi-line text block: routed requests/hit/miss %
+ * and loaded bytes per phase (decode/prefill/hotlist), reloads (thrash),
+ * evictions, expert-load stall time, and pool occupancy.  decode_tokens lets
+ * the block show the average routed misses per decode token (pass 0 to omit).
+ * Backends without the streaming pool return NULL, so callers print nothing.
+ * Free the text with ds4_vulkan_stats_free_text().  Thread-safe. */
+char *ds4_vulkan_stats_report(int decode_tokens);
+void ds4_vulkan_stats_free_text(char *text);
+
 #endif

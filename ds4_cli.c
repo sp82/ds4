@@ -98,6 +98,9 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    /* Print the Vulkan SSD-streaming expert pool stats after each generation
+     * (one-shot prompt mode and every REPL turn), next to the t/s summary. */
+    bool vulkan_stats;
     /* CLI flag wiring: raw argv values for --gpu-vram and --gpu-devices.
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
@@ -533,6 +536,16 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
     }
 }
 
+/* Print the Vulkan SSD-streaming expert pool stats of the response that just
+ * finished, next to the t/s summary.  No-op when the backend has no pool (or
+ * --vulkan-stats is off: the callers only reach it through the flag). */
+static void cli_print_vulkan_stats(int decode_tokens) {
+    char *text = ds4_vulkan_stats_report(decode_tokens);
+    if (!text) return;
+    ds4_log(stderr, DS4_LOG_TIMING, "ds4: %s", text);
+    ds4_vulkan_stats_free_text(text);
+}
+
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
@@ -686,6 +699,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    if (cfg->vulkan_stats) cli_print_vulkan_stats(generated);
 
     ds4_session_free(session);
     return 0;
@@ -1275,6 +1289,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                                             &printer,
                                             cli_prefill_progress_cb,
                                             &progress);
+            if (cfg->vulkan_stats) cli_print_vulkan_stats(0);
         }
     }
 
@@ -1700,6 +1715,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    if (cfg->vulkan_stats) cli_print_vulkan_stats(generated);
     return 0;
 }
 
@@ -2089,6 +2105,8 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--vulkan-stats")) {
+            c.vulkan_stats = true;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {

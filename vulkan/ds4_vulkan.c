@@ -30,6 +30,7 @@
 #include <time.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <atomic>
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -328,6 +329,13 @@ static uint32_t g_model_window_count = 0;
 #define DS4_VK_POOL_SEL_CAP 4096u   /* max (token,slot) pairs per MoE call */
 #define DS4_VK_POOL_TABLE_ENTRIES 384u /* max expert id per layer */
 
+/* Hotness (SPECS_HOTNESS): route hotness is a per-(layer,expert) counter that
+ * survives eviction.  The pool stores it per layer (n_experts entries); the
+ * engine-level table is indexed by layer slot in this TU.  Decay every
+ * DS4_VK_POOL_HOTNESS_DECAY_TOKENS routed seeds (a decode token routes one
+ * seed per layer, so this tracks Metal's decode-token cadence). */
+#define DS4_VK_POOL_HOTNESS_DECAY_TOKENS 16u
+
 struct ds4_vk_pool_layer {
     int              active;
     ds4_gpu_tensor  *tensor;   /* owner: gate|up|down slots (device-local) */
@@ -340,7 +348,86 @@ struct ds4_vk_pool_layer {
     uint32_t         slot_age[DS4_VK_POOL_MAX_SLOTS];/* LRU last-use age */
     uint32_t         age;                            /* monotonic use counter */
     int32_t          table_host[DS4_VK_POOL_TABLE_ENTRIES]; /* mirror; -1 = absent */
+    uint8_t          ever_loaded[DS4_VK_POOL_TABLE_ENTRIES]; /* stored since pool setup */
+    uint32_t         route_hotness[DS4_VK_POOL_TABLE_ENTRIES]; /* per-expert LFU ticks */
+    uint32_t         route_seed_count;  /* routed seeds seen (approx. tokens) */
+    uint32_t         route_last_decay;  /* decay watermark in seed_count */
 };
+
+/* Bisect gate: DS4_VULKAN_HOTNESS_OFF=1 restores the legacy LRU-only eviction
+ * and disables the route-hotness notes, for A/B measurements on the server.
+ * Cached at first call (like the other DS4_VULKAN_* toggles). */
+static int vulkan_pool_hotness_off(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_VULKAN_HOTNESS_OFF") != NULL;
+    }
+    return cached;
+}
+
+/* Decay the layer's route hotness (halve all entries) when the routed-seed
+ * counter has advanced by DS4_VK_POOL_HOTNESS_DECAY_TOKENS since the last
+ * decay, mirroring Metal (ds4_metal.m maybe_decay_route_hotness). */
+static void vulkan_pool_hotness_maybe_decay(struct ds4_vk_pool_layer *l) {
+    while (l->route_seed_count - l->route_last_decay >=
+           DS4_VK_POOL_HOTNESS_DECAY_TOKENS) {
+        for (uint32_t i = 0; i < DS4_VK_POOL_TABLE_ENTRIES; i++) {
+            l->route_hotness[i] >>= 1;
+        }
+        l->route_last_decay += DS4_VK_POOL_HOTNESS_DECAY_TOKENS;
+    }
+}
+
+/* Add `amount` to the route hotness of expert e (saturating), mirroring
+ * Metal's note_route_hotness. */
+static void vulkan_pool_hotness_note(struct ds4_vk_pool_layer *l, int32_t e,
+                                     uint32_t amount) {
+    if (!l || e < 0 || (uint32_t)e >= DS4_VK_POOL_TABLE_ENTRIES ||
+        amount == 0) {
+        return;
+    }
+    uint32_t *hotness = &l->route_hotness[(uint32_t)e];
+    if (*hotness > UINT32_MAX - amount) {
+        *hotness = UINT32_MAX;
+    } else {
+        *hotness += amount;
+    }
+}
+
+/* Note a routed selection (all selected experts, hit or miss): +1 per expert,
+ * then advance the layer seed counter and decay as needed. */
+static void vulkan_pool_hotness_note_selected(struct ds4_vk_pool_layer *l,
+                                              const int32_t *ids,
+                                              uint32_t n_ids) {
+    if (!l || !ids || n_ids == 0 || vulkan_pool_hotness_off()) return;
+    if (l->route_seed_count != UINT32_MAX) {
+        l->route_seed_count++;
+    }
+    vulkan_pool_hotness_maybe_decay(l);
+    for (uint32_t i = 0; i < n_ids; i++) {
+        vulkan_pool_hotness_note(l, ids[i], 1u);
+    }
+}
+
+/* Hotlist seed: give each seeded expert an initial retention advantage from
+ * its priority (Metal ds4_metal.m:16630).  Falls back to 1. */
+static void vulkan_pool_hotness_seed_priorities(struct ds4_vk_pool_layer *l,
+                                                const int32_t *ids,
+                                                const uint32_t *priorities,
+                                                uint32_t n_experts) {
+    if (!l || !ids || vulkan_pool_hotness_off()) return;
+    for (uint32_t i = 0; i < n_experts; i++) {
+        const uint32_t priority = priorities ? priorities[i] : 0u;
+        vulkan_pool_hotness_note(l, ids[i], priority != 0 ? priority : 1u);
+    }
+}
+
+static void vulkan_pool_hotness_reset(struct ds4_vk_pool_layer *l) {
+    if (!l) return;
+    memset(l->route_hotness, 0, sizeof(l->route_hotness));
+    l->route_seed_count = 0;
+    l->route_last_decay = 0;
+}
 
 static struct ds4_vk_pool_layer g_pool_layers[DS4_VK_POOL_MAX_LAYERS];
 static uint32_t g_pool_slots_per_layer = DS4_VK_POOL_MIN_SLOTS;
@@ -349,6 +436,47 @@ static uint32_t g_pool_layer_count = 0;   /* routed-expert layers in the model *
 static uint64_t g_pool_per_expert_bytes = 0;
 static uint64_t g_pool_total_bytes = 0;
 static int g_pool_ready = 0;   /* budget-derived slot count configured */
+
+/* Telemetry of the streaming expert pool (feeding the engine's --vulkan-stats
+ * report).  Counters are cumulative per (layer, phase) so the writer needs no
+ * lock: a layer pool is only ever touched by one thread at a time (the main
+ * thread for sync seeds and MoE, or the async load worker for that layer's
+ * store), and a layer is never seeded by two threads concurrently.  The
+ * values are atomics only so that a snapshot read is safe when the worker is
+ * still running.  Phases follow the seed entry point: routed decode seeds,
+ * prefill batch seeds, and the one-shot hotlist preload. */
+struct ds4_vk_pool_tel {
+    std::atomic<uint64_t> requests[DS4_GPU_EXPERT_PHASES];
+    std::atomic<uint64_t> hits[DS4_GPU_EXPERT_PHASES];
+    std::atomic<uint64_t> misses[DS4_GPU_EXPERT_PHASES];
+    std::atomic<uint64_t> loaded_bytes[DS4_GPU_EXPERT_PHASES];
+    std::atomic<uint64_t> reload_misses[DS4_GPU_EXPERT_PHASES];
+    std::atomic<uint64_t> evictions;
+};
+static struct ds4_vk_pool_tel g_pool_tel[DS4_VK_POOL_MAX_LAYERS];
+
+/* Wall time spent stalling decode on expert loads: the sync seeds' device
+ * wait before a store and the main thread's wait for the async worker copy
+ * fence.  Only the main thread writes this (the worker submits without
+ * waiting), but it stays atomic for safe snapshot reads. */
+static std::atomic<uint64_t> g_pool_tel_wait_us(0);
+
+/* Count the reloads among the experts being loaded now: an expert whose
+ * weights were stored in this pool before (ever_loaded) and evicted since is
+ * a reload, the signature of a pool that is too small for the routed set. */
+static uint32_t vulkan_pool_tel_reloads(const struct ds4_vk_pool_layer *l,
+                                        const int32_t *missing,
+                                        uint32_t n_missing) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < n_missing; i++) {
+        const int32_t e = missing[i];
+        if (e >= 0 && (uint32_t)e < DS4_VK_POOL_TABLE_ENTRIES &&
+            l->ever_loaded[(uint32_t)e]) {
+            n++;
+        }
+    }
+    return n;
+}
 
 static uint64_t vulkan_pool_effective_budget_bytes(void);
 static uint64_t vulkan_pool_auto_budget_bytes(void);
@@ -5017,8 +5145,10 @@ static int vulkan_pool_slot_mark(struct ds4_vk_pool_layer *l,
 }
 
 /* Reserve a slot for expert e WITHOUT uploading weights (the caller batches
- * the uploads), evicting the least-recently-used slot that is not part of
- * the current selection.  Returns the slot index or -1. */
+ * the uploads), evicting the least-hot slot (LFU) that is not part of the
+ * current selection; ties break on least-recently-used (LRU slot_age),
+ * mirroring Metal's prune (lowest route_hotness, then last_used).  Returns
+ * the slot index or -1. */
 static int vulkan_pool_slot_reserve_only(struct ds4_vk_pool_layer *l,
                                          const int32_t *ids, uint32_t n_ids,
                                          int32_t e) {
@@ -5030,15 +5160,42 @@ static int vulkan_pool_slot_reserve_only(struct ds4_vk_pool_layer *l,
         return (int)slot;
     }
     uint32_t victim = UINT32_MAX;
-    uint32_t min_age = UINT32_MAX;
-    for (uint32_t i = 0; i < l->n_slots; i++) {
-        if (vulkan_pool_id_requested(ids, n_ids, l->slots[i])) continue;
-        if (l->slot_age[i] < min_age) {
-            min_age = l->slot_age[i];
-            victim = i;
+    if (vulkan_pool_hotness_off()) {
+        /* Legacy LRU-only (bisect DS4_VULKAN_HOTNESS_OFF). */
+        uint32_t min_age = UINT32_MAX;
+        for (uint32_t i = 0; i < l->n_slots; i++) {
+            if (vulkan_pool_id_requested(ids, n_ids, l->slots[i])) continue;
+            if (l->slot_age[i] < min_age) {
+                min_age = l->slot_age[i];
+                victim = i;
+            }
+        }
+    } else {
+        /* LFU victim: lowest route hotness, tiebreak LRU slot_age (Metal
+         * prune semantics). */
+        uint32_t lowest_hotness = UINT32_MAX;
+        uint32_t oldest_age = UINT32_MAX;
+        for (uint32_t i = 0; i < l->n_slots; i++) {
+            if (vulkan_pool_id_requested(ids, n_ids, l->slots[i])) continue;
+            const int32_t slot_expert = l->slots[i];
+            uint32_t hotness = 0;
+            if (slot_expert >= 0 &&
+                (uint32_t)slot_expert < DS4_VK_POOL_TABLE_ENTRIES) {
+                hotness = l->route_hotness[(uint32_t)slot_expert];
+            }
+            if (hotness < lowest_hotness ||
+                (hotness == lowest_hotness && l->slot_age[i] < oldest_age)) {
+                lowest_hotness = hotness;
+                oldest_age = l->slot_age[i];
+                victim = i;
+            }
         }
     }
     if (victim == UINT32_MAX) return -1;
+    /* A resident expert is evicted to make room: count the churn (thrash
+     * signal when the evicted expert is reloaded soon after). */
+    g_pool_tel[l - g_pool_layers].evictions.fetch_add(1,
+            std::memory_order_relaxed);
     const int32_t old_e = l->slots[victim];
     if (old_e >= 0 && (uint32_t)old_e < DS4_VK_POOL_TABLE_ENTRIES) {
         l->table_host[(uint32_t)old_e] = -1;
@@ -5173,7 +5330,8 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
 static int vulkan_pool_seed_remap(struct ds4_vk_pool_layer *l,
                                   const ds4_gpu_stream_expert_table *table,
                                   const int32_t *ids, uint32_t n_ids,
-                                  int32_t *remap_out, int async) {
+                                  int32_t *remap_out, int async,
+                                  int phase) {
     if (!l || !table || !ids || !remap_out || n_ids == 0) return -1;
     if (n_ids > DS4_VK_POOL_SEL_CAP || !l->tensor || !l->meta) return -1;
 
@@ -5194,7 +5352,15 @@ static int vulkan_pool_seed_remap(struct ds4_vk_pool_layer *l,
      * is normally ~0.  Skipped on the async worker path: the worker copy is
      * submitted to the main queue AFTER the previous MoE scope, so the FIFO
      * order already guarantees the readers drained. */
-    if (n_missing != 0 && !async) vulkan_device_wait();
+    if (n_missing != 0 && !async) {
+        const double w0 = vulkan_now_ms();
+        vulkan_device_wait();
+        if (phase >= 0 && phase < DS4_GPU_EXPERT_PHASES) {
+            g_pool_tel_wait_us.fetch_add(
+                (uint64_t)((vulkan_now_ms() - w0) * 1000.0),
+                std::memory_order_relaxed);
+        }
+    }
 
     const double p0 = getenv("DS4_VULKAN_DEBUG_POOL_HIT") != NULL ?
                       vulkan_now_ms() : 0.0;
@@ -5219,6 +5385,37 @@ static int vulkan_pool_seed_remap(struct ds4_vk_pool_layer *l,
         fprintf(stderr, "ds4: Vulkan debug pool seed: store_time=%.2f ms\n",
                 vulkan_now_ms() - p0);
     }
+    /* Count the seed once the resident set is stable (a failed store above
+     * would return -1 and the caller retries, so nothing is double counted).
+     * An all-hit seed still counts requests+hits: that is the cross-token
+     * reuse the pool exists for. */
+    if (phase >= 0 && phase < DS4_GPU_EXPERT_PHASES) {
+        struct ds4_vk_pool_tel *t = &g_pool_tel[l - g_pool_layers];
+        t->requests[phase].fetch_add(n_ids, std::memory_order_relaxed);
+        if (n_missing == 0) {
+            t->hits[phase].fetch_add(n_ids, std::memory_order_relaxed);
+        } else {
+            t->hits[phase].fetch_add(n_ids - n_missing,
+                                     std::memory_order_relaxed);
+            t->misses[phase].fetch_add(n_missing, std::memory_order_relaxed);
+            const uint32_t reloads = vulkan_pool_tel_reloads(l, missing,
+                                                             n_missing);
+            if (reloads != 0) {
+                t->reload_misses[phase].fetch_add(reloads,
+                                                  std::memory_order_relaxed);
+            }
+            const uint64_t per = 2ull * l->gate_expert_bytes +
+                                 l->down_expert_bytes;
+            t->loaded_bytes[phase].fetch_add((uint64_t)n_missing * per,
+                                             std::memory_order_relaxed);
+            for (uint32_t i = 0; i < n_missing; i++) {
+                const int32_t e = missing[i];
+                if (e >= 0 && (uint32_t)e < DS4_VK_POOL_TABLE_ENTRIES) {
+                    l->ever_loaded[(uint32_t)e] = 1;
+                }
+            }
+        }
+    }
     return (int)n_ids;
 }
 
@@ -5226,7 +5423,11 @@ static int vulkan_pool_seed_remap(struct ds4_vk_pool_layer *l,
  * wait).  The main thread calls this right before a dispatch that reads the
  * pool (routed MoE). */
 extern "C" void ds4_vulkan_pool_commit_pending(void) {
+    const double w0 = vulkan_now_ms();
     vulkan_worker_copy_wait();
+    g_pool_tel_wait_us.fetch_add(
+        (uint64_t)((vulkan_now_ms() - w0) * 1000.0),
+        std::memory_order_relaxed);
 }
 
 extern "C" int ds4_vulkan_stream_seed_selected(
@@ -5244,8 +5445,10 @@ extern "C" int ds4_vulkan_stream_seed_selected(
                                   n_selected, 1)) {
         return 0;
     }
+    vulkan_pool_hotness_note_selected(l, ids, n_selected);
     int32_t remap[DS4_VK_POOL_SEL_CAP];
-    return vulkan_pool_seed_remap(l, table, ids, n_selected, remap, 0) >= 0;
+    return vulkan_pool_seed_remap(l, table, ids, n_selected, remap, 0,
+                                  DS4_GPU_EXPERT_PHASE_DECODE) >= 0;
 }
 
 /* Async seed (Fase 7 worker path): same as ds4_vulkan_stream_seed_selected
@@ -5275,8 +5478,10 @@ extern "C" int ds4_vulkan_stream_seed_selected_async(
                                   n_selected, 0)) {
         return 0;
     }
+    vulkan_pool_hotness_note_selected(l, ids, n_selected);
     int32_t remap[DS4_VK_POOL_SEL_CAP];
-    return vulkan_pool_seed_remap(l, table, ids, n_selected, remap, 1) >= 0;
+    return vulkan_pool_seed_remap(l, table, ids, n_selected, remap, 1,
+                                  DS4_GPU_EXPERT_PHASE_DECODE) >= 0;
 }
 
 extern "C" int ds4_vulkan_stream_seed_batch(
@@ -5306,14 +5511,17 @@ extern "C" int ds4_vulkan_stream_seed_batch(
                                   distinct, 1)) {
         return 0;
     }
+    vulkan_pool_hotness_note_selected(l, seen, distinct);
     int32_t remap[DS4_VK_POOL_SEL_CAP];
-    if (vulkan_pool_seed_remap(l, table, ids, n_ids, remap, 0) < 0) return 0;
+    if (vulkan_pool_seed_remap(l, table, ids, n_ids, remap, 0,
+                               DS4_GPU_EXPERT_PHASE_PREFILL) < 0) return 0;
     return 1;
 }
 
 extern "C" int ds4_vulkan_stream_seed_experts(
         const ds4_gpu_stream_expert_table *table,
-        const int32_t *ids, uint32_t n_experts) {
+        const int32_t *ids, const uint32_t *priorities,
+        uint32_t n_experts) {
     if (!table || !ids || n_experts == 0 || table->model_map == NULL ||
         table->gate_expert_bytes == 0 || table->down_expert_bytes == 0) {
         return 0;
@@ -5336,8 +5544,13 @@ extern "C" int ds4_vulkan_stream_seed_experts(
                                   DS4_VK_POOL_MIN_SLOTS, n, 1)) {
         return 0;
     }
+    /* Use the hotlist priorities (Metal ds4_metal.m:16630): a higher priority
+     * gives a stronger retention advantage against the LFU eviction.  The
+     * routed +1 notes on top of this during decode. */
+    vulkan_pool_hotness_seed_priorities(l, ids, priorities, n);
     int32_t remap[DS4_VK_POOL_SEL_CAP];
-    if (vulkan_pool_seed_remap(l, table, ids, n, remap, 0) < 0) return 0;
+    if (vulkan_pool_seed_remap(l, table, ids, n, remap, 0,
+                               DS4_GPU_EXPERT_PHASE_HOTLIST) < 0) return 0;
     return 1;
 }
 
@@ -5397,6 +5610,17 @@ extern "C" void ds4_vulkan_stream_pool_reset(void) {
     g_pool_per_expert_bytes = 0;
 }
 
+/* Clear the route hotness of every layer (session restart / new decode),
+ * without dropping the resident weights: mirrors Metal's
+ * ds4_gpu_stream_expert_cache_reset_route_hotness. */
+extern "C" void ds4_vulkan_stream_pool_reset_hotness(void) {
+    for (uint32_t i = 0; i < DS4_VK_POOL_MAX_LAYERS; i++) {
+        struct ds4_vk_pool_layer *l = &g_pool_layers[i];
+        if (!l->active) continue;
+        vulkan_pool_hotness_reset(l);
+    }
+}
+
 /* Effective expert budget (bytes / per-expert bytes) exposed to the compat
  * layer so the engine's hotlist/prefill preload scales with the pool size. */
 extern "C" uint32_t ds4_vulkan_effective_budget(void) {
@@ -5405,6 +5629,59 @@ extern "C" uint32_t ds4_vulkan_effective_budget(void) {
     uint64_t n = eff / g_pool_per_expert_bytes;
     if (n > UINT32_MAX) n = UINT32_MAX;
     return (uint32_t)n;
+}
+
+/* Decode-island CUDA graph capture is CUDA-only; Vulkan decodes eagerly, so
+ * there are never captured graphs whose baked buffer addresses could dangle.
+ * The engine still calls this at graph-runtime teardown on every backend; a
+ * silent no-op avoids the unavailable-stub noise at the end of every run. */
+extern "C" void ds4_gpu_decode_graphs_invalidate(void) {}
+
+/* Aggregate the per-layer telemetry counters into a snapshot for the engine's
+ * --vulkan-stats report.  Reads are atomic per counter; gauges (n_used, slot
+ * capacity, allocated bytes) are read without a lock, which is fine because
+ * the engine snapshots between tokens when no async store is running. */
+extern "C" void ds4_vulkan_telemetry_snapshot(ds4_gpu_expert_telemetry *t) {
+    if (!t) return;
+    memset(t, 0, sizeof(*t));
+    uint64_t evictions = 0;
+    for (uint32_t i = 0; i < DS4_VK_POOL_MAX_LAYERS; i++) {
+        const struct ds4_vk_pool_layer *l = &g_pool_layers[i];
+        const struct ds4_vk_pool_tel *tel = &g_pool_tel[i];
+        if (!l->active) continue;
+        t->layers_active++;
+        t->resident_experts += l->n_used;
+        t->pool_slots += l->n_slots;
+        if (i < DS4_GPU_EXPERT_TELE_LAYERS) {
+            uint64_t layer_req = 0, layer_miss = 0, layer_bytes = 0;
+            for (int p = 0; p < DS4_GPU_EXPERT_PHASES; p++) {
+                const uint64_t req =
+                    tel->requests[p].load(std::memory_order_relaxed);
+                const uint64_t miss =
+                    tel->misses[p].load(std::memory_order_relaxed);
+                t->requests[p] += req;
+                t->hits[p] += tel->hits[p].load(std::memory_order_relaxed);
+                t->misses[p] += miss;
+                t->loaded_bytes[p] +=
+                    tel->loaded_bytes[p].load(std::memory_order_relaxed);
+                t->reload_misses[p] +=
+                    tel->reload_misses[p].load(std::memory_order_relaxed);
+                layer_req += req;
+                layer_miss += miss;
+                layer_bytes +=
+                    tel->loaded_bytes[p].load(std::memory_order_relaxed);
+            }
+            t->layer_requests[i] = layer_req;
+            t->layer_misses[i] = layer_miss;
+            t->layer_loaded_bytes[i] = layer_bytes;
+        }
+        evictions += tel->evictions.load(std::memory_order_relaxed);
+    }
+    t->evictions = evictions;
+    t->wait_us = g_pool_tel_wait_us.load(std::memory_order_relaxed);
+    t->resident_bytes = g_pool_total_bytes;
+    t->budget_bytes = vulkan_pool_effective_budget_bytes();
+    t->ready = (uint8_t)(g_pool_ready != 0);
 }
 
 /* --- Fase 4/6: routed MoE (Q8_0 and IQ2_XXS+Q2_K experts) ---------------- */
