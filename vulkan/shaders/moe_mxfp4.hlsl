@@ -20,6 +20,7 @@
 StructuredBuffer<float> a_buf : register(t0);
 ByteAddressBuffer w_buf : register(t1);    /* gate_w (gate/up) or down_w */
 ByteAddressBuffer up_w_buf : register(t2); /* up_w (gate/up only) */
+StructuredBuffer<uint> order_buf : register(t3); /* expert-grouped pair order */
 RWStructuredBuffer<int> selected_buf : register(u0);
 RWStructuredBuffer<float> weights_buf : register(u1);
 RWStructuredBuffer<float> out2_buf : register(u2); /* gate */
@@ -177,9 +178,10 @@ void moe_gate_up_mid_mxfp4_v2(uint3 gid_grp : SV_GroupID,
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
     if (row >= mid_dim || pair >= n_tokens * n_expert) return;
-    uint tok = pair / n_expert;
-    uint slot = pair - tok * n_expert;
-    int sel = selected_buf[tok * n_expert + slot];
+    uint apair = ((params.flags & 2u) != 0u) ? order_buf[pair] : pair;
+    uint tok = apair / n_expert;
+    uint slot = apair - tok * n_expert;
+    int sel = selected_buf[apair];
     if (sel < 0) sel = 0;
     uint expert;
     if ((params.flags & 1u) != 0u) {
@@ -217,11 +219,10 @@ void moe_gate_up_mid_mxfp4_v2(uint3 gid_grp : SV_GroupID,
             g = min(g, params.clamp);
             u = min(max(u, -params.clamp), params.clamp);
         }
-        uint off = pair * mid_dim + row;
+        uint off = apair * mid_dim + row;
         out2_buf[off] = g;
         out3_buf[off] = u;
-        out4_buf[off] = (g / (1.0f + exp(-g))) * u *
-                        weights_buf[tok * n_expert + slot];
+        out4_buf[off] = (g / (1.0f + exp(-g))) * u * weights_buf[apair];
     }
 }
 
@@ -239,9 +240,10 @@ void moe_down_mxfp4_v2(uint3 gid_grp : SV_GroupID,
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
     if (row >= out_dim || pair >= n_tokens * n_expert) return;
-    uint tok = pair / n_expert;
-    uint slot = pair - tok * n_expert;
-    int sel = selected_buf[tok * n_expert + slot];
+    uint apair = ((params.flags & 2u) != 0u) ? order_buf[pair] : pair;
+    uint tok = apair / n_expert;
+    uint slot = apair - tok * n_expert;
+    int sel = selected_buf[apair];
     if (sel < 0) sel = 0;
     uint expert;
     if ((params.flags & 1u) != 0u) {
@@ -256,7 +258,7 @@ void moe_down_mxfp4_v2(uint3 gid_grp : SV_GroupID,
     uint h = tid & 3u;
     float acc = 0.0f;
     for (; b < blocks; b += 64u) {
-        uint xb = pair * params.in_dim + b * 32u;
+        uint xb = apair * params.in_dim + b * 32u;
         acc += mxfp4_partial_dot(w_buf, bbase + b * 17u, a_buf, xb, h * 4u, 4u);
     }
     moe_down_red[tid] = acc;
@@ -268,6 +270,6 @@ void moe_down_mxfp4_v2(uint3 gid_grp : SV_GroupID,
         GroupMemoryBarrierWithGroupSync();
     }
     if (tid == 0u) {
-        out4_buf[pair * out_dim + row] = moe_down_red[0];
+        out4_buf[apair * out_dim + row] = moe_down_red[0];
     }
 }
