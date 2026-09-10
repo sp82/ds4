@@ -898,7 +898,7 @@ kbench: $(KBENCH_DIR)/kbench.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unava
 $(KBENCH_DIR)/kbench_cuda.o: $(KBENCH_DIR)/kbench.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $(KBENCH_DIR)/kbench.c
 
-kbench-cuda: $(KBENCH_DIR)/kbench_cuda.o ds4_cuda.o $(MMQ_OBJS)
+kbench-cuda: $(KBENCH_DIR)/kbench_cuda.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 .PHONY: kbench-cuda
