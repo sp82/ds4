@@ -22392,12 +22392,24 @@ static void metal_graph_selected_async_load_run(
                                        job->il,
                                        job->gate_expert_bytes,
                                        job->down_expert_bytes);
+#if defined(DS4_VULKAN_BUILD)
+    /* Vulkan stages the store on the dedicated worker command buffer; the
+     * main thread waits the fence (vulkan_pool_commit_pending) before the MoE
+     * that consumes the pool. */
     if (ds4_gpu_stream_expert_cache_begin_selected_load_async(
                 &table,
                 job->selected_ids,
                 DS4_N_EXPERT_USED) == 0) {
         return;
     }
+#else
+    if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                &table,
+                job->selected_ids,
+                DS4_N_EXPERT_USED) == 0) {
+        return;
+    }
+#endif
 
     job->ok = true;
 }
