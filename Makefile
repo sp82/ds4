@@ -839,7 +839,7 @@ VULKAN_SHADER_INC = vulkan/shaders/ds4_vulkan_shaders.inc
 vulkan/shaders/iq2_tables.hlsl vulkan/shaders/iq2_tables_host.h: vulkan/shaders/gen_iq2_tables.py cuda/mmq/ggml-common.h
 	python3 vulkan/shaders/gen_iq2_tables.py
 
-$(VULKAN_SHADER_INC): vulkan/shaders/gen_shaders.py vulkan/shaders/common.hlsl vulkan/shaders/iq2_tables.hlsl vulkan/shaders/unary.hlsl vulkan/shaders/argmax.hlsl vulkan/shaders/sort.hlsl vulkan/shaders/rmsnorm.hlsl vulkan/shaders/rope.hlsl vulkan/shaders/matmul_q8.hlsl vulkan/shaders/matmul_q8_preq.hlsl vulkan/shaders/matmul_q8_kslice.hlsl vulkan/shaders/quantize_q8.hlsl vulkan/shaders/top1.hlsl vulkan/shaders/f16_conv.hlsl vulkan/shaders/matmul_f16.hlsl vulkan/shaders/matmul_f32.hlsl vulkan/shaders/embed.hlsl vulkan/shaders/kv.hlsl vulkan/shaders/attention.hlsl vulkan/shaders/router.hlsl vulkan/shaders/moe.hlsl vulkan/shaders/moe_iq2.hlsl
+$(VULKAN_SHADER_INC): vulkan/shaders/gen_shaders.py vulkan/shaders/common.hlsl vulkan/shaders/iq2_tables.hlsl vulkan/shaders/unary.hlsl vulkan/shaders/argmax.hlsl vulkan/shaders/sort.hlsl vulkan/shaders/rmsnorm.hlsl vulkan/shaders/rope.hlsl vulkan/shaders/matmul_q8.hlsl vulkan/shaders/matmul_q8_preq.hlsl vulkan/shaders/matmul_q8_kslice.hlsl vulkan/shaders/quantize_q8.hlsl vulkan/shaders/top1.hlsl vulkan/shaders/f16_conv.hlsl vulkan/shaders/matmul_f16.hlsl vulkan/shaders/matmul_f32.hlsl vulkan/shaders/embed.hlsl vulkan/shaders/kv.hlsl vulkan/shaders/attention.hlsl vulkan/shaders/router.hlsl vulkan/shaders/moe.hlsl vulkan/shaders/moe_iq2.hlsl vulkan/shaders/moe_q4k.hlsl vulkan/shaders/moe_mxfp4.hlsl vulkan/shaders/matmul_quant.hlsl
 	python3 vulkan/shaders/gen_shaders.py
 
 ds4_vulkan.o: vulkan/ds4_vulkan.c ds4_gpu.h ds4_gpu_mgpu.h $(VULKAN_SHADER_INC)

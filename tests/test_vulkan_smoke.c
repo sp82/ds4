@@ -291,6 +291,77 @@ static void cpu_matmul_f32(float *out, const float *w, uint32_t out_dim,
     }
 }
 
+/* Dense Q4_K matmul: out[tok][row] = dot(dequant_q4k(w[row]), x[tok]). */
+static void cpu_matmul_q4k(float *out, const uint8_t *w, uint32_t out_dim,
+                           uint32_t in_dim, const float *x, uint32_t n_tok) {
+    const uint32_t blocks = in_dim / 256u;
+    for (uint32_t tok = 0; tok < n_tok; tok++) {
+        for (uint32_t row = 0; row < out_dim; row++) {
+            const uint8_t *wrow = w + (uint64_t)row * blocks * 144u;
+            float acc = 0.0f;
+            for (uint32_t b = 0; b < blocks; b++) {
+                const uint8_t *blk = wrow + (uint64_t)b * 144u;
+                uint16_t dh, dmh;
+                memcpy(&dh, blk, 2);
+                memcpy(&dmh, blk + 2, 2);
+                const float d = f16_to_f32(dh);
+                const float dmin = f16_to_f32(dmh);
+                for (uint32_t j = 0; j < 8u; j++) {
+                    uint32_t sc, m;
+                    if (j < 4u) {
+                        sc = blk[4u + j] & 63u;
+                        m = blk[4u + j + 4u] & 63u;
+                    } else {
+                        const uint32_t a = blk[4u + j + 4u];
+                        const uint32_t bb = blk[4u + j - 4u];
+                        const uint32_t c = blk[4u + j];
+                        sc = (a & 0xfu) | ((bb >> 6u) << 4u);
+                        m = (a >> 4u) | ((c >> 6u) << 4u);
+                    }
+                    const float scale = d * (float)sc;
+                    const float minv = dmin * (float)m;
+                    const uint32_t byte_off = (j >> 1u) * 32u;
+                    const uint32_t shift = (j & 1u) * 4u;
+                    for (uint32_t l = 0; l < 32u; l++) {
+                        const uint32_t qb = blk[16u + byte_off + l];
+                        const uint32_t q = (qb >> shift) & 0xfu;
+                        acc += (scale * (float)q - minv) *
+                               x[tok * in_dim + b * 256u + j * 32u + l];
+                    }
+                }
+            }
+            out[tok * out_dim + row] = acc;
+        }
+    }
+}
+
+/* Dense Q4_0 matmul: out[tok][row] = dot(dequant_q4_0(w[row]), x[tok]).
+ * Elements 0..15 are the low nibbles of qs[0..15], 16..31 the high. */
+static void cpu_matmul_q4_0(float *out, const uint8_t *w, uint32_t out_dim,
+                            uint32_t in_dim, const float *x, uint32_t n_tok) {
+    const uint32_t blocks = in_dim / 32u;
+    for (uint32_t tok = 0; tok < n_tok; tok++) {
+        for (uint32_t row = 0; row < out_dim; row++) {
+            const uint8_t *wrow = w + (uint64_t)row * blocks * 18u;
+            float acc = 0.0f;
+            for (uint32_t b = 0; b < blocks; b++) {
+                const uint8_t *blk = wrow + (uint64_t)b * 18u;
+                uint16_t dh;
+                memcpy(&dh, blk, 2);
+                const float d = f16_to_f32(dh);
+                for (uint32_t j = 0; j < 16u; j++) {
+                    const uint8_t packed = blk[2u + j];
+                    acc += d * ((float)(packed & 0xfu) - 8.0f) *
+                           x[tok * in_dim + b * 32u + j];
+                    acc += d * ((float)(packed >> 4u) - 8.0f) *
+                           x[tok * in_dim + b * 32u + j + 16u];
+                }
+            }
+            out[tok * out_dim + row] = acc;
+        }
+    }
+}
+
 /* --- Fase 4: MoE CPU references (match the shader math) ------------------ */
 
 static float cpu_softplus(float x) {
@@ -398,6 +469,169 @@ static float cpu_dot_q2k_row(const uint8_t *model, uint64_t row_off,
         }
     }
     return acc;
+}
+
+/* Dequant a Q4_K row (144-byte 256-value blocks) and dot with x.
+ * Mirrors ds4_vec_dot_q4_K_f32 / q4_k_get_scale_min. */
+static float cpu_dot_q4k_row(const uint8_t *model, uint64_t row_off,
+                             uint32_t in_dim, const float *x, uint32_t x_off) {
+    const uint32_t blocks = in_dim / 256u;
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint8_t *blk = model + row_off + (uint64_t)b * 144u;
+        uint16_t dh, dmh;
+        memcpy(&dh, blk, 2);
+        memcpy(&dmh, blk + 2, 2);
+        const float d = f16_to_f32(dh);
+        const float dmin = f16_to_f32(dmh);
+        for (uint32_t j = 0; j < 8u; j++) {
+            uint32_t sc, m;
+            if (j < 4u) {
+                sc = blk[4u + j] & 63u;
+                m = blk[4u + j + 4u] & 63u;
+            } else {
+                const uint32_t a = blk[4u + j + 4u];
+                const uint32_t bb = blk[4u + j - 4u];
+                const uint32_t c = blk[4u + j];
+                sc = (a & 0xfu) | ((bb >> 6u) << 4u);
+                m = (a >> 4u) | ((c >> 6u) << 4u);
+            }
+            const float scale = d * (float)sc;
+            const float minv = dmin * (float)m;
+            const uint32_t byte_off = (j >> 1u) * 32u;
+            const uint32_t shift = (j & 1u) * 4u;
+            for (uint32_t l = 0; l < 32u; l++) {
+                const uint32_t qb = blk[16u + byte_off + l];
+                const uint32_t q = (qb >> shift) & 0xfu;
+                acc += (scale * (float)q - minv) *
+                       x[x_off + b * 256u + j * 32u + l];
+            }
+        }
+    }
+    return acc;
+}
+
+/* Routed MoE reference for Q4_K gate/up/down experts. */
+static void cpu_routed_moe_q4k(
+        float *out, float *gate, float *up, float *mid,
+        const uint8_t *model, uint64_t gate_off, uint64_t up_off,
+        uint64_t down_off, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t in_dim, uint32_t mid_dim,
+        uint32_t out_dim, const int32_t *selected, const float *weights,
+        const float *x, uint32_t n_tokens, uint32_t n_expert,
+        float clamp) {
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t slot = 0; slot < n_expert; slot++) {
+            const int32_t expert = selected[t * n_expert + slot];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                const uint64_t gbase =
+                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)r * gate_row_bytes;
+                const float g = cpu_dot_q4k_row(model, gate_off + gbase,
+                                                in_dim, x, t * in_dim);
+                const float u = cpu_dot_q4k_row(model, up_off + gbase,
+                                                in_dim, x, t * in_dim);
+                float gc = g, uc = u;
+                if (clamp > 1.0e-6f) {
+                    gc = fminf(gc, clamp);
+                    uc = fminf(fmaxf(uc, -clamp), clamp);
+                }
+                const uint64_t idx =
+                    ((uint64_t)t * n_expert + slot) * mid_dim + r;
+                gate[idx] = gc;
+                up[idx] = uc;
+                mid[idx] = (gc / (1.0f + expf(-gc))) * uc *
+                           weights[t * n_expert + slot];
+            }
+        }
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float acc = 0.0f;
+            for (uint32_t slot = 0; slot < n_expert; slot++) {
+                const int32_t expert = selected[t * n_expert + slot];
+                const uint64_t dbase = (uint64_t)expert * down_expert_bytes +
+                                       (uint64_t)r * down_row_bytes;
+                acc += cpu_dot_q4k_row(model, down_off + dbase, mid_dim,
+                                       mid + (uint64_t)t * n_expert * mid_dim,
+                                       slot * mid_dim);
+            }
+            out[t * out_dim + r] = acc;
+        }
+    }
+}
+
+/* Dequant an MXFP4 row (17-byte 32-value blocks) and dot with x.
+ * Mirrors ds4_vec_dot_mxfp4_f32 / ds4_e8m0_to_f32. */
+static float cpu_dot_mxfp4_row(const uint8_t *model, uint64_t row_off,
+                               uint32_t in_dim, const float *x, uint32_t x_off) {
+    static const float vals[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    const uint32_t blocks = in_dim / 32u;
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const uint8_t *blk = model + row_off + (uint64_t)b * 17u;
+        const uint32_t e = blk[0];
+        const uint32_t bits = (e == 0u) ? 0x00400000u : (e << 23u);
+        float d;
+        memcpy(&d, &bits, 4);
+        for (uint32_t j = 0; j < 16u; j++) {
+            const uint8_t q = blk[1u + j];
+            acc += d * vals[q & 0xfu] * x[x_off + b * 32u + j];
+            acc += d * vals[q >> 4] * x[x_off + b * 32u + j + 16u];
+        }
+    }
+    return acc;
+}
+
+/* Routed MoE reference for MXFP4 gate/up/down experts. */
+static void cpu_routed_moe_mxfp4(
+        float *out, float *gate, float *up, float *mid,
+        const uint8_t *model, uint64_t gate_off, uint64_t up_off,
+        uint64_t down_off, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t in_dim, uint32_t mid_dim,
+        uint32_t out_dim, const int32_t *selected, const float *weights,
+        const float *x, uint32_t n_tokens, uint32_t n_expert,
+        float clamp) {
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t slot = 0; slot < n_expert; slot++) {
+            const int32_t expert = selected[t * n_expert + slot];
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                const uint64_t gbase =
+                    (uint64_t)expert * gate_expert_bytes +
+                    (uint64_t)r * gate_row_bytes;
+                const float g = cpu_dot_mxfp4_row(model, gate_off + gbase,
+                                                  in_dim, x, t * in_dim);
+                const float u = cpu_dot_mxfp4_row(model, up_off + gbase,
+                                                  in_dim, x, t * in_dim);
+                float gc = g, uc = u;
+                if (clamp > 1.0e-6f) {
+                    gc = fminf(gc, clamp);
+                    uc = fminf(fmaxf(uc, -clamp), clamp);
+                }
+                const uint64_t idx =
+                    ((uint64_t)t * n_expert + slot) * mid_dim + r;
+                gate[idx] = gc;
+                up[idx] = uc;
+                mid[idx] = (gc / (1.0f + expf(-gc))) * uc *
+                           weights[t * n_expert + slot];
+            }
+        }
+        for (uint32_t r = 0; r < out_dim; r++) {
+            float acc = 0.0f;
+            for (uint32_t slot = 0; slot < n_expert; slot++) {
+                const int32_t expert = selected[t * n_expert + slot];
+                const uint64_t dbase = (uint64_t)expert * down_expert_bytes +
+                                       (uint64_t)r * down_row_bytes;
+                acc += cpu_dot_mxfp4_row(model, down_off + dbase, mid_dim,
+                                         mid + (uint64_t)t * n_expert * mid_dim,
+                                         slot * mid_dim);
+            }
+            out[t * out_dim + r] = acc;
+        }
+    }
 }
 
 /* Routed MoE reference for IQ2_XXS gate/up + Q2_K down. */
@@ -958,6 +1192,60 @@ static void cpu_attn_output_low(float *low, const uint8_t *out_a,
                     uint16_t sw;
                     memcpy(&sw, blk, 2);
                     acc += f16_to_f32(sw) * d * (float)dot;
+                }
+                low[(uint64_t)t * (group_cnt * rank) + (uint64_t)gl * rank + r] = acc;
+            }
+        }
+    }
+}
+
+/* Low-rank grouped attention output A in Q4_K: low[t][g*rank+r] = sum_d
+ * heads[t][g*group_dim+d] * out_a_q4k[(g*rank+r)][d].  Activation is raw f32
+ * (no inline quantization). */
+static void cpu_attn_output_low_q4k(float *low, const uint8_t *out_a,
+                                    uint32_t n_groups_total, uint32_t group0,
+                                    uint32_t group_cnt, uint64_t group_dim,
+                                    uint64_t rank, const float *heads,
+                                    uint32_t n_rows) {
+    const uint32_t blocks_a = (uint32_t)(group_dim / 256u);
+    for (uint32_t t = 0; t < n_rows; t++) {
+        for (uint32_t gl = 0; gl < group_cnt; gl++) {
+            const uint32_t g = group0 + gl;
+            for (uint32_t r = 0; r < rank; r++) {
+                const uint32_t wrow = gl * (uint32_t)rank + r;
+                float acc = 0.0f;
+                for (uint32_t b = 0; b < blocks_a; b++) {
+                    const uint8_t *blk = out_a + (uint64_t)(wrow * blocks_a + b) * 144u;
+                    uint16_t dh, dmh;
+                    memcpy(&dh, blk, 2);
+                    memcpy(&dmh, blk + 2, 2);
+                    const float d = f16_to_f32(dh);
+                    const float dmin = f16_to_f32(dmh);
+                    for (uint32_t j = 0; j < 8u; j++) {
+                        uint32_t sc, m;
+                        if (j < 4u) {
+                            sc = blk[4u + j] & 63u;
+                            m = blk[4u + j + 4u] & 63u;
+                        } else {
+                            const uint32_t a = blk[4u + j + 4u];
+                            const uint32_t bb = blk[4u + j - 4u];
+                            const uint32_t c = blk[4u + j];
+                            sc = (a & 0xfu) | ((bb >> 6u) << 4u);
+                            m = (a >> 4u) | ((c >> 6u) << 4u);
+                        }
+                        const float scale = d * (float)sc;
+                        const float minv = dmin * (float)m;
+                        const uint32_t byte_off = (j >> 1u) * 32u;
+                        const uint32_t shift = (j & 1u) * 4u;
+                        for (uint32_t l = 0; l < 32u; l++) {
+                            const uint32_t qb = blk[16u + byte_off + l];
+                            const uint32_t q = (qb >> shift) & 0xfu;
+                            acc += (scale * (float)q - minv) *
+                                   heads[(uint64_t)t * n_groups_total * group_dim +
+                                         (uint64_t)g * group_dim + b * 256u +
+                                         j * 32u + l];
+                        }
+                    }
                 }
                 low[(uint64_t)t * (group_cnt * rank) + (uint64_t)gl * rank + r] = acc;
             }
@@ -3109,6 +3397,528 @@ int main(void) {
         CHECK(ds4_gpu_set_model_map(g_model, MODEL_PADDED) != 0,
               "moe_iq2: restore full model map");
         if (iq2_model) free(iq2_model);
+    }
+
+    /* --- Fase 6b: routed MoE (Q4_K gate/up/down experts) ------------------ */
+    {
+        const uint32_t n_tokens = 2u, n_expert = 3u, n_total = 4u;
+        const uint32_t in_dim = 256u, mid_dim = 256u, out_dim = 64u;
+        const uint64_t gate_row_bytes = 144u;             /* 1 Q4_K block */
+        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = 144u;             /* 1 Q4_K block */
+        const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+        const uint64_t gate_region = (uint64_t)n_total * gate_expert_bytes;
+        const uint64_t down_region = (uint64_t)n_total * down_expert_bytes;
+        const uint64_t up_off = gate_region;
+        const uint64_t down_off = 2u * gate_region;
+        const uint64_t q4k_model_size =
+            (down_off + down_region + 4095u) & ~(uint64_t)4095u;
+        const float clamp = 5.0f;
+        const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+
+        uint8_t *q4k_model = NULL;
+        if (posix_memalign((void **)&q4k_model, 4096, q4k_model_size) == 0) {
+            memset(q4k_model, 0, q4k_model_size);
+        }
+        CHECK(q4k_model != NULL, "moe_q4k: model alloc");
+        if (q4k_model) {
+            /* Random Q4_K blocks: any byte pattern is a valid block; d/dmin
+             * ~ 0.02..0.1, random scale/qs bytes. */
+            srand(0x4a4bu);
+            for (uint64_t r = 0; r < (uint64_t)n_total * mid_dim; r++) {
+                for (uint32_t which = 0; which < 2u; which++) {
+                    uint8_t *blk = q4k_model +
+                        (which ? gate_region : 0u) + r * gate_row_bytes;
+                    uint16_t dh = f32_to_f16(
+                            0.02f + 0.08f * (float)(rand() % 1000) / 1000.0f);
+                    uint16_t dm = f32_to_f16(
+                            0.02f + 0.08f * (float)(rand() % 1000) / 1000.0f);
+                    memcpy(blk, &dh, 2);
+                    memcpy(blk + 2, &dm, 2);
+                    for (uint32_t i = 4u; i < 144u; i++) {
+                        blk[i] = (uint8_t)(rand() & 0xffu);
+                    }
+                }
+            }
+            for (uint64_t r = 0; r < (uint64_t)n_total * out_dim; r++) {
+                uint8_t *blk = q4k_model + down_off + r * down_row_bytes;
+                uint16_t dh = f32_to_f16(
+                        0.02f + 0.08f * (float)(rand() % 1000) / 1000.0f);
+                uint16_t dm = f32_to_f16(
+                        0.02f + 0.08f * (float)(rand() % 1000) / 1000.0f);
+                memcpy(blk, &dh, 2);
+                memcpy(blk + 2, &dm, 2);
+                for (uint32_t i = 4u; i < 144u; i++) {
+                    blk[i] = (uint8_t)(rand() & 0xffu);
+                }
+            }
+        }
+
+        CHECK(ds4_gpu_set_model_map(q4k_model, q4k_model_size) != 0,
+              "moe_q4k: set_model_map");
+        CHECK(ds4_gpu_synchronize() != 0, "moe_q4k: sync after map");
+
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tokens * in_dim * sizeof(float));
+        ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(pair_count * sizeof(int32_t));
+        ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(pair_count * sizeof(float));
+        ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(pair_count * mid_dim * sizeof(float));
+        ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(pair_count * mid_dim * sizeof(float));
+        ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(pair_count * mid_dim * sizeof(float));
+        ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(pair_count * out_dim * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
+        CHECK(x && selected && weights && gate && up && mid && down && out,
+              "moe_q4k: alloc");
+        if (q4k_model && x && selected && weights && gate && up && mid && down && out) {
+            float *xv = (float *)malloc((uint64_t)n_tokens * in_dim * sizeof(float));
+            int32_t *sv = (int32_t *)malloc(pair_count * sizeof(int32_t));
+            float *wv = (float *)malloc(pair_count * sizeof(float));
+            float *gv = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *uv = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *mv = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *ov = (float *)malloc((uint64_t)n_tokens * out_dim * sizeof(float));
+            float *g_ref = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *u_ref = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *m_ref = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *o_ref = (float *)malloc((uint64_t)n_tokens * out_dim * sizeof(float));
+            CHECK(xv && sv && wv && gv && uv && mv && ov &&
+                  g_ref && u_ref && m_ref && o_ref, "moe_q4k: ref alloc");
+            for (uint32_t i = 0; i < n_tokens * in_dim; i++) {
+                xv[i] = 0.2f * cosf((float)i * 0.31f) +
+                        0.3f * (float)(i % 7) - 0.5f;
+            }
+            for (uint32_t i = 0; i < pair_count; i++) {
+                sv[i] = (int32_t)((i * 5u + 1u) % n_total);
+                wv[i] = 0.3f + 0.1f * (float)(i % 5);
+            }
+            ds4_gpu_tensor_write(x, 0, xv, (uint64_t)n_tokens * in_dim * sizeof(float));
+            ds4_gpu_tensor_write(selected, 0, sv, pair_count * sizeof(int32_t));
+            ds4_gpu_tensor_write(weights, 0, wv, pair_count * sizeof(float));
+
+            cpu_routed_moe_q4k(o_ref, g_ref, u_ref, m_ref, q4k_model,
+                               0u, up_off, down_off, gate_expert_bytes,
+                               gate_row_bytes, down_expert_bytes,
+                               down_row_bytes, in_dim, mid_dim, out_dim,
+                               sv, wv, xv, n_tokens, n_expert, clamp);
+
+            CHECK(ds4_gpu_routed_moe_batch_tensor(
+                      out, gate, up, mid, down, q4k_model, q4k_model_size,
+                      0u, up_off, down_off, 12u, 12u,
+                      gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+                      down_row_bytes, in_dim, mid_dim, out_dim, selected,
+                      weights, n_total, n_expert, clamp, x, 0u, n_tokens,
+                      NULL, true) != 0,
+                  "routed_moe: batch q4k");
+            CHECK(ds4_gpu_synchronize() != 0, "routed_moe: sync q4k batch");
+            ds4_gpu_tensor_read(gate, 0, gv, pair_count * mid_dim * sizeof(float));
+            ds4_gpu_tensor_read(up, 0, uv, pair_count * mid_dim * sizeof(float));
+            ds4_gpu_tensor_read(mid, 0, mv, pair_count * mid_dim * sizeof(float));
+            ds4_gpu_tensor_read(out, 0, ov, (uint64_t)n_tokens * out_dim * sizeof(float));
+            check_close(gv, g_ref, pair_count * mid_dim, 0.01f,
+                        "routed_moe: q4k gate matches CPU");
+            check_close(uv, u_ref, pair_count * mid_dim, 0.01f,
+                        "routed_moe: q4k up matches CPU");
+            check_close(mv, m_ref, pair_count * mid_dim, 0.01f,
+                        "routed_moe: q4k mid matches CPU");
+            check_close(ov, o_ref, n_tokens * out_dim, 0.01f,
+                        "routed_moe: q4k out matches CPU");
+
+            float *o_ref1 = (float *)malloc((uint64_t)out_dim * sizeof(float));
+            cpu_routed_moe_q4k(o_ref1, g_ref, u_ref, m_ref, q4k_model,
+                               0u, up_off, down_off, gate_expert_bytes,
+                               gate_row_bytes, down_expert_bytes,
+                               down_row_bytes, in_dim, mid_dim, out_dim,
+                               sv, wv, xv, 1u, n_expert, clamp);
+            CHECK(ds4_gpu_routed_moe_one_tensor(
+                      out, gate, up, mid, down, q4k_model, q4k_model_size,
+                      0u, up_off, down_off, 12u, 12u,
+                      gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+                      down_row_bytes, in_dim, mid_dim, out_dim, selected,
+                      weights, n_total, n_expert, clamp, x, NULL, 0u, true) != 0,
+                  "routed_moe: one q4k");
+            CHECK(ds4_gpu_synchronize() != 0, "routed_moe: sync q4k one");
+            ds4_gpu_tensor_read(out, 0, ov, (uint64_t)out_dim * sizeof(float));
+            check_close(ov, o_ref1, out_dim, 0.01f,
+                        "routed_moe: q4k one out matches CPU");
+
+            /* Non-Q4_K combos must still fail cleanly. */
+            CHECK(ds4_gpu_routed_moe_batch_tensor(
+                      out, gate, up, mid, down, q4k_model, q4k_model_size,
+                      0u, up_off, down_off, 12u, 10u,
+                      gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+                      down_row_bytes, in_dim, mid_dim, out_dim, selected,
+                      weights, n_total, n_expert, clamp, x, 0u, n_tokens,
+                      NULL, true) == 0,
+                  "routed_moe: Q4_K+Q2_K rejected");
+
+            free(o_ref1);
+            free(xv); free(sv); free(wv); free(gv); free(uv); free(mv);
+            free(ov); free(g_ref); free(u_ref); free(m_ref); free(o_ref);
+        }
+        if (x) ds4_gpu_tensor_free(x);
+        if (selected) ds4_gpu_tensor_free(selected);
+        if (weights) ds4_gpu_tensor_free(weights);
+        if (gate) ds4_gpu_tensor_free(gate);
+        if (up) ds4_gpu_tensor_free(up);
+        if (mid) ds4_gpu_tensor_free(mid);
+        if (down) ds4_gpu_tensor_free(down);
+        if (out) ds4_gpu_tensor_free(out);
+
+        CHECK(ds4_gpu_set_model_map(g_model, MODEL_PADDED) != 0,
+              "moe_q4k: restore full model map");
+        if (q4k_model) free(q4k_model);
+    }
+
+    /* --- Fase 6c: routed MoE (MXFP4 gate/up/down experts) ----------------- */
+    {
+        const uint32_t n_tokens = 2u, n_expert = 3u, n_total = 4u;
+        const uint32_t in_dim = 256u, mid_dim = 256u, out_dim = 64u;
+        const uint64_t gate_row_bytes = (in_dim / 32u) * 17u;  /* 8 blocks */
+        const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = (in_dim / 32u) * 17u;
+        const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+        const uint64_t gate_region = (uint64_t)n_total * gate_expert_bytes;
+        const uint64_t down_region = (uint64_t)n_total * down_expert_bytes;
+        const uint64_t up_off = gate_region;
+        const uint64_t down_off = 2u * gate_region;
+        const uint64_t mxfp4_model_size =
+            (down_off + down_region + 4095u) & ~(uint64_t)4095u;
+        const float clamp = 5.0f;
+        const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+
+        uint8_t *mxfp4_model = NULL;
+        if (posix_memalign((void **)&mxfp4_model, 4096, mxfp4_model_size) == 0) {
+            memset(mxfp4_model, 0, mxfp4_model_size);
+        }
+        CHECK(mxfp4_model != NULL, "moe_mxfp4: model alloc");
+        if (mxfp4_model) {
+            /* Random MXFP4 blocks: e ~ 124..130 (scale 2^-3..2^3), random
+             * nibbles (any E2M1 code is valid). */
+            srand(0x3f9au);
+            for (uint64_t r = 0; r < (uint64_t)n_total * mid_dim; r++) {
+                for (uint32_t which = 0; which < 2u; which++) {
+                    uint8_t *blk = mxfp4_model +
+                        (which ? gate_region : 0u) + r * gate_row_bytes;
+                    for (uint64_t off = 0; off < gate_row_bytes; off += 17u) {
+                        blk[off] = (uint8_t)(124u + (uint32_t)(rand() % 7));
+                        for (uint32_t i = 1u; i < 17u; i++) {
+                            blk[off + i] = (uint8_t)(rand() & 0xffu);
+                        }
+                    }
+                }
+            }
+            for (uint64_t r = 0; r < (uint64_t)n_total * out_dim; r++) {
+                uint8_t *blk = mxfp4_model + down_off + r * down_row_bytes;
+                for (uint64_t off = 0; off < down_row_bytes; off += 17u) {
+                    blk[off] = (uint8_t)(124u + (uint32_t)(rand() % 7));
+                    for (uint32_t i = 1u; i < 17u; i++) {
+                        blk[off + i] = (uint8_t)(rand() & 0xffu);
+                    }
+                }
+            }
+        }
+
+        CHECK(ds4_gpu_set_model_map(mxfp4_model, mxfp4_model_size) != 0,
+              "moe_mxfp4: set_model_map");
+        CHECK(ds4_gpu_synchronize() != 0, "moe_mxfp4: sync after map");
+
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tokens * in_dim * sizeof(float));
+        ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(pair_count * sizeof(int32_t));
+        ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(pair_count * sizeof(float));
+        ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(pair_count * mid_dim * sizeof(float));
+        ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(pair_count * mid_dim * sizeof(float));
+        ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(pair_count * mid_dim * sizeof(float));
+        ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(pair_count * out_dim * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
+        CHECK(x && selected && weights && gate && up && mid && down && out,
+              "moe_mxfp4: alloc");
+        if (mxfp4_model && x && selected && weights && gate && up && mid && down && out) {
+            float *xv = (float *)malloc((uint64_t)n_tokens * in_dim * sizeof(float));
+            int32_t *sv = (int32_t *)malloc(pair_count * sizeof(int32_t));
+            float *wv = (float *)malloc(pair_count * sizeof(float));
+            float *gv = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *uv = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *mv = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *ov = (float *)malloc((uint64_t)n_tokens * out_dim * sizeof(float));
+            float *g_ref = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *u_ref = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *m_ref = (float *)malloc(pair_count * mid_dim * sizeof(float));
+            float *o_ref = (float *)malloc((uint64_t)n_tokens * out_dim * sizeof(float));
+            CHECK(xv && sv && wv && gv && uv && mv && ov &&
+                  g_ref && u_ref && m_ref && o_ref, "moe_mxfp4: ref alloc");
+            for (uint32_t i = 0; i < n_tokens * in_dim; i++) {
+                xv[i] = 0.2f * cosf((float)i * 0.31f) +
+                        0.3f * (float)(i % 7) - 0.5f;
+            }
+            for (uint32_t i = 0; i < pair_count; i++) {
+                sv[i] = (int32_t)((i * 5u + 1u) % n_total);
+                wv[i] = 0.3f + 0.1f * (float)(i % 5);
+            }
+            ds4_gpu_tensor_write(x, 0, xv, (uint64_t)n_tokens * in_dim * sizeof(float));
+            ds4_gpu_tensor_write(selected, 0, sv, pair_count * sizeof(int32_t));
+            ds4_gpu_tensor_write(weights, 0, wv, pair_count * sizeof(float));
+
+            cpu_routed_moe_mxfp4(o_ref, g_ref, u_ref, m_ref, mxfp4_model,
+                                 0u, up_off, down_off, gate_expert_bytes,
+                                 gate_row_bytes, down_expert_bytes,
+                                 down_row_bytes, in_dim, mid_dim, out_dim,
+                                 sv, wv, xv, n_tokens, n_expert, clamp);
+
+            CHECK(ds4_gpu_routed_moe_batch_tensor(
+                      out, gate, up, mid, down, mxfp4_model, mxfp4_model_size,
+                      0u, up_off, down_off, 39u, 39u,
+                      gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+                      down_row_bytes, in_dim, mid_dim, out_dim, selected,
+                      weights, n_total, n_expert, clamp, x, 0u, n_tokens,
+                      NULL, true) != 0,
+                  "routed_moe: batch mxfp4");
+            CHECK(ds4_gpu_synchronize() != 0, "routed_moe: sync mxfp4 batch");
+            ds4_gpu_tensor_read(gate, 0, gv, pair_count * mid_dim * sizeof(float));
+            ds4_gpu_tensor_read(up, 0, uv, pair_count * mid_dim * sizeof(float));
+            ds4_gpu_tensor_read(mid, 0, mv, pair_count * mid_dim * sizeof(float));
+            ds4_gpu_tensor_read(out, 0, ov, (uint64_t)n_tokens * out_dim * sizeof(float));
+            check_close(gv, g_ref, pair_count * mid_dim, 0.01f,
+                        "routed_moe: mxfp4 gate matches CPU");
+            check_close(uv, u_ref, pair_count * mid_dim, 0.01f,
+                        "routed_moe: mxfp4 up matches CPU");
+            check_close(mv, m_ref, pair_count * mid_dim, 0.01f,
+                        "routed_moe: mxfp4 mid matches CPU");
+            check_close(ov, o_ref, n_tokens * out_dim, 0.01f,
+                        "routed_moe: mxfp4 out matches CPU");
+
+            float *o_ref1 = (float *)malloc((uint64_t)out_dim * sizeof(float));
+            cpu_routed_moe_mxfp4(o_ref1, g_ref, u_ref, m_ref, mxfp4_model,
+                                 0u, up_off, down_off, gate_expert_bytes,
+                                 gate_row_bytes, down_expert_bytes,
+                                 down_row_bytes, in_dim, mid_dim, out_dim,
+                                 sv, wv, xv, 1u, n_expert, clamp);
+            CHECK(ds4_gpu_routed_moe_one_tensor(
+                      out, gate, up, mid, down, mxfp4_model, mxfp4_model_size,
+                      0u, up_off, down_off, 39u, 39u,
+                      gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+                      down_row_bytes, in_dim, mid_dim, out_dim, selected,
+                      weights, n_total, n_expert, clamp, x, NULL, 0u, true) != 0,
+                  "routed_moe: one mxfp4");
+            CHECK(ds4_gpu_synchronize() != 0, "routed_moe: sync mxfp4 one");
+            ds4_gpu_tensor_read(out, 0, ov, (uint64_t)out_dim * sizeof(float));
+            check_close(ov, o_ref1, out_dim, 0.01f,
+                        "routed_moe: mxfp4 one out matches CPU");
+
+            /* Mixed pairs must still fail cleanly. */
+            CHECK(ds4_gpu_routed_moe_batch_tensor(
+                      out, gate, up, mid, down, mxfp4_model, mxfp4_model_size,
+                      0u, up_off, down_off, 39u, 12u,
+                      gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+                      down_row_bytes, in_dim, mid_dim, out_dim, selected,
+                      weights, n_total, n_expert, clamp, x, 0u, n_tokens,
+                      NULL, true) == 0,
+                  "routed_moe: MXFP4+Q4_K rejected");
+
+            free(o_ref1);
+            free(xv); free(sv); free(wv); free(gv); free(uv); free(mv);
+            free(ov); free(g_ref); free(u_ref); free(m_ref); free(o_ref);
+        }
+        if (x) ds4_gpu_tensor_free(x);
+        if (selected) ds4_gpu_tensor_free(selected);
+        if (weights) ds4_gpu_tensor_free(weights);
+        if (gate) ds4_gpu_tensor_free(gate);
+        if (up) ds4_gpu_tensor_free(up);
+        if (mid) ds4_gpu_tensor_free(mid);
+        if (down) ds4_gpu_tensor_free(down);
+        if (out) ds4_gpu_tensor_free(out);
+
+        CHECK(ds4_gpu_set_model_map(g_model, MODEL_PADDED) != 0,
+              "moe_mxfp4: restore full model map");
+        if (mxfp4_model) free(mxfp4_model);
+    }
+
+    /* --- Fase 3b: attention output with out_a Q4_K ------------------------ */
+    {
+        const uint32_t n_groups = 2u, rank = 16u, out_dim = 16u, n_rows = 3u;
+        const uint64_t group_dim = 256u;
+        const uint32_t low_dim = n_groups * rank;
+        const uint32_t out_a_rows = n_groups * rank;
+        const uint64_t out_a_bytes = (uint64_t)out_a_rows * 144u;
+        const uint64_t out_b_off = out_a_bytes;
+        const uint64_t out_b_bytes = (uint64_t)out_dim * 34u;
+        const uint64_t q4k_size =
+            (out_b_off + out_b_bytes + 4095u) & ~(uint64_t)4095u;
+
+        uint8_t *q4k_attn = NULL;
+        if (posix_memalign((void **)&q4k_attn, 4096, q4k_size) == 0) {
+            memset(q4k_attn, 0, q4k_size);
+        }
+        CHECK(q4k_attn != NULL, "attn_out_q4k: model alloc");
+        if (q4k_attn) {
+            srand(0xa771u);
+            for (uint32_t r = 0; r < out_a_rows; r++) {
+                uint8_t *blk = q4k_attn + (uint64_t)r * 144u;
+                uint16_t dh = f32_to_f16(
+                        0.02f + 0.08f * (float)(rand() % 1000) / 1000.0f);
+                uint16_t dm = f32_to_f16(
+                        0.02f + 0.08f * (float)(rand() % 1000) / 1000.0f);
+                memcpy(blk, &dh, 2);
+                memcpy(blk + 2, &dm, 2);
+                for (uint32_t i = 4u; i < 144u; i++) {
+                    blk[i] = (uint8_t)(rand() & 0xffu);
+                }
+            }
+            for (uint32_t r = 0; r < out_dim; r++) {
+                float row[32];
+                for (uint32_t i = 0; i < 32u; i++) {
+                    row[i] = 0.03f * (float)(int32_t)((r * 9u + i * 5u) % 53) - 0.8f;
+                }
+                quant_q8_block(q4k_attn + out_b_off + (uint64_t)r * 34u, row, 32);
+            }
+        }
+
+        CHECK(ds4_gpu_set_model_map(q4k_attn, q4k_size) != 0,
+              "attn_out_q4k: set_model_map");
+        CHECK(ds4_gpu_synchronize() != 0, "attn_out_q4k: sync after map");
+
+        ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc((uint64_t)n_rows * n_groups * group_dim * sizeof(float));
+        ds4_gpu_tensor *low = ds4_gpu_tensor_alloc((uint64_t)n_rows * low_dim * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_rows * out_dim * sizeof(float));
+        CHECK(heads && low && out, "attn_out_q4k: alloc");
+        if (q4k_attn && heads && low && out) {
+            float *hvv = (float *)malloc((uint64_t)n_rows * n_groups * group_dim * sizeof(float));
+            float *lvv = (float *)malloc((uint64_t)n_rows * low_dim * sizeof(float));
+            float *ov = (float *)malloc((uint64_t)n_rows * out_dim * sizeof(float));
+            float *ref_low = (float *)malloc((uint64_t)n_rows * low_dim * sizeof(float));
+            float *ref_out = (float *)malloc((uint64_t)n_rows * out_dim * sizeof(float));
+            for (uint32_t i = 0; i < n_rows * n_groups * group_dim; i++) {
+                hvv[i] = 0.1f * (float)(int32_t)((i * 7u) % 200) - 1.0f;
+            }
+            ds4_gpu_tensor_write(heads, 0, hvv,
+                                 (uint64_t)n_rows * n_groups * group_dim * sizeof(float));
+
+            /* single-token group slice (decode path) */
+            float *ref_low1 = (float *)malloc((uint64_t)low_dim * sizeof(float));
+            cpu_attn_output_low_q4k(ref_low1, q4k_attn, n_groups, 0, n_groups,
+                                    group_dim, rank, hvv, 1u);
+            CHECK(ds4_gpu_attention_output_low_q4_K_slice_tensor(
+                      low, q4k_attn, q4k_size, 0u, group_dim, rank, 0u, n_groups,
+                      heads) != 0,
+                  "attn_out_q4k: low slice");
+            CHECK(ds4_gpu_synchronize() != 0, "attn_out_q4k: sync low slice");
+            ds4_gpu_tensor_read(low, 0, lvv, (uint64_t)low_dim * sizeof(float));
+            check_close(lvv, ref_low1, low_dim, 0.01f,
+                        "attn_out_q4k: low slice matches CPU");
+            free(ref_low1);
+
+            /* full batch output (low Q4_K + out_b Q8_0 matmul) */
+            cpu_attn_output_low_q4k(ref_low, q4k_attn, n_groups, 0, n_groups,
+                                    group_dim, rank, hvv, n_rows);
+            cpu_matmul_q8(ref_out, q4k_attn + out_b_off, out_dim, low_dim,
+                          ref_low, n_rows);
+            CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+                      out, low, NULL, NULL, q4k_attn, q4k_size, 0u, out_b_off,
+                      8u, group_dim, rank, n_groups, out_dim, heads,
+                      n_rows) != 0,
+                  "attn_out_q4k: batch");
+            CHECK(ds4_gpu_synchronize() != 0, "attn_out_q4k: sync batch");
+            ds4_gpu_tensor_read(out, 0, ov, (uint64_t)n_rows * out_dim * sizeof(float));
+            check_close(ov, ref_out, n_rows * out_dim, 0.01f,
+                        "attn_out_q4k: batch matches CPU");
+
+            free(hvv); free(lvv); free(ov); free(ref_low); free(ref_out);
+        }
+        if (heads) ds4_gpu_tensor_free(heads);
+        if (low) ds4_gpu_tensor_free(low);
+        if (out) ds4_gpu_tensor_free(out);
+
+        CHECK(ds4_gpu_set_model_map(g_model, MODEL_PADDED) != 0,
+              "attn_out_q4k: restore full model map");
+        if (q4k_attn) free(q4k_attn);
+    }
+
+    /* --- Fase 3: dense quant matmul (Q4_K + Q4_0) ------------------------- */
+    {
+        const uint32_t out_dim = 32u, in_dim = 256u, n_tok = 2u;
+        const uint64_t q4k_row_bytes = (in_dim / 256u) * 144u;
+        const uint64_t q4_0_row_bytes = (in_dim / 32u) * 18u;
+        const uint64_t q4k_off = 0u;
+        const uint64_t q4k_bytes = (uint64_t)out_dim * q4k_row_bytes;
+        const uint64_t q4_0_off = q4k_bytes;
+        const uint64_t q4_0_bytes = (uint64_t)out_dim * q4_0_row_bytes;
+        const uint64_t model_size =
+            (q4_0_off + q4_0_bytes + 4095u) & ~(uint64_t)4095u;
+
+        uint8_t *dm_model = NULL;
+        if (posix_memalign((void **)&dm_model, 4096, model_size) == 0) {
+            memset(dm_model, 0, model_size);
+        }
+        CHECK(dm_model != NULL, "matmul_quant: model alloc");
+        if (dm_model) {
+            srand(0x9d31u);
+            for (uint32_t r = 0; r < out_dim; r++) {
+                uint8_t *blk = dm_model + q4k_off + (uint64_t)r * q4k_row_bytes;
+                uint16_t dh = f32_to_f16(
+                        0.02f + 0.08f * (float)(rand() % 1000) / 1000.0f);
+                uint16_t dm = f32_to_f16(
+                        0.02f + 0.08f * (float)(rand() % 1000) / 1000.0f);
+                memcpy(blk, &dh, 2);
+                memcpy(blk + 2, &dm, 2);
+                for (uint32_t i = 4u; i < 144u; i++) {
+                    blk[i] = (uint8_t)(rand() & 0xffu);
+                }
+            }
+            for (uint32_t r = 0; r < out_dim; r++) {
+                uint8_t *rowp = dm_model + q4_0_off + (uint64_t)r * q4_0_row_bytes;
+                for (uint32_t b = 0; b < in_dim / 32u; b++) {
+                    uint8_t *blk = rowp + (uint64_t)b * 18u;
+                    uint16_t dh = f32_to_f16(
+                            0.02f + 0.08f * (float)(rand() % 1000) / 1000.0f);
+                    memcpy(blk, &dh, 2);
+                    for (uint32_t i = 0; i < 16u; i++) {
+                        blk[2u + i] = (uint8_t)(rand() & 0xffu);
+                    }
+                }
+            }
+        }
+        CHECK(ds4_gpu_set_model_map(dm_model, model_size) != 0,
+              "matmul_quant: set_model_map");
+        CHECK(ds4_gpu_synchronize() != 0, "matmul_quant: sync after map");
+
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tok * in_dim * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tok * out_dim * sizeof(float));
+        CHECK(x && out, "matmul_quant: alloc");
+        if (dm_model && x && out) {
+            float *xv = (float *)malloc((uint64_t)n_tok * in_dim * sizeof(float));
+            float *ov = (float *)malloc((uint64_t)n_tok * out_dim * sizeof(float));
+            float *ref = (float *)malloc((uint64_t)n_tok * out_dim * sizeof(float));
+            for (uint32_t i = 0; i < n_tok * in_dim; i++) {
+                xv[i] = 0.2f * cosf((float)i * 0.31f) +
+                        0.3f * (float)(i % 7) - 0.5f;
+            }
+            ds4_gpu_tensor_write(x, 0, xv, (uint64_t)n_tok * in_dim * sizeof(float));
+
+            /* Q4_K dense (type 12) */
+            cpu_matmul_q4k(ref, dm_model + q4k_off, out_dim, in_dim, xv, n_tok);
+            CHECK(ds4_gpu_matmul_quant_tensor(out, dm_model, model_size, q4k_off,
+                                              12u, in_dim, out_dim, x, n_tok) != 0,
+                  "matmul_quant: q4k");
+            CHECK(ds4_gpu_synchronize() != 0, "matmul_quant: sync q4k");
+            ds4_gpu_tensor_read(out, 0, ov, (uint64_t)n_tok * out_dim * sizeof(float));
+            check_close(ov, ref, n_tok * out_dim, 0.01f,
+                        "matmul_quant: q4k matches CPU");
+
+            /* Q4_0 dense (type 2) */
+            cpu_matmul_q4_0(ref, dm_model + q4_0_off, out_dim, in_dim, xv, n_tok);
+            CHECK(ds4_gpu_matmul_quant_tensor(out, dm_model, model_size, q4_0_off,
+                                              2u, in_dim, out_dim, x, n_tok) != 0,
+                  "matmul_quant: q4_0");
+            CHECK(ds4_gpu_synchronize() != 0, "matmul_quant: sync q4_0");
+            ds4_gpu_tensor_read(out, 0, ov, (uint64_t)n_tok * out_dim * sizeof(float));
+            check_close(ov, ref, n_tok * out_dim, 0.01f,
+                        "matmul_quant: q4_0 matches CPU");
+
+            free(xv); free(ov); free(ref);
+        }
+        if (x) ds4_gpu_tensor_free(x);
+        if (out) ds4_gpu_tensor_free(out);
+        CHECK(ds4_gpu_set_model_map(g_model, MODEL_PADDED) != 0,
+              "matmul_quant: restore full model map");
+        if (dm_model) free(dm_model);
     }
 
     /* --- Fase 5: head RMS norm (+ rope tail) --------------------------- */

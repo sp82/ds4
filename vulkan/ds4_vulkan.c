@@ -194,7 +194,7 @@ static void vulkan_device_wait(void) {
     pthread_mutex_unlock(&g_device_wait_mutex);
 }
 
-#define DS4_VK_PIPE_COUNT 61
+#define DS4_VK_PIPE_COUNT 68
 static VkPipeline     g_pipes[DS4_VK_PIPE_COUNT];
 static VkShaderModule g_mods[DS4_VK_PIPE_COUNT];
 
@@ -260,6 +260,13 @@ enum ds4_vk_pipe {
     DS4_PIPE_MATMUL_Q8_0_PREQ_V2,
     DS4_PIPE_MOE_GATE_UP_MID_IQ2XXS_V2,
     DS4_PIPE_MOE_DOWN_Q2K_V2,
+    DS4_PIPE_MOE_GATE_UP_MID_Q4K,
+    DS4_PIPE_MOE_DOWN_Q4K,
+    DS4_PIPE_ATTN_OUTPUT_LOW_Q4K,
+    DS4_PIPE_MOE_GATE_UP_MID_MXFP4,
+    DS4_PIPE_MOE_DOWN_MXFP4,
+    DS4_PIPE_MATMUL_Q4K,
+    DS4_PIPE_MATMUL_Q4_0,
 };
 
 /* Whole-model wrapper (Fase 6 step 2 staging pool).  The windows requested by
@@ -1263,6 +1270,17 @@ static int vulkan_compute_init(void) {
           "moe_gate_up_mid_iq2xxs_v2" },
         { ds4_spv_moe_down_q2k_v2, ds4_spv_moe_down_q2k_v2_len,
           "moe_down_q2k_v2" },
+        { ds4_spv_moe_gate_up_mid_q4k, ds4_spv_moe_gate_up_mid_q4k_len,
+          "moe_gate_up_mid_q4k" },
+        { ds4_spv_moe_down_q4k, ds4_spv_moe_down_q4k_len, "moe_down_q4k" },
+        { ds4_spv_attn_output_low_q4k, ds4_spv_attn_output_low_q4k_len,
+          "attn_output_low_q4k" },
+        { ds4_spv_moe_gate_up_mid_mxfp4, ds4_spv_moe_gate_up_mid_mxfp4_len,
+          "moe_gate_up_mid_mxfp4" },
+        { ds4_spv_moe_down_mxfp4, ds4_spv_moe_down_mxfp4_len,
+          "moe_down_mxfp4" },
+        { ds4_spv_matmul_q4k, ds4_spv_matmul_q4k_len, "matmul_q4k" },
+        { ds4_spv_matmul_q4_0, ds4_spv_matmul_q4_0_len, "matmul_q4_0" },
     };
     for (uint32_t i = 0; i < DS4_VK_PIPE_COUNT; i++) {
         g_mods[i] = vulkan_create_shader_module(pipes[i].code, pipes[i].len);
@@ -3427,15 +3445,73 @@ int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map,
 
 /* Typed quant matmul: only Q8_0 (type 8) is implemented; anything else
  * returns 0 so the caller falls back to its CPU path. */
+/* Dense Q4_K / Q4_0 matmul: out[tok][row] = dot(dequant(w[row]), x[tok]) with
+ * a raw f32 activation.  Weight rows are blocks * block_bytes wide. */
+static int vulkan_matmul_quant_dense(VkPipeline pipe, ds4_gpu_tensor *out,
+                                     const void *model_map, uint64_t model_size,
+                                     uint64_t weight_offset, uint32_t blocks,
+                                     uint32_t block_bytes, uint64_t in_dim,
+                                     uint64_t out_dim, const ds4_gpu_tensor *x,
+                                     uint64_t n_tok) {
+    if (!out || !x || !model_map || blocks == 0 || block_bytes == 0 ||
+        in_dim == 0 || out_dim == 0 || n_tok == 0) {
+        return 0;
+    }
+    const uint64_t row_bytes = (uint64_t)blocks * block_bytes;
+    if (out_dim > UINT64_MAX / row_bytes) return 0;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset) {
+        return 0;
+    }
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) {
+        return 0;
+    }
+    if (!vulkan_model_range_ok(weight_offset, weight_bytes)) return 0;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+    struct ds4_vk_params p = {};
+    p.in_dim = (uint32_t)in_dim;
+    p.out_dim = (uint32_t)out_dim;
+    p.rows = (uint32_t)n_tok;
+    p.blocks = blocks;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, x);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_W, weight_offset,
+                                    weight_bytes);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out);
+    return vulkan_dispatch(pipe, &p, sizeof(p), binds, nb,
+                           (uint32_t)out_dim, (uint32_t)n_tok, 1);
+}
+
 int ds4_gpu_matmul_quant_tensor(ds4_gpu_tensor *out, const void *model_map,
                                 uint64_t model_size, uint64_t weight_offset,
                                 uint32_t weight_type, uint64_t in_dim,
                                 uint64_t out_dim, const ds4_gpu_tensor *x,
                                 uint64_t n_tok) {
-    if (weight_type != 8u) return 0;   /* DS4_TENSOR_Q8_0 */
-    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
-                                      weight_offset, in_dim, out_dim, x,
-                                      n_tok);
+    if (weight_type == 8u) {   /* DS4_TENSOR_Q8_0 */
+        return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
+                                          weight_offset, in_dim, out_dim, x,
+                                          n_tok);
+    }
+    if (weight_type == 12u) {  /* DS4_TENSOR_Q4_K */
+        if (in_dim % 256u != 0) return 0;
+        return vulkan_matmul_quant_dense(
+                g_pipes[DS4_PIPE_MATMUL_Q4K], out, model_map, model_size,
+                weight_offset, (uint32_t)(in_dim / 256u), 144u, in_dim,
+                out_dim, x, n_tok);
+    }
+    if (weight_type == 2u) {   /* DS4_TENSOR_Q4_0 */
+        if (in_dim % 32u != 0) return 0;
+        return vulkan_matmul_quant_dense(
+                g_pipes[DS4_PIPE_MATMUL_Q4_0], out, model_map, model_size,
+                weight_offset, (uint32_t)(in_dim / 32u), 18u, in_dim,
+                out_dim, x, n_tok);
+    }
+    return 0;
 }
 
 /* --- matmul variants (Q8_0) ------------------------------------------------- */
@@ -4593,13 +4669,107 @@ int ds4_gpu_attention_output_low_q8_tensor(
 }
 
 int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
-        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        ds4_gpu_tensor       *low, const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
         uint32_t n_groups_total, uint32_t group0, uint32_t group_cnt,
         const ds4_gpu_tensor *heads, uint32_t n_rows) {
     return vulkan_attn_output_low_q8(low, model_map, model_size, out_a_offset,
                                      group_dim, rank, n_groups_total, group0,
                                      group_cnt, heads, n_rows);
+}
+
+/* Low-rank grouped projection (out_a Q4_K): same math as the Q8_0 helper but
+ * the weight rows are Q4_K (144-byte 256-value blocks) and the activation is
+ * used raw (no inline Q8 quantization).  group_dim must be a multiple of 256.
+ * The model buffer is bound at the group0 slice of out_a and the kernel uses
+ * the local group index, so the bound window stays small. */
+static int vulkan_attn_output_low_q4k(ds4_gpu_tensor *low,
+                                      const void *model_map,
+                                      uint64_t model_size,
+                                      uint64_t out_a_offset,
+                                      uint64_t group_dim, uint64_t rank,
+                                      uint32_t n_groups_total,
+                                      uint32_t group0, uint32_t group_cnt,
+                                      const ds4_gpu_tensor *heads,
+                                      uint32_t n_rows) {
+    if (!low || !heads || !model_map || group_dim == 0 || rank == 0 ||
+        n_groups_total == 0 || group_cnt == 0 ||
+        group0 > n_groups_total || group_cnt > n_groups_total - group0 ||
+        n_rows == 0 || (group_dim % 256u) != 0) {
+        return 0;
+    }
+    const uint64_t low_dim = (uint64_t)group_cnt * rank;
+    const uint64_t blocks_a = group_dim / 256u;
+    const uint64_t row_a_bytes = blocks_a * 144u;
+    const uint64_t a_offset =
+        out_a_offset + (uint64_t)group0 * rank * row_a_bytes;
+    const uint64_t out_a_bytes = low_dim * row_a_bytes;
+    if (a_offset < out_a_offset || a_offset > model_size ||
+        out_a_bytes > model_size - a_offset ||
+        heads->bytes < (uint64_t)n_rows * n_groups_total * group_dim *
+                           sizeof(float) ||
+        low->bytes < (uint64_t)n_rows * low_dim * sizeof(float)) {
+        return 0;
+    }
+    if (!vulkan_model_range_ok(a_offset, out_a_bytes)) return 0;
+    if (group_dim > UINT32_MAX || rank > UINT32_MAX || low_dim > UINT32_MAX ||
+        n_groups_total > UINT32_MAX || group0 > UINT32_MAX ||
+        group_cnt > UINT32_MAX) {
+        return 0;
+    }
+    struct ds4_vk_params p = {};
+    p.n = (uint32_t)group_dim;
+    p.out_dim = (uint32_t)rank;
+    p.blocks = (uint32_t)blocks_a;
+    p.index = n_groups_total;
+    p.aux = group0;
+    p.n_rot = group_cnt;
+    p.rows = n_rows;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, heads);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_W, a_offset, out_a_bytes);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, low);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q4K], &p, sizeof(p),
+                           binds, nb, (uint32_t)low_dim, n_rows, 1);
+}
+
+int ds4_gpu_attention_output_low_q4_K_slice_tensor(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t group0, uint32_t group_cnt, const ds4_gpu_tensor *heads) {
+    /* Single-token group slice (decode).  The engine calls this with the full
+     * heads row and group0 == 0 on the non-TP path. */
+    return vulkan_attn_output_low_q4k(low, model_map, model_size, out_a_offset,
+                                      group_dim, rank, group0 + group_cnt,
+                                      group0, group_cnt, heads, 1u);
+}
+
+/* Full attention output with out_a Q4_K: low = heads @ out_a^T (grouped
+ * Q4_K), then out = low @ out_b^T (typed matmul over the concatenated low
+ * dim; out_b_type == Q8_0 today).  Falls back to the engine per-token path
+ * when out_b is another quant (return 0). */
+int ds4_gpu_attention_output_q4_K_batch_tensor(
+        ds4_gpu_tensor       *out, ds4_gpu_tensor *low, ds4_gpu_tensor *group_tmp,
+        ds4_gpu_tensor       *low_tmp, const void *model_map, uint64_t model_size,
+        uint64_t              out_a_offset, uint64_t out_b_offset,
+        uint32_t              out_b_type, uint64_t group_dim, uint64_t rank,
+        uint32_t              n_groups, uint64_t out_dim,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    (void)group_tmp; (void)low_tmp;
+    if (!out || !low || !heads || !model_map || n_groups == 0 ||
+        out_dim == 0 || n_tokens == 0) {
+        return 0;
+    }
+    if (!vulkan_attn_output_low_q4k(low, model_map, model_size, out_a_offset,
+                                    group_dim, rank, n_groups, 0u, n_groups,
+                                    heads, n_tokens)) {
+        return 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    return ds4_gpu_matmul_quant_tensor(out, model_map, model_size,
+                                       out_b_offset, out_b_type, low_dim,
+                                       out_dim, low, n_tokens);
 }
 
 /* --- Fase 4: MoE routed / shared ---------------------------------------- */
@@ -5686,9 +5856,11 @@ extern "C" void ds4_vulkan_telemetry_snapshot(ds4_gpu_expert_telemetry *t) {
 
 /* --- Fase 4/6: routed MoE (Q8_0 and IQ2_XXS+Q2_K experts) ---------------- */
 
-/* Routed MoE for Q8_0 expert weights (gate_type/down_type == 8) or IQ2_XXS
- * gate/up with Q2_K down (gate_type == 16, down_type == 10); any other quant
- * returns 0 so the engine falls back to its CPU path.  Three dispatches:
+/* Routed MoE for Q8_0 expert weights (gate_type/down_type == 8), IQ2_XXS
+ * gate/up with Q2_K down (gate_type == 16, down_type == 10), Q4_K experts
+ * (gate_type == down_type == 12), or MXFP4 experts (gate_type == down_type
+ * == 39); any other quant returns 0 so the engine falls back to its CPU
+ * path.  Three dispatches:
  * gate/up/mid (weighted SwiGLU), down projection into the down scratch, then
  * the expert sum into out.  The model buffer is bound at the base of each
  * expert tensor with a range covering all n_total_expert experts; the shaders
@@ -5718,10 +5890,19 @@ static int vulkan_routed_moe_launch(
     ds4_vulkan_pool_commit_pending();
     const int q8_path = (gate_type == 8u && down_type == 8u);
     const int iq2_path = (gate_type == 16u && down_type == 10u);
-    if (!q8_path && !iq2_path) return 0;   /* Q8_0 or IQ2_XXS+Q2_K experts */
-    /* The IQ2_XXS/Q2_K kernels dequant 256-value super-blocks. */
-    if (iq2_path &&
+    const int q4_path = (gate_type == 12u && down_type == 12u);
+    const int mxfp4_path = (gate_type == 39u && down_type == 39u);
+    if (!q8_path && !iq2_path && !q4_path && !mxfp4_path) {
+        return 0;   /* Q8_0, IQ2_XXS+Q2_K, Q4_K or MXFP4 experts */
+    }
+    /* The IQ2_XXS/Q2_K and Q4_K kernels dequant 256-value super-blocks; MXFP4
+     * uses 32-value blocks (handled by the generic /32 path below). */
+    if ((iq2_path || q4_path) &&
         (expert_in_dim % 256u != 0 || expert_mid_dim % 256u != 0)) {
+        return 0;
+    }
+    if (mxfp4_path &&
+        (expert_in_dim % 32u != 0 || expert_mid_dim % 32u != 0)) {
         return 0;
     }
     const uint64_t gate_region = (uint64_t)n_total_expert * gate_expert_bytes;
@@ -5784,7 +5965,8 @@ static int vulkan_routed_moe_launch(
     p.index = n_expert;
     p.aux = (uint32_t)gate_expert_bytes;
     p.ratio = (uint32_t)gate_row_bytes;
-    p.blocks = iq2_path ? (expert_in_dim / 256u) : ((expert_in_dim + 31u) / 32u);
+    p.blocks = (iq2_path || q4_path) ? (expert_in_dim / 256u)
+                                     : ((expert_in_dim + 31u) / 32u);
     p.clamp = clamp;
     uint32_t nb = 0;
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, x);
@@ -5796,9 +5978,11 @@ static int vulkan_routed_moe_launch(
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT4, up);
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT5, mid);
     if (pool_mode) binds[nb++] = tbl_b;
-    const VkPipeline gate_pipe = iq2_path ?
-        vulkan_pipe_moe_gate_iq2() :
-        g_pipes[DS4_PIPE_MOE_GATE_UP_MID_Q8];
+    const VkPipeline gate_pipe = mxfp4_path ?
+        g_pipes[DS4_PIPE_MOE_GATE_UP_MID_MXFP4] :
+        (q4_path ? g_pipes[DS4_PIPE_MOE_GATE_UP_MID_Q4K] :
+         (iq2_path ? vulkan_pipe_moe_gate_iq2()
+                   : g_pipes[DS4_PIPE_MOE_GATE_UP_MID_Q8]));
     if (!vulkan_dispatch(gate_pipe, &p, sizeof(p),
                          binds, nb, expert_mid_dim, (uint32_t)pair_count, 1)) {
         return 0;
@@ -5809,15 +5993,19 @@ static int vulkan_routed_moe_launch(
     p.out_dim = out_dim;
     p.aux = (uint32_t)down_expert_bytes;
     p.ratio = (uint32_t)down_row_bytes;
-    p.blocks = iq2_path ? (expert_mid_dim / 256u) : ((expert_mid_dim + 31u) / 32u);
+    p.blocks = (iq2_path || q4_path) ? (expert_mid_dim / 256u)
+                                     : ((expert_mid_dim + 31u) / 32u);
     nb = 0;
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, mid);
     binds[nb++] = down_b;
     binds[nb++] = sel_b;
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT5, down);
     if (pool_mode) binds[nb++] = tbl_b;
-    const VkPipeline down_pipe = iq2_path ?
-        vulkan_pipe_moe_down_q2k() : g_pipes[DS4_PIPE_MOE_DOWN_Q8];
+    const VkPipeline down_pipe = mxfp4_path ?
+        g_pipes[DS4_PIPE_MOE_DOWN_MXFP4] :
+        (q4_path ? g_pipes[DS4_PIPE_MOE_DOWN_Q4K] :
+         (iq2_path ? vulkan_pipe_moe_down_q2k()
+                   : g_pipes[DS4_PIPE_MOE_DOWN_Q8]));
     if (!vulkan_dispatch(down_pipe, &p, sizeof(p),
                          binds, nb, out_dim, (uint32_t)pair_count, 1)) {
         return 0;
