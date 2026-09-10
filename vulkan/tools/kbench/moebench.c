@@ -25,7 +25,7 @@ static double now_ms(void) {
 #define MOE_IN_DIM   4096u
 #define MOE_MID_DIM  2048u
 #define MOE_OUT_DIM  4096u
-#define MOE_N_TOTAL  8u
+#define MOE_N_TOTAL  64u
 #define MOE_N_USED   6u
 #define MOE_GATE_TYPE 39u   /* GGUF MXFP4 */
 #define MOE_DOWN_TYPE 39u

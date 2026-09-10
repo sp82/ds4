@@ -201,7 +201,7 @@ static void vulkan_device_wait(void) {
     pthread_mutex_unlock(&g_device_wait_mutex);
 }
 
-#define DS4_VK_PIPE_COUNT 71
+#define DS4_VK_PIPE_COUNT 72
 static VkPipeline     g_pipes[DS4_VK_PIPE_COUNT];
 static VkShaderModule g_mods[DS4_VK_PIPE_COUNT];
 
@@ -275,6 +275,7 @@ enum ds4_vk_pipe {
     DS4_PIPE_MOE_DOWN_MXFP4,
     DS4_PIPE_MOE_GATE_UP_MID_MXFP4_V2,
     DS4_PIPE_MOE_DOWN_MXFP4_V2,
+    DS4_PIPE_MOE_GROUP,
     DS4_PIPE_MATMUL_Q4K,
     DS4_PIPE_MATMUL_Q4_0,
 };
@@ -591,6 +592,10 @@ static ds4_gpu_tensor *g_scratch_d = NULL;
 /* Persistent staging buffer for batched expert-pool stores (one submit per
  * layer seed instead of a one-shot submit per gate/up/down range). */
 static ds4_gpu_tensor *g_pool_staging = NULL;
+
+/* Persistent scratch holding the expert-grouped pair order for the routed MoE
+ * (see moe_group.hlsl); grows to the largest pair count seen. */
+static ds4_gpu_tensor *g_moe_order = NULL;
 
 /* Per-tensor device handle.  tensor->ptr points at one of these (heap). */
 struct ds4_vulkan_tensor {
@@ -1338,6 +1343,7 @@ static int vulkan_compute_init(void) {
           "moe_gate_up_mid_mxfp4_v2" },
         { ds4_spv_moe_down_mxfp4_v2, ds4_spv_moe_down_mxfp4_v2_len,
           "moe_down_mxfp4_v2" },
+        { ds4_spv_moe_group, ds4_spv_moe_group_len, "moe_group" },
         { ds4_spv_matmul_q4k, ds4_spv_matmul_q4k_len, "matmul_q4k" },
         { ds4_spv_matmul_q4_0, ds4_spv_matmul_q4_0_len, "matmul_q4_0" },
     };
@@ -1441,6 +1447,7 @@ void ds4_gpu_cleanup(void) {
         if (g_scratch_c) { ds4_gpu_tensor_free(g_scratch_c); g_scratch_c = NULL; }
         if (g_scratch_d) { ds4_gpu_tensor_free(g_scratch_d); g_scratch_d = NULL; }
         if (g_pool_staging) { ds4_gpu_tensor_free(g_pool_staging); g_pool_staging = NULL; }
+        if (g_moe_order) { ds4_gpu_tensor_free(g_moe_order); g_moe_order = NULL; }
         for (uint32_t i = 0; i < g_model_window_count; i++) {
             ds4_gpu_tensor_free(g_model_windows[i].tensor);
             g_model_windows[i].tensor = NULL;
@@ -6000,6 +6007,18 @@ extern "C" void ds4_vulkan_telemetry_snapshot(ds4_gpu_expert_telemetry *t) {
  * address rows as expert*expert_bytes + row*row_bytes (+ 256-value super
  * block offsets for the IQ2_XXS/Q2_K path; rejected when the region would
  * exceed the 32-bit shader addressing). */
+/* Ensure the routed-MoE pair-order scratch holds at least `pairs` uint32. */
+static ds4_gpu_tensor *vulkan_moe_order_ensure(uint64_t pairs) {
+    const uint64_t bytes = pairs * sizeof(uint32_t);
+    if (g_moe_order && g_moe_order->bytes >= bytes) return g_moe_order;
+    if (g_moe_order) {
+        ds4_gpu_tensor_free(g_moe_order);
+        g_moe_order = NULL;
+    }
+    g_moe_order = ds4_gpu_tensor_alloc(bytes);
+    return g_moe_order;
+}
+
 static int vulkan_routed_moe_launch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
@@ -6091,6 +6110,35 @@ static int vulkan_routed_moe_launch(
     struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
     if (pool_mode) p.flags |= 1u;
 
+    /* Opt-in expert grouping (DS4_VULKAN_MOE_GROUP): reorder the (token,
+     * expert) pairs so the MXFP4 kernels walk them in expert order.  The
+     * default keeps the raw pair order: the batch kernel is bound by the
+     * MXFP4 dequant, not by weight bandwidth, so grouping only helps when the
+     * expert set far exceeds L2. */
+    ds4_gpu_tensor *order = NULL;
+    if (mxfp4_path && getenv("DS4_VULKAN_MOE_GROUP") != NULL) {
+        order = vulkan_moe_order_ensure(pair_count);
+        if (!order) return 0;
+        struct ds4_vk_params gp = {};
+        gp.index = n_total_expert;
+        gp.rows = (uint32_t)pair_count;
+        gp.flags = pool_mode ? 1u : 0u;
+        struct ds4_vk_bind gb[3];
+        uint32_t gnb = 0;
+        gb[gnb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, selected);
+        if (pool_mode) {
+            struct ds4_vk_bind gtb = tbl_b;
+            gtb.binding = DS4_VK_BINDING_B;
+            gb[gnb++] = gtb;
+        }
+        gb[gnb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, order);
+        if (!vulkan_dispatch(g_pipes[DS4_PIPE_MOE_GROUP], &gp, sizeof(gp),
+                             gb, gnb, 1, 1, 1)) {
+            return 0;
+        }
+        p.flags |= 2u;
+    }
+
     /* 1. gate/up/mid: grid (expert_mid_dim, pair_count). */
     p.in_dim = expert_in_dim;
     p.out_dim = expert_mid_dim;
@@ -6111,6 +6159,7 @@ static int vulkan_routed_moe_launch(
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT4, up);
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT5, mid);
     if (pool_mode) binds[nb++] = tbl_b;
+    if (order) binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_W, order);
     const VkPipeline gate_pipe = mxfp4_path ?
         vulkan_pipe_moe_mxfp4_gate() :
         (q4_path ? g_pipes[DS4_PIPE_MOE_GATE_UP_MID_Q4K] :
@@ -6134,6 +6183,7 @@ static int vulkan_routed_moe_launch(
     binds[nb++] = sel_b;
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT5, down);
     if (pool_mode) binds[nb++] = tbl_b;
+    if (order) binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_W, order);
     const VkPipeline down_pipe = mxfp4_path ?
         vulkan_pipe_moe_mxfp4_down() :
         (q4_path ? g_pipes[DS4_PIPE_MOE_DOWN_Q4K] :
