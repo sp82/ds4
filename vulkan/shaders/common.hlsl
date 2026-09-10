@@ -213,18 +213,11 @@ float q4k_sub_dot(ByteAddressBuffer w, uint bbase, uint j,
  * 4-bit FP4 (E2M1) codes: low nibble = element j, high nibble = element j+16.
  * Value = e8m0_to_f32(e) * mxfp4_value(nib).  Mirrors ds4_vec_dot_mxfp4_f32. */
 float mxfp4_value(uint nib) {
-    float mag;
-    switch (nib & 7u) {
-    case 0u: mag = 0.0f; break;
-    case 1u: mag = 0.5f; break;
-    case 2u: mag = 1.0f; break;
-    case 3u: mag = 1.5f; break;
-    case 4u: mag = 2.0f; break;
-    case 5u: mag = 3.0f; break;
-    case 6u: mag = 4.0f; break;
-    default: mag = 6.0f; break;
-    }
-    return (nib & 8u) != 0u ? -mag : mag;
+    /* Branchless: E2M1 magnitude table + sign from bit 3 (the switch lowered
+     * to a long select chain and dominated the MXFP4 MoE cost). */
+    const float mags[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float m = mags[nib & 7u];
+    return (nib & 8u) != 0u ? -m : m;
 }
 
 /* E8M0 exponent byte -> f32 (e == 0 -> 2^-127, else 2^(e-127)). */
