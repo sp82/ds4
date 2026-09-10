@@ -91,6 +91,8 @@ __pycache__/
 /vkbench
 /kbench
 /kbench-cuda
+/moebench
+/moebench-cuda
 /vulkan/tools/vkbench/vkbench.o
 /.clangd
 /compile_commands.json

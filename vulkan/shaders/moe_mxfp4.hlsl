@@ -144,3 +144,130 @@ void moe_down_mxfp4(uint3 gid_grp : SV_GroupID,
         out4_buf[pair * out_dim + row] = moe_down_red[0];
     }
 }
+
+/* Partial MXFP4 block dot over `bc` qs bytes starting at byte b0 (0..15) of
+ * the block: byte b0+jj holds element (b0+jj) in its low nibble and element
+ * (b0+jj+16) in its high nibble.  Used by the split v2 kernels to keep all
+ * 256 lanes busy when the block count is below 256. */
+static float mxfp4_partial_dot(ByteAddressBuffer w, uint bbase,
+                               StructuredBuffer<float> x, uint xb,
+                               uint b0, uint bc) {
+    float d = e8m0_to_f32(q8_byte_at(w, bbase, 0u));
+    float acc = 0.0f;
+    for (uint jj = 0u; jj < bc; jj++) {
+        uint q = q8_byte_at(w, bbase + 1u, b0 + jj);
+        acc += d * mxfp4_value(q & 0xfu) * x[xb + b0 + jj];
+        acc += d * mxfp4_value(q >> 4u) * x[xb + b0 + jj + 16u];
+    }
+    return acc;
+}
+
+/* v2: same as moe_gate_up_mid_mxfp4 but two lanes share each 32-value block
+ * (half the qs bytes each) so all 256 lanes are active at in_dim/32 blocks
+ * (e.g. 128 at in_dim=4096).  The tree reduce is unchanged. */
+[numthreads(256, 1, 1)]
+void moe_gate_up_mid_mxfp4_v2(uint3 gid_grp : SV_GroupID,
+                              uint tid : SV_GroupThreadID) {
+    uint row = gid_grp.x;
+    uint pair = gid_grp.y;
+    uint mid_dim = params.out_dim;
+    uint n_expert = params.index;
+    uint n_tokens = params.rows;
+    uint blocks = params.blocks;
+    uint expert_bytes = params.aux;
+    uint row_bytes = params.ratio;
+    if (row >= mid_dim || pair >= n_tokens * n_expert) return;
+    uint tok = pair / n_expert;
+    uint slot = pair - tok * n_expert;
+    int sel = selected_buf[tok * n_expert + slot];
+    if (sel < 0) sel = 0;
+    uint expert;
+    if ((params.flags & 1u) != 0u) {
+        int ts = tbl_buf[sel];
+        if (ts < 0) ts = 0;
+        expert = (uint)ts;
+    } else {
+        expert = (uint)sel;
+    }
+    uint gbase = expert * expert_bytes + row * row_bytes;
+    uint b = tid >> 1u;
+    uint h = tid & 1u;
+    float gacc = 0.0f;
+    float uacc = 0.0f;
+    for (; b < blocks; b += 128u) {
+        uint xb = tok * params.in_dim + b * 32u;
+        gacc += mxfp4_partial_dot(w_buf, gbase + b * 17u, a_buf, xb, h * 8u, 8u);
+        uacc += mxfp4_partial_dot(up_w_buf, gbase + b * 17u, a_buf, xb,
+                                  h * 8u, 8u);
+    }
+    moe_gate_red[tid] = gacc;
+    moe_up_red[tid] = uacc;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            moe_gate_red[tid] += moe_gate_red[tid + stride];
+            moe_up_red[tid] += moe_up_red[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        float g = moe_gate_red[0];
+        float u = moe_up_red[0];
+        if (params.clamp > 1.0e-6f) {
+            g = min(g, params.clamp);
+            u = min(max(u, -params.clamp), params.clamp);
+        }
+        uint off = pair * mid_dim + row;
+        out2_buf[off] = g;
+        out3_buf[off] = u;
+        out4_buf[off] = (g / (1.0f + exp(-g))) * u *
+                        weights_buf[tok * n_expert + slot];
+    }
+}
+
+/* v2 down: four lanes share each 32-value block (four qs bytes each) so all
+ * 256 lanes are active at mid_dim/32 blocks (e.g. 64 at mid_dim=2048). */
+[numthreads(256, 1, 1)]
+void moe_down_mxfp4_v2(uint3 gid_grp : SV_GroupID,
+                       uint tid : SV_GroupThreadID) {
+    uint row = gid_grp.x;
+    uint pair = gid_grp.y;
+    uint out_dim = params.out_dim;
+    uint n_expert = params.index;
+    uint n_tokens = params.rows;
+    uint blocks = params.blocks;
+    uint expert_bytes = params.aux;
+    uint row_bytes = params.ratio;
+    if (row >= out_dim || pair >= n_tokens * n_expert) return;
+    uint tok = pair / n_expert;
+    uint slot = pair - tok * n_expert;
+    int sel = selected_buf[tok * n_expert + slot];
+    if (sel < 0) sel = 0;
+    uint expert;
+    if ((params.flags & 1u) != 0u) {
+        int ts = tbl_buf[sel];
+        if (ts < 0) ts = 0;
+        expert = (uint)ts;
+    } else {
+        expert = (uint)sel;
+    }
+    uint bbase = expert * expert_bytes + row * row_bytes;
+    uint b = tid >> 2u;
+    uint h = tid & 3u;
+    float acc = 0.0f;
+    for (; b < blocks; b += 64u) {
+        uint xb = pair * params.in_dim + b * 32u;
+        acc += mxfp4_partial_dot(w_buf, bbase + b * 17u, a_buf, xb, h * 4u, 4u);
+    }
+    moe_down_red[tid] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            moe_down_red[tid] += moe_down_red[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        out4_buf[pair * out_dim + row] = moe_down_red[0];
+    }
+}

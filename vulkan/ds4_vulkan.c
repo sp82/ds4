@@ -201,7 +201,7 @@ static void vulkan_device_wait(void) {
     pthread_mutex_unlock(&g_device_wait_mutex);
 }
 
-#define DS4_VK_PIPE_COUNT 69
+#define DS4_VK_PIPE_COUNT 71
 static VkPipeline     g_pipes[DS4_VK_PIPE_COUNT];
 static VkShaderModule g_mods[DS4_VK_PIPE_COUNT];
 
@@ -273,6 +273,8 @@ enum ds4_vk_pipe {
     DS4_PIPE_ATTN_OUTPUT_LOW_Q4K,
     DS4_PIPE_MOE_GATE_UP_MID_MXFP4,
     DS4_PIPE_MOE_DOWN_MXFP4,
+    DS4_PIPE_MOE_GATE_UP_MID_MXFP4_V2,
+    DS4_PIPE_MOE_DOWN_MXFP4_V2,
     DS4_PIPE_MATMUL_Q4K,
     DS4_PIPE_MATMUL_Q4_0,
 };
@@ -1331,6 +1333,11 @@ static int vulkan_compute_init(void) {
           "moe_gate_up_mid_mxfp4" },
         { ds4_spv_moe_down_mxfp4, ds4_spv_moe_down_mxfp4_len,
           "moe_down_mxfp4" },
+        { ds4_spv_moe_gate_up_mid_mxfp4_v2,
+          ds4_spv_moe_gate_up_mid_mxfp4_v2_len,
+          "moe_gate_up_mid_mxfp4_v2" },
+        { ds4_spv_moe_down_mxfp4_v2, ds4_spv_moe_down_mxfp4_v2_len,
+          "moe_down_mxfp4_v2" },
         { ds4_spv_matmul_q4k, ds4_spv_matmul_q4k_len, "matmul_q4k" },
         { ds4_spv_matmul_q4_0, ds4_spv_matmul_q4_0_len, "matmul_q4_0" },
     };
@@ -3463,6 +3470,22 @@ static VkPipeline vulkan_pipe_moe_down_q2k(void) {
         return g_pipes[DS4_PIPE_MOE_DOWN_Q2K];
     }
     return g_pipes[DS4_PIPE_MOE_DOWN_Q2K_V2];
+}
+
+/* MXFP4 routed MoE: default v2 (split lanes so all 256 are active at the real
+ * block counts).  MOE_MXFP4:0 forces the one-lane-per-block v1. */
+static VkPipeline vulkan_pipe_moe_mxfp4_gate(void) {
+    if (vulkan_force_variant("MOE_MXFP4", "0")) {
+        return g_pipes[DS4_PIPE_MOE_GATE_UP_MID_MXFP4];
+    }
+    return g_pipes[DS4_PIPE_MOE_GATE_UP_MID_MXFP4_V2];
+}
+
+static VkPipeline vulkan_pipe_moe_mxfp4_down(void) {
+    if (vulkan_force_variant("MOE_MXFP4", "0")) {
+        return g_pipes[DS4_PIPE_MOE_DOWN_MXFP4];
+    }
+    return g_pipes[DS4_PIPE_MOE_DOWN_MXFP4_V2];
 }
 
 /* Prequantized Q8_0 matmul: quantize x into scratch int8 blocks + scales,
@@ -6089,7 +6112,7 @@ static int vulkan_routed_moe_launch(
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT5, mid);
     if (pool_mode) binds[nb++] = tbl_b;
     const VkPipeline gate_pipe = mxfp4_path ?
-        g_pipes[DS4_PIPE_MOE_GATE_UP_MID_MXFP4] :
+        vulkan_pipe_moe_mxfp4_gate() :
         (q4_path ? g_pipes[DS4_PIPE_MOE_GATE_UP_MID_Q4K] :
          (iq2_path ? vulkan_pipe_moe_gate_iq2()
                    : g_pipes[DS4_PIPE_MOE_GATE_UP_MID_Q8]));
@@ -6112,7 +6135,7 @@ static int vulkan_routed_moe_launch(
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT5, down);
     if (pool_mode) binds[nb++] = tbl_b;
     const VkPipeline down_pipe = mxfp4_path ?
-        g_pipes[DS4_PIPE_MOE_DOWN_MXFP4] :
+        vulkan_pipe_moe_mxfp4_down() :
         (q4_path ? g_pipes[DS4_PIPE_MOE_DOWN_Q4K] :
          (iq2_path ? vulkan_pipe_moe_down_q2k()
                    : g_pipes[DS4_PIPE_MOE_DOWN_Q8]));
