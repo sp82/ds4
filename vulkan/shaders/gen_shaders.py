@@ -82,6 +82,8 @@ SHADERS = [
     ("directional_steering_project", "directional.hlsl",
      "directional_steering_project"),
     ("matmul_q8_0_preq_v2", "matmul_q8_preq.hlsl", "matmul_q8_0_preq_v2"),
+    ("matmul_q8_0_preq_v3", "matmul_q8_preq.hlsl", "matmul_q8_0_preq_v3",
+     ["-T", "cs_6_4"]),
     ("moe_gate_up_mid_iq2xxs_v2", "moe_iq2.hlsl", "moe_gate_up_mid_iq2xxs_v2"),
     ("moe_down_q2k_v2", "moe_iq2.hlsl", "moe_down_q2k_v2"),
     ("moe_gate_up_mid_q4k", "moe_q4k.hlsl", "moe_gate_up_mid_q4k"),

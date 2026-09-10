@@ -128,3 +128,71 @@ void matmul_q8_0_preq_v2(uint3 gid : SV_DispatchThreadID,
         out_buf[tok * out_dim + row] = matmul_red[0];
     }
 }
+
+/* v3: identical mapping to v2 but the int8 dot uses the hardware packed-dot
+ * instruction (dot4add_i8packed -> OpSDot, VK_KHR_shader_integer_dot_product,
+ * compiled as cs_6_4).  The host selects v3 only when the device exposes the
+ * feature and falls back to v2 otherwise. */
+[numthreads(256, 1, 1)]
+void matmul_q8_0_preq_v3(uint3 gid : SV_DispatchThreadID,
+                         uint3 gid_grp : SV_GroupID,
+                         uint tid : SV_GroupThreadID) {
+    uint row = gid_grp.x;
+    uint tok = gid_grp.y;
+    uint out_dim = params.out_dim;
+    uint blocks = params.blocks;
+    if (row >= out_dim || tok >= params.rows) return;
+
+    float acc = 0.0f;
+    uint b = tid >> 1u;   /* Q8 block */
+    uint h = tid & 1u;    /* 16-element half of the block */
+    for (; b < blocks; b += 128u) {
+        uint wblock = row * blocks + b;
+        uint xq_byte = (tok * blocks + b) * 32u + h * 16u;
+        uint xw0 = xq_buf.Load(xq_byte);
+        uint xw1 = xq_buf.Load(xq_byte + 4u);
+        uint xw2 = xq_buf.Load(xq_byte + 8u);
+        uint xw3 = xq_buf.Load(xq_byte + 12u);
+
+        uint ww0, ww1, ww2, ww3;
+        uint w_byte = wblock * 34u + 2u + h * 16u;
+        if ((wblock & 1u) != 0u) {
+            ww0 = w_buf.Load(w_byte);
+            ww1 = w_buf.Load(w_byte + 4u);
+            ww2 = w_buf.Load(w_byte + 8u);
+            ww3 = w_buf.Load(w_byte + 12u);
+        } else {
+            uint wa = w_buf.Load(w_byte - 2u);
+            uint wb = w_buf.Load(w_byte + 2u);
+            uint wc = w_buf.Load(w_byte + 6u);
+            uint wd = w_buf.Load(w_byte + 10u);
+            uint we = w_buf.Load(w_byte + 14u);
+            ww0 = (wa >> 16u) | ((wb & 0xffffu) << 16u);
+            ww1 = (wb >> 16u) | ((wc & 0xffffu) << 16u);
+            ww2 = (wc >> 16u) | ((wd & 0xffffu) << 16u);
+            ww3 = (wd >> 16u) | ((we & 0xffffu) << 16u);
+        }
+
+        int dot = dot4add_i8packed(xw0, ww0, 0);
+        dot = dot4add_i8packed(xw1, ww1, dot);
+        dot = dot4add_i8packed(xw2, ww2, dot);
+        dot = dot4add_i8packed(xw3, ww3, dot);
+
+        uint sw = w_buf.Load((wblock * 34u) & ~3u);
+        uint sbits = (wblock & 1u) != 0u ? (sw >> 16u) : sw;
+        acc += f16tof32(sbits & 0xffffu) *
+               xscale_buf[tok * blocks + b] * (float)dot;
+    }
+
+    matmul_red[tid] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            matmul_red[tid] += matmul_red[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        out_buf[tok * out_dim + row] = matmul_red[0];
+    }
+}
