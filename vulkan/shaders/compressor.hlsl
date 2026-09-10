@@ -40,6 +40,16 @@ void compressor_store(uint3 gid : SV_DispatchThreadID) {
     uint t = gid.x / width;
     uint j = gid.x - t * width;
     uint pos_mod = (params.pos0 + t) % params.ratio;
+    /* Several tokens in the batch can map to the same state row (their
+     * pos_mod collide).  The sequential reference is last-write-wins, so only
+     * the last token for each pos_mod writes; otherwise the concurrent writes
+     * race (observed on NVIDIA).  t_last = largest t < rows with
+     * (pos0 + t) % ratio == pos_mod. */
+    uint t0 = (pos_mod + params.ratio - (params.pos0 % params.ratio)) %
+              params.ratio;
+    uint t_last = t0 + params.ratio *
+                  ((params.rows - 1u - t0) / params.ratio);
+    if (t != t_last) return;
     uint dst_row = params.ratio == 4u ? params.ratio + pos_mod : pos_mod;
     st_kv_buf[dst_row * width + j] = kv_buf[t * width + j];
     st_sc_buf[dst_row * width + j] =
