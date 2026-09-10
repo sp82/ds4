@@ -68,6 +68,10 @@ static int run_one(const char *name,
         ds4_gpu_tensor_alloc((uint64_t)n_tok * out_dim * sizeof(float));
     if (!out) { fprintf(stderr, "kbench: %s alloc failed\n", name); return 1; }
     double t0 = now_ms();
+    /* Batch the iterations into one command scope: a bare dispatch is a
+     * one-shot submit + device wait per call, which measures the round-trip
+     * latency, not the kernel.  Both backends implement begin/end_commands. */
+    ds4_gpu_begin_commands();
     for (int i = 0; i < iters; i++) {
         if (!fn(out, map, map_size, off, in_dim, out_dim, x, n_tok)) {
             fprintf(stderr, "kbench: %s failed at iter %d\n", name, i);
@@ -75,6 +79,7 @@ static int run_one(const char *name,
             return 1;
         }
     }
+    ds4_gpu_end_commands();
     ds4_gpu_synchronize();
     double t1 = now_ms();
     ds4_gpu_tensor_read(out, 0, out_host,
@@ -154,11 +159,13 @@ int main(int argc, char **argv) {
     /* matmul_q8_0: misura la variante v1 e v2 (Fase 7 tuning) e ne confronta
      * l'output (tolleranza 1%, come lo smoke).  Le varianti sono forzate via
      * DS4_VULKAN_FORCE_VARIANT (valutato per dispatch, quindi il toggle a
-     * metà processo funziona); il default a init è la v2. */
+     * metà processo funziona); il default a init è la v3 (dp4a) se il device
+     * espone VK_KHR_shader_integer_dot_product, altrimenti la v2. */
     {
         float *q8_v1 = (float *)malloc((size_t)out_elems * sizeof(float));
         float *q8_v2 = (float *)malloc((size_t)out_elems * sizeof(float));
-        if (q8_v1 && q8_v2) {
+        float *q8_v3 = (float *)malloc((size_t)out_elems * sizeof(float));
+        if (q8_v1 && q8_v2 && q8_v3) {
             setenv("DS4_VULKAN_FORCE_VARIANT", "Q8_PREQ:0", 1);
             run_one("matmul_q8_0", ds4_gpu_matmul_q8_0_tensor, map, buf_size,
                     q8_off, in_dim, out_dim, x, n_tok, iters, q8_v1, out_elems);
@@ -166,6 +173,10 @@ int main(int argc, char **argv) {
             run_one("matmul_q8_0_v2", ds4_gpu_matmul_q8_0_tensor, map,
                     buf_size, q8_off, in_dim, out_dim, x, n_tok, iters,
                     q8_v2, out_elems);
+            setenv("DS4_VULKAN_FORCE_VARIANT", "Q8_PREQ:2", 1);
+            run_one("matmul_q8_0_v3", ds4_gpu_matmul_q8_0_tensor, map,
+                    buf_size, q8_off, in_dim, out_dim, x, n_tok, iters,
+                    q8_v3, out_elems);
             unsetenv("DS4_VULKAN_FORCE_VARIANT");
             uint32_t bad = 0;
             for (uint32_t i = 0; i < out_elems; i++) {
@@ -173,9 +184,16 @@ int main(int argc, char **argv) {
             }
             printf("kbench: parity q8 v1-v2: %s (%u/%u mismatches)\n",
                    bad == 0 ? "OK" : "FAIL", bad, out_elems);
+            bad = 0;
+            for (uint32_t i = 0; i < out_elems; i++) {
+                if (!ref_close(q8_v2[i], q8_v3[i])) bad++;
+            }
+            printf("kbench: parity q8 v2-v3: %s (%u/%u mismatches)\n",
+                   bad == 0 ? "OK" : "FAIL", bad, out_elems);
         }
         free(q8_v1);
         free(q8_v2);
+        free(q8_v3);
     }
     run_one("matmul_f32", ds4_gpu_matmul_f32_tensor, map, buf_size, f32_off,
             in_dim, out_dim, x, n_tok, iters, out_host, out_elems);
