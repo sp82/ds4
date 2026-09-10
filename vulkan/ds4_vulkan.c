@@ -176,30 +176,45 @@ static int g_vulkan_device_dirty = 0;
  * state (double free / context lost). */
 static pthread_mutex_t g_device_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void vulkan_device_wait(void) {
-    if (g_device != VK_NULL_HANDLE) {
-        pthread_mutex_lock(&g_device_wait_mutex);
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        vkDeviceWaitIdle(g_device);
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
-                          (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
-        if (ms > 1000.0 && getenv("DS4_VULKAN_DEBUG_BINDS") != NULL) {
-            fprintf(stderr, "ds4: Vulkan debug: device wait %.0f ms\n", ms);
-        }
+/* Serialize every use of g_queue: the Fase 7 async expert-load worker submits
+ * on g_queue while the main thread also submits and drains it.  Vulkan
+ * requires external synchronization of the queue; without it NVIDIA loses the
+ * device.  (Defined here so vulkan_device_wait can take it too.) */
+static pthread_mutex_t g_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void vulkan_device_wait_impl(int reset_pool) {
+    if (g_device == VK_NULL_HANDLE) return;
+    pthread_mutex_lock(&g_device_wait_mutex);
+    /* vkDeviceWaitIdle drains the queue; the following vkResetDescriptorPool
+     * frees descriptors a still-in-flight submit could reference.  Both must
+     * exclude the worker's queue submits. */
+    pthread_mutex_lock(&g_queue_mutex);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    vkDeviceWaitIdle(g_device);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+                      (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (ms > 1000.0 && getenv("DS4_VULKAN_DEBUG_BINDS") != NULL) {
+        fprintf(stderr, "ds4: Vulkan debug: device wait %.0f ms\n", ms);
     }
     g_vulkan_device_dirty = 0;
     /* Every set allocated for a completed scope is safe to reclaim.  With the
      * static decode map the model windows are no longer re-staged per layer,
      * so this is the per-layer reset point for the descriptor pool (Fase 6
-     * step 3; the pool is only otherwise reset at synchronize). */
-    if (g_desc_pool != VK_NULL_HANDLE && !g_commands_active) {
+     * step 3; the pool is only otherwise reset at synchronize).  The async
+     * worker must NOT reset the pool the main thread allocates from. */
+    if (reset_pool && g_desc_pool != VK_NULL_HANDLE && !g_commands_active) {
         vkResetDescriptorPool(g_device, g_desc_pool, 0);
         g_desc_sets_allocated = 0;
     }
+    pthread_mutex_unlock(&g_queue_mutex);
     pthread_mutex_unlock(&g_device_wait_mutex);
 }
+
+/* Full wait: drain + reclaim the descriptor pool (main thread).  The async
+ * worker uses vulkan_device_wait_impl(0) to drain without touching the pool. */
+static void vulkan_device_wait(void) { vulkan_device_wait_impl(1); }
 
 #define DS4_VK_PIPE_COUNT 72
 static VkPipeline     g_pipes[DS4_VK_PIPE_COUNT];
@@ -1964,13 +1979,8 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 /* --- compute dispatch ---------------------------------------------------- */
 
-/* Every submission to g_queue goes through this helper: Vulkan requires the
- * VkQueue to be externally synchronized, but the async expert-load worker
- * (vulkan_worker_copy_submit_multi) submits concurrently with the main
- * thread.  Without serialization NVIDIA loses the device (AMD tolerated the
- * race).  The lock covers only the submit, not GPU execution, so the async
- * overlap is preserved. */
-static pthread_mutex_t g_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Every submission to g_queue goes through this helper.  The lock covers only
+ * the submit, not GPU execution, so the async overlap is preserved. */
 static VkResult vulkan_queue_submit(uint32_t count, const VkSubmitInfo *si,
                                     VkFence fence) {
     pthread_mutex_lock(&g_queue_mutex);
@@ -5556,7 +5566,7 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
     }
 
     if (g_pool_staging && g_pool_staging->bytes < total) {
-        vulkan_device_wait();
+        vulkan_device_wait_impl(0);
         ds4_gpu_tensor_free(g_pool_staging);
         g_pool_staging = NULL;
     }
