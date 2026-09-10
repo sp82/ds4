@@ -60,6 +60,8 @@ __pycache__/
 /vulkan/AGENTS.md
 /vulkan/shaders/ds4_vulkan_shaders.inc
 /vkbench
+/kbench
+/kbench-cuda
 /vulkan/tools/vkbench/vkbench.o
 /.clangd
 /compile_commands.json
