@@ -37,6 +37,10 @@
 
 #include "shaders/ds4_vulkan_shaders.inc"
 
+/* Defined in ds4_vulkan_unavailable.c: prints once, at backend init, the
+ * categorized list of ds4_gpu_* entry points that are silent stubs. */
+extern "C" void ds4_vulkan_report_unavailable(void);
+
 #define DS4_VULKAN_LOG_PREFIX "ds4: Vulkan "
 
 /* Descriptor bindings shared with the HLSL (see common.hlsl): SRVs on
@@ -1348,6 +1352,7 @@ int ds4_gpu_init(void) {
 
     fprintf(stderr, DS4_VULKAN_LOG_PREFIX "initialized: %s (api 0x%08x)\n",
             g_props.deviceName, (unsigned)g_props.apiVersion);
+    ds4_vulkan_report_unavailable();
     g_gpu[0].device_id = 0;
     g_gpu[0].stream = NULL;
     g_gpu[0].cublas = NULL;
