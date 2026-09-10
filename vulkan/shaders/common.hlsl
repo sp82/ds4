@@ -169,6 +169,84 @@ int s8_at(ByteAddressBuffer w, uint off) {
     return b < 128u ? (int)b : (int)b - 256;
 }
 
+/* --- Q4_K (GGUF type 12) dequant helpers ---------------------------------
+ * 144-byte blocks / 256 values: d (f16) @0, dmin (f16) @2, scales[12] @4,
+ * qs[128] @16.  Eight 32-value groups; group j uses byte_off=(j>>1)*32 and
+ * shift=(j&1)*4 in qs, with a two-level scale/min decoded from scales[]
+ * (q4_k_get_scale_min).  Value = d*sc*nib - dmin*m (nib is not biased). */
+void q4k_scale_min(ByteAddressBuffer w, uint bbase, uint j,
+                   out uint sc, out uint m) {
+    if (j < 4u) {
+        sc = q8_byte_at(w, bbase + 4u, j) & 63u;
+        m  = q8_byte_at(w, bbase + 4u, j + 4u) & 63u;
+    } else {
+        uint a = q8_byte_at(w, bbase + 4u, j + 4u);
+        uint b = q8_byte_at(w, bbase + 4u, j - 4u);
+        uint c = q8_byte_at(w, bbase + 4u, j);
+        sc = (a & 0xfu) | ((b >> 6u) << 4u);
+        m  = (a >> 4u)  | ((c >> 6u) << 4u);
+    }
+}
+
+/* Dot of one 32-value Q4_K sub-block (group j, 0..7) at byte offset bbase
+ * against x[xb..xb+31].  Mirrors ds4_vec_dot_q4_K_f32. */
+float q4k_sub_dot(ByteAddressBuffer w, uint bbase, uint j,
+                  StructuredBuffer<float> x, uint xb) {
+    float d    = f16_at(w, bbase + 0u);
+    float dmin = f16_at(w, bbase + 2u);
+    uint sc, m;
+    q4k_scale_min(w, bbase, j, sc, m);
+    float scale = d * (float)sc;
+    float minv  = dmin * (float)m;
+    uint byte_off = (j >> 1u) * 32u;
+    uint shift = (j & 1u) * 4u;
+    float acc = 0.0f;
+    for (uint l = 0u; l < 32u; l++) {
+        uint qb = q8_byte_at(w, bbase + 16u, byte_off + l);
+        acc += (scale * (float)((qb >> shift) & 0xfu) - minv) * x[xb + l];
+    }
+    return acc;
+}
+
+/* --- MXFP4 (GGUF type 39) dequant helpers --------------------------------
+ * 17-byte blocks / 32 values: e (E8M0 exponent) @0 + qs[16].  qs[j] packs two
+ * 4-bit FP4 (E2M1) codes: low nibble = element j, high nibble = element j+16.
+ * Value = e8m0_to_f32(e) * mxfp4_value(nib).  Mirrors ds4_vec_dot_mxfp4_f32. */
+float mxfp4_value(uint nib) {
+    float mag;
+    switch (nib & 7u) {
+    case 0u: mag = 0.0f; break;
+    case 1u: mag = 0.5f; break;
+    case 2u: mag = 1.0f; break;
+    case 3u: mag = 1.5f; break;
+    case 4u: mag = 2.0f; break;
+    case 5u: mag = 3.0f; break;
+    case 6u: mag = 4.0f; break;
+    default: mag = 6.0f; break;
+    }
+    return (nib & 8u) != 0u ? -mag : mag;
+}
+
+/* E8M0 exponent byte -> f32 (e == 0 -> 2^-127, else 2^(e-127)). */
+float e8m0_to_f32(uint e) {
+    uint bits = (e == 0u) ? 0x00400000u : (e << 23u);
+    return asfloat(bits);
+}
+
+/* Dot of one 32-value MXFP4 block at byte offset bbase against
+ * x[xb..xb+31]. */
+float mxfp4_block_dot(ByteAddressBuffer w, uint bbase,
+                      StructuredBuffer<float> x, uint xb) {
+    float d = e8m0_to_f32(q8_byte_at(w, bbase, 0u));
+    float acc = 0.0f;
+    for (uint j = 0u; j < 16u; j++) {
+        uint q = q8_byte_at(w, bbase + 1u, j);
+        acc += d * mxfp4_value(q & 0xfu) * x[xb + j];
+        acc += d * mxfp4_value(q >> 4u) * x[xb + j + 16u];
+    }
+    return acc;
+}
+
 /* Read a model scalar at a byte offset: type 0 = f32, 1 = f16 (the
  * compressor ape tensors).  Mirrors CUDA model_scalar_dev. */
 float model_scalar(ByteAddressBuffer w, uint base, uint type, uint idx) {

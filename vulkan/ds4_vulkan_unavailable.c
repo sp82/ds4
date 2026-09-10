@@ -24,8 +24,6 @@
         fprintf(stderr, "ds4: Vulkan unavailable: %s\n", #name); \
     }
 
-VULKAN_UNAVAILABLE_INT(ds4_gpu_attention_output_low_q4_K_slice_tensor)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_attention_output_q4_K_batch_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_attention_prefill_raw_heads_range_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_device_cache_support_tensors)

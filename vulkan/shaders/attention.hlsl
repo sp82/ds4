@@ -498,3 +498,51 @@ void attn_output_low_q8(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID) {
         heads_buf[t * (group_cnt * rank) + row] = attn_partial[0];
     }
 }
+
+/* Low-rank projection of the attention output (grouped Q4_K): same math and
+ * layout as attn_output_low_q8, but out_a is Q4_K (144-byte 256-value blocks)
+ * and the activation heads are used raw (f32, no inline Q8 quantization).
+ *
+ * params: n=group_dim, in_dim=group_dim, out_dim=rank, blocks=group_dim/256,
+ * index=n_groups (total groups in heads), aux=group0, n_rot=group_cnt,
+ * rows=n_rows.  group_dim must be a multiple of 256. */
+[numthreads(256, 1, 1)]
+void attn_output_low_q4k(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID) {
+    uint row = gid.x;            /* local output row: 0 .. group_cnt*rank-1 */
+    uint t = gid.y;
+    uint rank = params.out_dim;
+    uint group_dim = params.n;
+    uint blocks = params.blocks;
+    uint n_groups_total = params.index;
+    uint group0 = params.aux;
+    uint group_cnt = params.n_rot;
+    uint n_rows = params.rows;
+    if (row >= group_cnt * rank || t >= n_rows) return;
+
+    uint local_g = row / rank;
+    uint r = row % rank;
+    uint g = group0 + local_g;
+    uint wrow = local_g * rank + r;    /* out_a row index within the slice */
+    uint xbase = t * n_groups_total * group_dim + g * group_dim;
+
+    float acc = 0.0f;
+    for (uint b = tid; b < blocks; b += 256u) {
+        uint bbase = (wrow * blocks + b) * 144u;
+        uint xb = xbase + b * 256u;
+        for (uint j = 0u; j < 8u; j++) {
+            acc += q4k_sub_dot(sink_buf, bbase, j, q_buf, xb + j * 32u);
+        }
+    }
+
+    attn_partial[tid] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            attn_partial[tid] += attn_partial[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        heads_buf[t * (group_cnt * rank) + row] = attn_partial[0];
+    }
+}
