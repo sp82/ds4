@@ -116,6 +116,7 @@ static bool              g_commands_active = false;
  * reuse safety) and the main waits the fence (vulkan_pool_commit_pending)
  * right before dispatching the MoE that reads the pool. */
 static pthread_mutex_t   g_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static VkCommandPool     g_worker_pool  = VK_NULL_HANDLE;
 static VkCommandBuffer   g_worker_cb   = VK_NULL_HANDLE;
 static VkFence           g_worker_fence = VK_NULL_HANDLE;
 static int               g_worker_fence_pending = 0;
@@ -1416,6 +1417,10 @@ void ds4_gpu_cleanup(void) {
             vkDestroyFence(g_device, g_worker_fence, NULL);
             g_worker_fence = VK_NULL_HANDLE;
         }
+        if (g_worker_pool != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(g_device, g_worker_pool, NULL);
+            g_worker_pool = VK_NULL_HANDLE;
+        }
         vkDestroyCommandPool(g_device, g_cmd_pool, NULL);
         vkDestroyDevice(g_device, NULL);
     }
@@ -1429,6 +1434,7 @@ void ds4_gpu_cleanup(void) {
     g_cmd_pool = VK_NULL_HANDLE;
     g_cmd[0] = VK_NULL_HANDLE;
     g_cmd[1] = VK_NULL_HANDLE;
+    g_worker_cb = VK_NULL_HANDLE;
     g_cmd_i = 0;
     g_commands_active = false;
     g_readback_fence_pending = 0;
@@ -1906,6 +1912,21 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 /* --- compute dispatch ---------------------------------------------------- */
 
+/* Every submission to g_queue goes through this helper: Vulkan requires the
+ * VkQueue to be externally synchronized, but the async expert-load worker
+ * (vulkan_worker_copy_submit_multi) submits concurrently with the main
+ * thread.  Without serialization NVIDIA loses the device (AMD tolerated the
+ * race).  The lock covers only the submit, not GPU execution, so the async
+ * overlap is preserved. */
+static pthread_mutex_t g_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static VkResult vulkan_queue_submit(uint32_t count, const VkSubmitInfo *si,
+                                    VkFence fence) {
+    pthread_mutex_lock(&g_queue_mutex);
+    const VkResult rc = vkQueueSubmit(g_queue, count, si, fence);
+    pthread_mutex_unlock(&g_queue_mutex);
+    return rc;
+}
+
 /* One-shot submit of the current compute CB (used when the caller dispatches
  * without an open command scope): end, submit, wait, reset. */
 static int vulkan_submit_one_shot(void) {
@@ -1914,7 +1935,7 @@ static int vulkan_submit_one_shot(void) {
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cmd[g_cmd_i];
-    VkResult rc = vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE);
+    VkResult rc = vulkan_queue_submit(1, &si, VK_NULL_HANDLE);
     if (rc != VK_SUCCESS) {
         vulkan_log_vk(rc, "vkQueueSubmit");
         return 0;
@@ -1978,7 +1999,7 @@ static int vulkan_cb_submit(void) {
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cmd[g_cmd_i];
-    const VkResult rc = vkQueueSubmit(g_queue, 1, &si, g_cmd_fence[g_cmd_i]);
+    const VkResult rc = vulkan_queue_submit(1, &si, g_cmd_fence[g_cmd_i]);
     if (rc != VK_SUCCESS) {
         vulkan_log_vk(rc, "vkQueueSubmit(scope)");
         return 0;
@@ -2012,10 +2033,22 @@ static int vulkan_worker_cb_ensure(void) {
     if (g_worker_cb != VK_NULL_HANDLE && g_worker_fence != VK_NULL_HANDLE) return 1;
     if (g_device == VK_NULL_HANDLE) return 0;
     if (g_worker_cb == VK_NULL_HANDLE) {
-        if (g_cmd_pool == VK_NULL_HANDLE) return 0;
+        /* Dedicated pool: the main thread records g_cmd[] from g_cmd_pool
+         * concurrently, and a command pool must not be used from two threads
+         * without external synchronization (NVIDIA faults with Xid 13). */
+        if (g_worker_pool == VK_NULL_HANDLE) {
+            VkCommandPoolCreateInfo cpci = {};
+            cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            cpci.queueFamilyIndex = g_queue_family;
+            if (vkCreateCommandPool(g_device, &cpci, NULL,
+                                    &g_worker_pool) != VK_SUCCESS) {
+                return 0;
+            }
+        }
         VkCommandBufferAllocateInfo cbai = {};
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cbai.commandPool = g_cmd_pool;
+        cbai.commandPool = g_worker_pool;
         cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cbai.commandBufferCount = 1;
         if (vkAllocateCommandBuffers(g_device, &cbai, &g_worker_cb) != VK_SUCCESS) {
@@ -2048,6 +2081,13 @@ static int vulkan_worker_copy_submit_multi(VkBuffer src, VkBuffer dst,
         pthread_mutex_unlock(&g_worker_mutex);
         return 0;
     }
+    /* The worker CB is single-buffered: a previous submission of it may still
+     * be executing.  Wait its fence before re-recording (Vulkan forbids
+     * modifying a command buffer while it is in use; NVIDIA faults with Xid
+     * 13).  The main thread's own wait on the same fence is idempotent. */
+    if (g_worker_fence_pending) {
+        vkWaitForFences(g_device, 1, &g_worker_fence, VK_TRUE, UINT64_MAX);
+    }
     if (vkResetCommandBuffer(g_worker_cb, 0) != VK_SUCCESS ||
         vkResetFences(g_device, 1, &g_worker_fence) != VK_SUCCESS) {
         pthread_mutex_unlock(&g_worker_mutex);
@@ -2076,7 +2116,7 @@ static int vulkan_worker_copy_submit_multi(VkBuffer src, VkBuffer dst,
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_worker_cb;
-    const VkResult rc = vkQueueSubmit(g_queue, 1, &si, g_worker_fence);
+    const VkResult rc = vulkan_queue_submit(1, &si, g_worker_fence);
     if (rc != VK_SUCCESS) {
         vulkan_log_vk(rc, "vkQueueSubmit(worker copy)");
         pthread_mutex_unlock(&g_worker_mutex);
@@ -2171,7 +2211,7 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &g_cmd[g_cmd_i];
-        const VkResult rc = vkQueueSubmit(g_queue, 1, &si, g_readback_fence);
+        const VkResult rc = vulkan_queue_submit(1, &si, g_readback_fence);
         double wq = 0.0;
         if (rc == VK_SUCCESS) {
             wq = 0.0;
@@ -2213,7 +2253,7 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cmd[g_cmd_i];
-    const VkResult rc = vkQueueSubmit(g_queue, 1, &si, g_readback_fence);
+    const VkResult rc = vulkan_queue_submit(1, &si, g_readback_fence);
     g_commands_active = false;
     if (rc != VK_SUCCESS) {
         vulkan_log_vk(rc, "vkQueueSubmit(readback scope)");
