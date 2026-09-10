@@ -120,6 +120,8 @@ static VkCommandPool     g_worker_pool  = VK_NULL_HANDLE;
 static VkCommandBuffer   g_worker_cb   = VK_NULL_HANDLE;
 static VkFence           g_worker_fence = VK_NULL_HANDLE;
 static int               g_worker_fence_pending = 0;
+/* VK_KHR_shader_integer_dot_product available (hardware packed int8 dot). */
+static int               g_has_int_dot = 0;
 /* Fence signaling the router-scope submission that produced the selection
  * read back by the worker (signal_selected_readback_ready / wait). */
 static VkFence           g_readback_fence = VK_NULL_HANDLE;
@@ -199,7 +201,7 @@ static void vulkan_device_wait(void) {
     pthread_mutex_unlock(&g_device_wait_mutex);
 }
 
-#define DS4_VK_PIPE_COUNT 68
+#define DS4_VK_PIPE_COUNT 69
 static VkPipeline     g_pipes[DS4_VK_PIPE_COUNT];
 static VkShaderModule g_mods[DS4_VK_PIPE_COUNT];
 
@@ -263,6 +265,7 @@ enum ds4_vk_pipe {
     DS4_PIPE_COMPRESSOR_SHIFT_RATIO4,
     DS4_PIPE_DIRECTIONAL_STEERING_PROJECT,
     DS4_PIPE_MATMUL_Q8_0_PREQ_V2,
+    DS4_PIPE_MATMUL_Q8_0_PREQ_V3,
     DS4_PIPE_MOE_GATE_UP_MID_IQ2XXS_V2,
     DS4_PIPE_MOE_DOWN_Q2K_V2,
     DS4_PIPE_MOE_GATE_UP_MID_Q4K,
@@ -954,10 +957,14 @@ static VkResult vulkan_create_device(void) {
      * (with BDA the driver packs buffers into a dense VA range, which masks
      * the over-read fault we are chasing). */
     const char *bda_ext = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
-    const char *dev_exts[1];
+    const char *intdot_ext =
+        VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
+    const char *dev_exts[2];
     uint32_t n_dev_exts = 0;
+    const int want_bda = getenv("DS4_VULKAN_DEBUG_BINDS") != NULL;
     VkPhysicalDeviceFeatures2 feat2 = {};
     VkPhysicalDeviceDescriptorIndexingFeatures desc_index = {};
+    VkPhysicalDeviceShaderIntegerDotProductFeatures intdot_feat = {};
     VkPhysicalDeviceBufferDeviceAddressFeatures bda_feat = {};
     VkPhysicalDeviceFeatures dev_feats = {};
     vkGetPhysicalDeviceFeatures(g_phys, &dev_feats);
@@ -966,7 +973,10 @@ static VkResult vulkan_create_device(void) {
          * diagnostic to confirm an OOB write and to let the decode proceed. */
         dev_feats.robustBufferAccess = VK_TRUE;
     }
-    if (getenv("DS4_VULKAN_DEBUG_BINDS") != NULL) {
+    /* Probe device extensions once: VK_KHR_shader_integer_dot_product (always;
+     * drives the Q8 preq v3 hardware-dot selection) and
+     * VK_KHR_buffer_device_address (debug env only, see the comment above). */
+    {
         uint32_t dext_n = 0;
         if (vkEnumerateDeviceExtensionProperties(g_phys, NULL, &dext_n, NULL) ==
             VK_SUCCESS && dext_n > 0) {
@@ -975,36 +985,54 @@ static VkResult vulkan_create_device(void) {
             if (dexts) {
                 vkEnumerateDeviceExtensionProperties(g_phys, NULL, &dext_n, dexts);
                 for (uint32_t i = 0; i < dext_n; i++) {
-                    if (strcmp(dexts[i].extensionName, bda_ext) == 0) {
+                    if (strcmp(dexts[i].extensionName, intdot_ext) == 0) {
+                        dev_exts[n_dev_exts++] = intdot_ext;
+                        g_has_int_dot = 1;
+                    } else if (want_bda &&
+                               strcmp(dexts[i].extensionName, bda_ext) == 0) {
                         dev_exts[n_dev_exts++] = bda_ext;
-                        break;
                     }
                 }
                 free(dexts);
             }
         }
-        if (n_dev_exts > 0) {
-            bda_feat.sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-            bda_feat.bufferDeviceAddress = VK_TRUE;
-        }
+    }
+    int have_bda = 0;
+    for (uint32_t i = 0; i < n_dev_exts; i++) {
+        if (dev_exts[i] == bda_ext) have_bda = 1;
+    }
+    if (g_has_int_dot) {
+        intdot_feat.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+        intdot_feat.shaderIntegerDotProduct = VK_TRUE;
+    }
+    if (have_bda) {
+        bda_feat.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+        bda_feat.bufferDeviceAddress = VK_TRUE;
     }
     /* The shared descriptor set layout marks every binding PARTIALLY_BOUND so
      * kernels may leave unused bindings unwritten.  That flag is only legal
      * when the feature is enabled at device creation; without it the driver
      * (NVIDIA in particular) ignores it and a dispatch with an unwritten
-     * descriptor faults the GPU (device lost). */
+     * descriptor faults the GPU (device lost).  Chain: desc_index -> intdot
+     * -> bda. */
     desc_index.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
     desc_index.descriptorBindingPartiallyBound = VK_TRUE;
+    void *chain = NULL;
+    if (have_bda) {
+        bda_feat.pNext = chain;
+        chain = &bda_feat;
+    }
+    if (g_has_int_dot) {
+        intdot_feat.pNext = chain;
+        chain = &intdot_feat;
+    }
+    desc_index.pNext = chain;
     feat2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     feat2.features = dev_feats;
-    if (n_dev_exts > 0) {
-        bda_feat.pNext = &desc_index;
-        feat2.pNext = &bda_feat;
-    } else {
-        feat2.pNext = &desc_index;
-    }
+    feat2.pNext = &desc_index;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci = {};
@@ -1287,6 +1315,8 @@ static int vulkan_compute_init(void) {
           "directional_steering_project" },
         { ds4_spv_matmul_q8_0_preq_v2, ds4_spv_matmul_q8_0_preq_v2_len,
           "matmul_q8_0_preq_v2" },
+        { ds4_spv_matmul_q8_0_preq_v3, ds4_spv_matmul_q8_0_preq_v3_len,
+          "matmul_q8_0_preq_v3" },
         { ds4_spv_moe_gate_up_mid_iq2xxs_v2,
           ds4_spv_moe_gate_up_mid_iq2xxs_v2_len,
           "moe_gate_up_mid_iq2xxs_v2" },
@@ -1305,6 +1335,14 @@ static int vulkan_compute_init(void) {
         { ds4_spv_matmul_q4_0, ds4_spv_matmul_q4_0_len, "matmul_q4_0" },
     };
     for (uint32_t i = 0; i < DS4_VK_PIPE_COUNT; i++) {
+        /* v3 uses OpSDot and can only be created when the device exposes
+         * VK_KHR_shader_integer_dot_product; the selector never returns it
+         * otherwise. */
+        if (i == DS4_PIPE_MATMUL_Q8_0_PREQ_V3 && !g_has_int_dot) {
+            g_mods[i] = VK_NULL_HANDLE;
+            g_pipes[i] = VK_NULL_HANDLE;
+            continue;
+        }
         g_mods[i] = vulkan_create_shader_module(pipes[i].code, pipes[i].len);
         if (!g_mods[i]) return 0;
         g_pipes[i] = vulkan_create_compute_pipeline(g_mods[i], g_pipe_layout,
@@ -3394,6 +3432,16 @@ static int vulkan_force_variant(const char *slot, const char *idx) {
 static VkPipeline vulkan_pipe_q8_preq(void) {
     if (vulkan_force_variant("Q8_PREQ", "0")) {
         return g_pipes[DS4_PIPE_MATMUL_Q8_0_PREQ];
+    }
+    if (vulkan_force_variant("Q8_PREQ", "1")) {
+        return g_pipes[DS4_PIPE_MATMUL_Q8_0_PREQ_V2];
+    }
+    if (g_has_int_dot && vulkan_force_variant("Q8_PREQ", "2")) {
+        return g_pipes[DS4_PIPE_MATMUL_Q8_0_PREQ_V3];
+    }
+    /* Default: the hardware packed-dot v3 when available, else v2. */
+    if (g_has_int_dot) {
+        return g_pipes[DS4_PIPE_MATMUL_Q8_0_PREQ_V3];
     }
     return g_pipes[DS4_PIPE_MATMUL_Q8_0_PREQ_V2];
 }
