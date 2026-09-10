@@ -956,6 +956,7 @@ static VkResult vulkan_create_device(void) {
     const char *dev_exts[1];
     uint32_t n_dev_exts = 0;
     VkPhysicalDeviceFeatures2 feat2 = {};
+    VkPhysicalDeviceDescriptorIndexingFeatures desc_index = {};
     VkPhysicalDeviceBufferDeviceAddressFeatures bda_feat = {};
     VkPhysicalDeviceFeatures dev_feats = {};
     vkGetPhysicalDeviceFeatures(g_phys, &dev_feats);
@@ -987,10 +988,21 @@ static VkResult vulkan_create_device(void) {
             bda_feat.bufferDeviceAddress = VK_TRUE;
         }
     }
+    /* The shared descriptor set layout marks every binding PARTIALLY_BOUND so
+     * kernels may leave unused bindings unwritten.  That flag is only legal
+     * when the feature is enabled at device creation; without it the driver
+     * (NVIDIA in particular) ignores it and a dispatch with an unwritten
+     * descriptor faults the GPU (device lost). */
+    desc_index.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+    desc_index.descriptorBindingPartiallyBound = VK_TRUE;
     feat2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     feat2.features = dev_feats;
     if (n_dev_exts > 0) {
+        bda_feat.pNext = &desc_index;
         feat2.pNext = &bda_feat;
+    } else {
+        feat2.pNext = &desc_index;
     }
 
     const float priority = 1.0f;
@@ -1006,7 +1018,7 @@ static VkResult vulkan_create_device(void) {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = n_dev_exts;
     dci.ppEnabledExtensionNames = n_dev_exts ? dev_exts : NULL;
-    if (n_dev_exts > 0 || dev_feats.robustBufferAccess) dci.pNext = &feat2;
+    dci.pNext = &feat2;
 
     VkResult rc = vkCreateDevice(g_phys, &dci, NULL, &g_device);
     if (rc != VK_SUCCESS) {
@@ -1118,11 +1130,16 @@ static int vulkan_compute_init(void) {
         { DS4_VK_BINDING_TBL, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
           VK_SHADER_STAGE_COMPUTE_BIT, NULL },
     };
-    const VkDescriptorBindingFlags flags =
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    const uint32_t n_bindings =
+        (uint32_t)(sizeof(bindings) / sizeof(bindings[0]));
+    VkDescriptorBindingFlags binding_flags[sizeof(bindings) /
+                                           sizeof(bindings[0])];
+    for (uint32_t bi = 0; bi < n_bindings; bi++) {
+        binding_flags[bi] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    }
     const VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info = {
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
-        NULL, sizeof(bindings) / sizeof(bindings[0]), &flags,
+        NULL, n_bindings, binding_flags,
     };
     VkDescriptorSetLayoutCreateInfo dslci = {};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
