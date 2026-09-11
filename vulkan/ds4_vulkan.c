@@ -1431,6 +1431,8 @@ static void vulkan_compute_cleanup(void) {
 
 /* --- public contract: lifecycle ---------------------------------------- */
 
+static void vulkan_autotune_moe_rows(void);
+
 int ds4_gpu_init(void) {
     if (g_device != VK_NULL_HANDLE) return 1; /* already initialized */
 
@@ -1478,6 +1480,7 @@ int ds4_gpu_init(void) {
         ds4_gpu_cleanup();
         return 0;
     }
+    vulkan_autotune_moe_rows();
     return 1;
 }
 
@@ -6117,6 +6120,19 @@ extern "C" void ds4_vulkan_telemetry_snapshot(ds4_gpu_expert_telemetry *t) {
  * address rows as expert*expert_bytes + row*row_bytes (+ 256-value super
  * block offsets for the IQ2_XXS/Q2_K path; rejected when the region would
  * exceed the 32-bit shader addressing). */
+/* Autotuned rows-per-workgroup for the routed-MoE kernels (SPECS_AUTOTUNE.md
+ * §2.5): 0 = not yet autotuned (default 8).  DS4_VULKAN_MOE_ROWS overrides. */
+static uint32_t g_moe_rows = 0;
+
+static uint32_t vulkan_moe_rows_per_group(void) {
+    const char *re = getenv("DS4_VULKAN_MOE_ROWS");
+    if (re && *re) {
+        long v = strtol(re, NULL, 10);
+        if (v >= 1 && v <= 64) return (uint32_t)v;
+    }
+    return g_moe_rows ? g_moe_rows : 8u;
+}
+
 /* Ensure the routed-MoE pair-order scratch holds at least `pairs` uint32. */
 static ds4_gpu_tensor *vulkan_moe_order_ensure(uint64_t pairs) {
     const uint64_t bytes = pairs * sizeof(uint32_t);
@@ -6252,16 +6268,10 @@ static int vulkan_routed_moe_launch(
     struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
     if (pool_mode) p.flags |= 1u;
 
-    /* All routed-MoE gate/down kernels (Q8, IQ2/Q2K, Q4_K, MXFP4; v1 and v2)
-     * honour params.rsvd2 = rows per workgroup, so the prefill grid can be
-     * collapsed on every path (see SPECS_AUTOTUNE.md §2.5). */
-    uint32_t moe_R = 1u;
-    {
-        const char *re = getenv("DS4_VULKAN_MOE_ROWS");
-        moe_R = (re && *re) ? (uint32_t)strtoul(re, NULL, 10) : 8u;
-        if (moe_R < 1u) moe_R = 1u;
-        if (moe_R > 64u) moe_R = 64u;
-    }
+    /* All routed-MoE gate/down kernels honour params.rsvd2 = rows per
+     * workgroup, so the prefill grid can be collapsed on every path
+     * (see SPECS_AUTOTUNE.md §2.5). */
+    const uint32_t moe_R = vulkan_moe_rows_per_group();
     p.rsvd2 = moe_R;
 
     /* Opt-in expert grouping (DS4_VULKAN_MOE_GROUP): reorder the (token,
@@ -6423,6 +6433,119 @@ int ds4_gpu_routed_moe_batch_tensor(
             down_row_bytes, expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens,
             layer_index);
+}
+
+/* SPECS_AUTOTUNE.md §2.5: pick R (rows-per-workgroup) for the routed-MoE
+ * kernels by timing a small prefill-shaped MoE dispatch at init, before the
+ * model is loaded.  R is a per-device dispatch property, so one probe on the
+ * MXFP4 layout serves every quant path.  Cheap (~0.2 s worst case) and it
+ * leaves the runtime exactly as the explicit DS4_VULKAN_MOE_ROWS override
+ * would.  Skipped when DS4_VULKAN_MOE_ROWS is set or DS4_VULKAN_AUTOTUNE_OFF=1;
+ * DS4_VULKAN_AUTOTUNE_PROFILE=1 logs each measurement. */
+static void vulkan_autotune_moe_rows(void) {
+    if (getenv("DS4_VULKAN_AUTOTUNE_OFF")) return;
+    {
+        const char *re = getenv("DS4_VULKAN_MOE_ROWS");
+        if (re && *re) return;
+    }
+    /* MXFP4 (type 39) layout: 8 experts, 16 tokens x 6 used. */
+    const uint32_t n_tok = 16u, n_used = 6u, n_total = 8u;
+    const uint32_t in_dim = 4096u, mid_dim = 2048u, out_dim = 4096u;
+    const uint64_t gate_row = (in_dim / 32u) * 17u;
+    const uint64_t down_row = (mid_dim / 32u) * 17u;
+    const uint64_t gate_expert = (uint64_t)mid_dim * gate_row;
+    const uint64_t down_expert = (uint64_t)out_dim * down_row;
+    const uint64_t gate_region = (uint64_t)n_total * gate_expert;
+    const uint64_t down_region = (uint64_t)n_total * down_expert;
+    const uint64_t up_off = gate_region;
+    const uint64_t down_off = 2u * gate_region;
+    const uint64_t map_size =
+        (down_off + down_region + 4095u) & ~(uint64_t)4095u;
+    const uint64_t pairs = (uint64_t)n_tok * n_used;
+
+    uint8_t *map = NULL;
+    ds4_gpu_tensor *x = NULL, *sel = NULL, *w = NULL, *gate = NULL;
+    ds4_gpu_tensor *up = NULL, *mid = NULL, *down = NULL, *out = NULL;
+    float *xv = NULL;
+    int32_t *sv = NULL;
+    float *wv = NULL;
+
+    if (posix_memalign((void **)&map, 4096, (size_t)map_size) == 0) {
+        for (uint64_t i = 0; i < map_size; i++)
+            map[i] = (uint8_t)(i * 131u + 7u);
+        x = ds4_gpu_tensor_alloc((uint64_t)n_tok * in_dim * 4u);
+        sel = ds4_gpu_tensor_alloc(pairs * 4u);
+        w = ds4_gpu_tensor_alloc(pairs * 4u);
+        gate = ds4_gpu_tensor_alloc(pairs * mid_dim * 4u);
+        up = ds4_gpu_tensor_alloc(pairs * mid_dim * 4u);
+        mid = ds4_gpu_tensor_alloc(pairs * mid_dim * 4u);
+        down = ds4_gpu_tensor_alloc(pairs * out_dim * 4u);
+        out = ds4_gpu_tensor_alloc((uint64_t)n_tok * out_dim * 4u);
+    } else {
+        map = NULL;
+    }
+    if (x && sel && w && gate && up && mid && down && out) {
+        xv = (float *)malloc((size_t)n_tok * in_dim * 4u);
+        sv = (int32_t *)malloc((size_t)pairs * 4u);
+        wv = (float *)malloc((size_t)pairs * 4u);
+    }
+    if (map && xv && sv && wv) {
+        for (uint32_t i = 0; i < n_tok * in_dim; i++)
+            xv[i] = 0.2f * (float)(i % 13u) - 0.5f;
+        for (uint64_t i = 0; i < pairs; i++) {
+            sv[i] = (int32_t)((i * 5u + 1u) % n_total);
+            wv[i] = 0.3f + 0.1f * (float)(i % 5u);
+        }
+        ds4_gpu_set_model_map(map, map_size);
+        ds4_gpu_tensor_write(x, 0, xv, (uint64_t)n_tok * in_dim * 4u);
+        ds4_gpu_tensor_write(sel, 0, sv, pairs * 4u);
+        ds4_gpu_tensor_write(w, 0, wv, pairs * 4u);
+
+        static const uint32_t cand[] = { 1u, 4u, 8u };
+        const int iters = 4;
+        const int profile = getenv("DS4_VULKAN_AUTOTUNE_PROFILE") != NULL;
+        uint32_t best = 8u;
+        double best_ms = 0.0;
+        for (size_t ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++) {
+            g_moe_rows = cand[ci];
+            int ok = 1;
+            ds4_gpu_begin_commands();
+            const double t0 = vulkan_now_ms();
+            for (int it = 0; it < iters; it++) {
+                if (!ds4_gpu_routed_moe_batch_tensor(
+                            out, gate, up, mid, down, map, map_size,
+                            0u, up_off, down_off, 39u, 39u,
+                            gate_expert, gate_row, down_expert, down_row,
+                            in_dim, mid_dim, out_dim, sel, w,
+                            n_total, n_used, 5.0f, x, 0u, n_tok, NULL, true)) {
+                    ok = 0;
+                    break;
+                }
+            }
+            ds4_gpu_end_commands();
+            ds4_gpu_synchronize();
+            const double ms = (vulkan_now_ms() - t0) / (double)iters;
+            if (profile)
+                fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                        "autotune: MOE_ROWS R=%u -> %.3f ms @16 tok\n",
+                        cand[ci], ms);
+            if (ok && (best_ms == 0.0 || ms < best_ms)) {
+                best_ms = ms;
+                best = cand[ci];
+            }
+        }
+        g_moe_rows = best;
+        fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                "autotune: MoE rows/workgroup = %u (%.3f ms @16 tok)\n",
+                best, best_ms);
+    }
+
+    free(xv); free(sv); free(wv);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(w);
+    ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
+    ds4_gpu_set_model_map(NULL, 0);
+    free(map);
 }
 
 
