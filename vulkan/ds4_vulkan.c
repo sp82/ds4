@@ -106,7 +106,13 @@ static float             g_ts_period = 0.0f;
 static int               g_ts_on = 0;
 static int               g_ts_started = 0;
 static int               g_ts_router_written = 0;
+static int               g_ts_verbose = 0;
 static uint32_t          g_ts_valid_bits = 0;
+/* Verbose mode (DS4_VULKAN_DEBUG_GPU_TS_VERBOSE): timestamp every dispatch of
+ * a scope and report the per-dispatch GPU time with the pipe name. */
+static uint32_t          g_ts_pipe[96];
+static uint32_t          g_ts_n = 0;
+static char              g_pipe_names[96][24];
 static VkCommandPool     g_cmd_pool  = VK_NULL_HANDLE;
 /* Compute-scope command buffers, double-buffered (Fase 7 flush early-submit):
  * a scope can be submitted while the sibling CB records the next one, so the
@@ -244,7 +250,7 @@ static void vulkan_device_wait_impl(int reset_pool) {
  * worker uses vulkan_device_wait_impl(0) to drain without touching the pool. */
 static void vulkan_device_wait(void) { vulkan_device_wait_impl(1); }
 
-#define DS4_VK_PIPE_COUNT 72
+#define DS4_VK_PIPE_COUNT 73
 static VkPipeline     g_pipes[DS4_VK_PIPE_COUNT];
 static VkShaderModule g_mods[DS4_VK_PIPE_COUNT];
 
@@ -321,6 +327,7 @@ enum ds4_vk_pipe {
     DS4_PIPE_MOE_GROUP,
     DS4_PIPE_MATMUL_Q4K,
     DS4_PIPE_MATMUL_Q4_0,
+    DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2,
 };
 
 /* Whole-model wrapper (Fase 6 step 2 staging pool).  The windows requested by
@@ -1409,12 +1416,21 @@ static int vulkan_compute_init(void) {
         { ds4_spv_moe_group, ds4_spv_moe_group_len, "moe_group" },
         { ds4_spv_matmul_q4k, ds4_spv_matmul_q4k_len, "matmul_q4k" },
         { ds4_spv_matmul_q4_0, ds4_spv_matmul_q4_0_len, "matmul_q4_0" },
+        { ds4_spv_attn_output_low_q8_v2, ds4_spv_attn_output_low_q8_v2_len,
+          "attn_output_low_q8_v2" },
     };
     for (uint32_t i = 0; i < DS4_VK_PIPE_COUNT; i++) {
+        snprintf(g_pipe_names[i], sizeof(g_pipe_names[i]), "%s",
+                 pipes[i].entry);
         /* v3 uses OpSDot and can only be created when the device exposes
          * VK_KHR_shader_integer_dot_product; the selector never returns it
          * otherwise. */
         if (i == DS4_PIPE_MATMUL_Q8_0_PREQ_V3 && !g_has_int_dot) {
+            g_mods[i] = VK_NULL_HANDLE;
+            g_pipes[i] = VK_NULL_HANDLE;
+            continue;
+        }
+        if (i == DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2 && !g_has_int_dot) {
             g_mods[i] = VK_NULL_HANDLE;
             g_pipes[i] = VK_NULL_HANDLE;
             continue;
@@ -1438,13 +1454,15 @@ static int vulkan_compute_init(void) {
         VkQueryPoolCreateInfo qpci = {};
         qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
         qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        qpci.queryCount = 4;
+        qpci.queryCount = 128;
         if (g_ts_period > 0.0f &&
             vkCreateQueryPool(g_device, &qpci, NULL, &g_ts_pool) == VK_SUCCESS) {
             g_ts_on = 1;
+            g_ts_verbose =
+                getenv("DS4_VULKAN_DEBUG_GPU_TS_VERBOSE") != NULL;
             fprintf(stderr,
-                    "ds4: GPU timestamp scope timing ON (period=%.1f ns)\n",
-                    (double)g_ts_period);
+                    "ds4: GPU timestamp scope timing ON (period=%.1f ns%s)\n",
+                    (double)g_ts_period, g_ts_verbose ? ", verbose" : "");
         }
     }
 
@@ -2149,19 +2167,46 @@ static VkCommandBuffer vulkan_cb_acquire(int switch_ok) {
 
 static void vulkan_ts_begin(VkCommandBuffer cb) {
     if (!g_ts_on || !g_commands_active || g_ts_started || !cb) return;
-    vkCmdResetQueryPool(cb, g_ts_pool, 0, 4);
+    vkCmdResetQueryPool(cb, g_ts_pool, 0, 128);
     vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, g_ts_pool, 0);
     g_ts_started = 1;
     g_ts_router_written = 0;
+    g_ts_n = 0;
 }
 
 static void vulkan_ts_end(VkCommandBuffer cb) {
-    if (!g_ts_on || !g_ts_started || !cb) return;
+    if (!g_ts_on || !g_ts_started || !cb || g_ts_verbose) return;
     vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, g_ts_pool, 1);
 }
 
 static void vulkan_ts_report(const char *tag) {
     if (!g_ts_on || !g_ts_started) return;
+    if (g_ts_verbose) {
+        const uint32_t n = g_ts_n;
+        uint64_t r[128] = {0};
+        const VkResult rc =
+            vkGetQueryPoolResults(g_device, g_ts_pool, 0, 1u + 2u * n,
+                                   (1u + 2u * n) * sizeof(uint64_t), r,
+                                   sizeof(uint64_t),
+                                   VK_QUERY_RESULT_64_BIT |
+                                   VK_QUERY_RESULT_WAIT_BIT);
+        if (rc == VK_SUCCESS && n > 0) {
+            const double scope =
+                (double)(r[2 * n] - r[0]) * (double)g_ts_period / 1e6;
+            fprintf(stderr, "ds4: gpu-ts %s: %.3f ms (%u disp)\n", tag, scope,
+                    n);
+            for (uint32_t i = 0; i < n; i++) {
+                const double dt = (double)(r[2 + 2 * i] - r[1 + 2 * i]) *
+                                  (double)g_ts_period / 1e6;
+                const uint32_t p = g_ts_pipe[i];
+                fprintf(stderr, "ds4: gpu-pipe %-28s %.4f ms\n",
+                        p < 96 ? g_pipe_names[p] : "?", dt);
+            }
+        }
+        g_ts_started = 0;
+        g_ts_n = 0;
+        return;
+    }
     uint64_t r[4] = {0, 0, 0, 0};
     const uint32_t n = g_ts_router_written ? 4u : 2u;
     const VkResult rc =
@@ -2739,8 +2784,21 @@ static int vulkan_dispatch(VkPipeline pipeline,
     vkUpdateDescriptorSets(g_device, n_binds, writes, 0, NULL);
     const double d2 = dbg_disp ? vulkan_now_ms() : 0.0;
 
+    /* Verbose debug timing: timestamp every dispatch of the scope. */
+    const int ts_each =
+        (g_ts_on && g_ts_verbose && g_ts_started && g_ts_n < 62u);
+    if (ts_each) {
+        int pi = -1;
+        for (int k = 0; k < DS4_VK_PIPE_COUNT; k++) {
+            if (g_pipes[k] == pipeline) { pi = k; break; }
+        }
+        g_ts_pipe[g_ts_n] = (uint32_t)(pi < 0 ? 0 : pi);
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            g_ts_pool, 1u + 2u * g_ts_n);
+    }
     const int ts_router =
-        (g_ts_on && pipeline == g_pipes[DS4_PIPE_ROUTER_SELECT]);
+        (!g_ts_verbose && g_ts_on &&
+         pipeline == g_pipes[DS4_PIPE_ROUTER_SELECT]);
     if (ts_router) {
         g_ts_router_written = 1;
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -2759,6 +2817,11 @@ static int vulkan_dispatch(VkPipeline pipeline,
         g_pfnCmdSetCheckpointNV(cb, (const void *)(uintptr_t)(uint32_t)dbg_pipe);
     }
     vkCmdDispatch(cb, gx, gy, gz);
+    if (ts_each) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            g_ts_pool, 2u + 2u * g_ts_n);
+        g_ts_n++;
+    }
     if (ts_router)
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                             g_ts_pool, 3);
@@ -3677,6 +3740,19 @@ static VkPipeline vulkan_pipe_q8_preq(void) {
         return g_pipes[DS4_PIPE_MATMUL_Q8_0_PREQ_V3];
     }
     return g_pipes[DS4_PIPE_MATMUL_Q8_0_PREQ_V2];
+}
+
+/* attn_output_low Q8 variant: v2 uses dot4add_i8packed (packed int8 dot) when
+ * the device exposes VK_KHR_shader_integer_dot_product, else the original
+ * byte-by-byte v1.  DS4_VULKAN_FORCE_VARIANT=ATTN_OUT_LOW:0|1 for bisect. */
+static VkPipeline vulkan_pipe_attn_output_low(void) {
+    if (vulkan_force_variant("ATTN_OUT_LOW", "0")) {
+        return g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8];
+    }
+    if (g_has_int_dot && g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2] != VK_NULL_HANDLE) {
+        return g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2];
+    }
+    return g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8];
 }
 
 /* Variante MoE IQ2_XXS gate/up/mid e Q2_K down (Fase 7).  Default v2 (dequant
@@ -4990,7 +5066,7 @@ static int vulkan_attn_output_low_q8(ds4_gpu_tensor *low,
     binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_W, a_offset, out_a_bytes);
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, low);
     if (low_dim > UINT32_MAX || n_rows > UINT32_MAX) return 0;
-    return vulkan_dispatch(g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8], &p, sizeof(p),
+    return vulkan_dispatch(vulkan_pipe_attn_output_low(), &p, sizeof(p),
                            binds, nb, (uint32_t)low_dim, n_rows, 1);
 }
 
