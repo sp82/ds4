@@ -6252,6 +6252,18 @@ static int vulkan_routed_moe_launch(
     struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
     if (pool_mode) p.flags |= 1u;
 
+    /* All routed-MoE gate/down kernels (Q8, IQ2/Q2K, Q4_K, MXFP4; v1 and v2)
+     * honour params.rsvd2 = rows per workgroup, so the prefill grid can be
+     * collapsed on every path (see SPECS_AUTOTUNE.md §2.5). */
+    uint32_t moe_R = 1u;
+    {
+        const char *re = getenv("DS4_VULKAN_MOE_ROWS");
+        moe_R = (re && *re) ? (uint32_t)strtoul(re, NULL, 10) : 8u;
+        if (moe_R < 1u) moe_R = 1u;
+        if (moe_R > 64u) moe_R = 64u;
+    }
+    p.rsvd2 = moe_R;
+
     /* Opt-in expert grouping (DS4_VULKAN_MOE_GROUP): reorder the (token,
      * expert) pairs so the MXFP4 kernels walk them in expert order.  The
      * default keeps the raw pair order: the batch kernel is bound by the
@@ -6307,8 +6319,9 @@ static int vulkan_routed_moe_launch(
         (q4_path ? g_pipes[DS4_PIPE_MOE_GATE_UP_MID_Q4K] :
          (iq2_path ? vulkan_pipe_moe_gate_iq2()
                    : g_pipes[DS4_PIPE_MOE_GATE_UP_MID_Q8]));
+    const uint32_t gate_gx = (expert_mid_dim + moe_R - 1u) / moe_R;
     if (!vulkan_dispatch(gate_pipe, &p, sizeof(p),
-                         binds, nb, expert_mid_dim, (uint32_t)pair_count, 1)) {
+                         binds, nb, gate_gx, (uint32_t)pair_count, 1)) {
         if (getenv("DS4_VULKAN_DEBUG_FAIL"))
             fprintf(stderr, "ds4: MoE fail: gate dispatch layer=%u pool=%d\n",
                     layer_index, pool_mode);
@@ -6334,8 +6347,9 @@ static int vulkan_routed_moe_launch(
         (q4_path ? g_pipes[DS4_PIPE_MOE_DOWN_Q4K] :
          (iq2_path ? vulkan_pipe_moe_down_q2k()
                    : g_pipes[DS4_PIPE_MOE_DOWN_Q8]));
+    const uint32_t down_gx = (out_dim + moe_R - 1u) / moe_R;
     if (!vulkan_dispatch(down_pipe, &p, sizeof(p),
-                         binds, nb, out_dim, (uint32_t)pair_count, 1)) {
+                         binds, nb, down_gx, (uint32_t)pair_count, 1)) {
         if (getenv("DS4_VULKAN_DEBUG_FAIL"))
             fprintf(stderr, "ds4: MoE fail: down dispatch layer=%u pool=%d\n",
                     layer_index, pool_mode);

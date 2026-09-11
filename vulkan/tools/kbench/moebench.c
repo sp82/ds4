@@ -1,11 +1,14 @@
 /* vulkan/tools/kbench/moebench.c -- routed MoE microbenchmark for the DS4
  * Vulkan backend, using DeepSeek V4 Flash expert dimensions.
  *
- * Measures the MXFP4 routed MoE (gate/up/down experts) at the real shapes:
+ * Measures the routed MoE (gate/up/down experts) at the real shapes:
  *   in_dim=4096, mid_dim=2048, out_dim=4096, n_expert_used=6
- * for decode (1 token) and prefill (64 tokens).  The synthetic expert weights
- * are random MXFP4 blocks (any E2M1 code is valid); only the read+dequant+dot
- * cost matters, so the values are irrelevant to the timing.
+ * for decode (1 token) and prefill (8/16/32/64 tokens).  The synthetic expert
+ * weights are random bytes (any code is valid for timing); only the
+ * read+dequant+dot cost matters, so the values are irrelevant.
+ *
+ * Usage: moebench [iters [quant]]
+ *   quant = mxfp4 (default) | iq2 | q4k
  *
  * Build: make moebench   (Vulkan)   /   make moebench-cuda CUDA_ARCH=sm_120
  */
@@ -27,26 +30,28 @@ static double now_ms(void) {
 #define MOE_OUT_DIM  4096u
 #define MOE_N_TOTAL  64u
 #define MOE_N_USED   6u
-#define MOE_GATE_TYPE 39u   /* GGUF MXFP4 */
-#define MOE_DOWN_TYPE 39u
 
-/* gate_row_bytes = (in/32)*17, down_row_bytes = (mid/32)*17. */
-static const uint64_t g_gate_row = (MOE_IN_DIM / 32u) * 17u;
-static const uint64_t g_down_row = (MOE_MID_DIM / 32u) * 17u;
-static const uint64_t g_gate_expert = (uint64_t)MOE_MID_DIM * g_gate_row;
-static const uint64_t g_down_expert = (uint64_t)MOE_OUT_DIM * g_down_row;
+/* Expert quant sets: gate/up and down GGUF types + row byte counts.
+ * row_bytes = (dim / block_elems) * block_bytes:
+ *   MXFP4   (39): 17 B / 32    IQ2_XXS (16): 66 B / 256
+ *   Q2_K    (10): 84 B / 256   Q4_K    (12): 144 B / 256 */
+struct quant_set {
+    const char *name;
+    uint32_t    gate_type;
+    uint32_t    down_type;
+    uint64_t    gate_row;
+    uint64_t    down_row;
+};
 
-static void fill_mxfp4(uint8_t *base, uint64_t rows, uint64_t row_bytes) {
-    for (uint64_t r = 0; r < rows; r++) {
-        uint8_t *blk = base + r * row_bytes;
-        for (uint64_t off = 0; off < row_bytes; off += 17u) {
-            blk[off] = (uint8_t)(124u + (uint32_t)(rand() % 7));
-            for (uint32_t i = 1u; i < 17u; i++) {
-                blk[off + i] = (uint8_t)(rand() & 0xffu);
-            }
-        }
-    }
-}
+static const struct quant_set g_sets[] = {
+    { "mxfp4", 39u, 39u, (MOE_IN_DIM / 32u) * 17u,  (MOE_MID_DIM / 32u) * 17u  },
+    { "iq2",   16u, 10u, (MOE_IN_DIM / 256u) * 66u, (MOE_MID_DIM / 256u) * 84u },
+    { "q4k",   12u, 12u, (MOE_IN_DIM / 256u) * 144u,(MOE_MID_DIM / 256u) * 144u},
+    { "q8",    8u,  8u,  (MOE_IN_DIM / 32u) * 34u,  (MOE_MID_DIM / 32u) * 34u  },
+};
+
+static uint32_t g_gate_type, g_down_type;
+static uint64_t g_gate_row, g_down_row, g_gate_expert, g_down_expert;
 
 static void run_case(const char *name, const uint8_t *map, uint64_t map_size,
                      uint64_t up_off, uint64_t down_off, uint32_t n_tokens,
@@ -83,7 +88,7 @@ static void run_case(const char *name, const uint8_t *map, uint64_t map_size,
     for (int it = 0; it < iters; it++) {
         if (!ds4_gpu_routed_moe_batch_tensor(
                     out, gate, up, mid, down, map, map_size,
-                    0u, up_off, down_off, MOE_GATE_TYPE, MOE_DOWN_TYPE,
+                    0u, up_off, down_off, g_gate_type, g_down_type,
                     g_gate_expert, g_gate_row, g_down_expert, g_down_row,
                     MOE_IN_DIM, MOE_MID_DIM, MOE_OUT_DIM, selected, weights,
                     MOE_N_TOTAL, MOE_N_USED, 5.0f, x, 0u, n_tokens, NULL,
@@ -113,8 +118,21 @@ static void run_case(const char *name, const uint8_t *map, uint64_t map_size,
 
 int main(int argc, char **argv) {
     int iters = 50;
+    const char *quant = "mxfp4";
     if (argc > 1) iters = atoi(argv[1]);
+    if (argc > 2) quant = argv[2];
     if (iters <= 0) iters = 50;
+
+    const struct quant_set *qs = &g_sets[0];
+    for (size_t i = 0; i < sizeof(g_sets) / sizeof(g_sets[0]); i++) {
+        if (!strcmp(g_sets[i].name, quant)) { qs = &g_sets[i]; break; }
+    }
+    g_gate_type = qs->gate_type;
+    g_down_type = qs->down_type;
+    g_gate_row = qs->gate_row;
+    g_down_row = qs->down_row;
+    g_gate_expert = (uint64_t)MOE_MID_DIM * g_gate_row;
+    g_down_expert = (uint64_t)MOE_OUT_DIM * g_down_row;
 
     const uint64_t gate_region = (uint64_t)MOE_N_TOTAL * g_gate_expert;
     const uint64_t down_region = (uint64_t)MOE_N_TOTAL * g_down_expert;
@@ -127,20 +145,19 @@ int main(int argc, char **argv) {
     if (posix_memalign((void **)&map, 4096, (size_t)map_size) != 0) return 1;
     memset(map, 0, (size_t)map_size);
     srand(0x3f9au);
-    fill_mxfp4(map, (uint64_t)MOE_N_TOTAL * MOE_MID_DIM, g_gate_row);
-    fill_mxfp4(map + up_off, (uint64_t)MOE_N_TOTAL * MOE_MID_DIM, g_gate_row);
-    fill_mxfp4(map + down_off, (uint64_t)MOE_N_TOTAL * MOE_OUT_DIM, g_down_row);
-    printf("moebench: map %.1f MB, gate_expert %.2f MB, down_expert %.2f MB\n",
-           (double)map_size / 1e6, (double)g_gate_expert / 1e6,
-           (double)g_down_expert / 1e6);
+    for (uint64_t i = 0; i < map_size; i++) map[i] = (uint8_t)(rand() & 0xff);
+    printf("moebench: quant=%s map %.1f MB, gate_expert %.2f MB, "
+           "down_expert %.2f MB\n", qs->name, (double)map_size / 1e6,
+           (double)g_gate_expert / 1e6, (double)g_down_expert / 1e6);
 
     if (ds4_gpu_init() == 0) { fprintf(stderr, "moebench: init failed\n"); return 1; }
     if (ds4_gpu_set_model_map(map, map_size) == 0) {
         fprintf(stderr, "moebench: set_model_map failed\n");
         return 1;
     }
-    run_case("mxfp4_decode", map, map_size, up_off, down_off, 1u, iters);
-    run_case("mxfp4_prefill_64", map, map_size, up_off, down_off, 64u, iters / 2 + 1);
+    run_case("decode", map, map_size, up_off, down_off, 1u, iters);
+    run_case("prefill_32", map, map_size, up_off, down_off, 32u, iters / 2 + 1);
+    run_case("prefill_64", map, map_size, up_off, down_off, 64u, iters / 2 + 1);
     ds4_gpu_cleanup();
     free(map);
     return 0;

@@ -44,7 +44,6 @@ groupshared float moe_down_red[256];
 [numthreads(256, 1, 1)]
 void moe_gate_up_mid_q4k(uint3 gid_grp : SV_GroupID,
                          uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x;
     uint pair = gid_grp.y;
     uint mid_dim = params.out_dim;
     uint n_expert = params.index;
@@ -52,7 +51,7 @@ void moe_gate_up_mid_q4k(uint3 gid_grp : SV_GroupID,
     uint blocks = params.blocks;
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
-    if (row >= mid_dim || pair >= n_tokens * n_expert) return;
+    if (pair >= n_tokens * n_expert) return;
     uint tok = pair / n_expert;
     uint slot = pair - tok * n_expert;
     int sel = selected_buf[tok * n_expert + slot];
@@ -65,17 +64,18 @@ void moe_gate_up_mid_q4k(uint3 gid_grp : SV_GroupID,
     } else {
         expert = (uint)sel;
     }
+    uint sub_blocks = blocks * 8u;
+    uint lsub = tid >> 3u;
+    uint sub = tid & 7u;
+    uint xb = tok * params.in_dim + tid * 32u;
+    MOE_ROWS_BEGIN(gid_grp.x, mid_dim)
     uint gbase = expert * expert_bytes + row * row_bytes;
     uint ubase = expert * expert_bytes + row * row_bytes;
-    uint sub_blocks = blocks * 8u;
     float gacc = 0.0f;
     float uacc = 0.0f;
     if (tid < sub_blocks) {
-        uint b = tid >> 3u;
-        uint sub = tid & 7u;
-        uint xb = tok * params.in_dim + tid * 32u;
-        gacc = q4k_sub_dot(w_buf, gbase + b * 144u, sub, a_buf, xb);
-        uacc = q4k_sub_dot(up_w_buf, ubase + b * 144u, sub, a_buf, xb);
+        gacc = q4k_sub_dot(w_buf, gbase + lsub * 144u, sub, a_buf, xb);
+        uacc = q4k_sub_dot(up_w_buf, ubase + lsub * 144u, sub, a_buf, xb);
     }
     moe_gate_red[tid] = gacc;
     moe_up_red[tid] = uacc;
@@ -100,6 +100,7 @@ void moe_gate_up_mid_q4k(uint3 gid_grp : SV_GroupID,
         out4_buf[off] = (g / (1.0f + exp(-g))) * u *
                         weights_buf[tok * n_expert + slot];
     }
+    MOE_ROWS_END
 }
 
 /* One block per (row, pair): down[slot][row] = Q4_K dot of the selected
@@ -110,7 +111,6 @@ void moe_gate_up_mid_q4k(uint3 gid_grp : SV_GroupID,
 [numthreads(256, 1, 1)]
 void moe_down_q4k(uint3 gid_grp : SV_GroupID,
                   uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x;
     uint pair = gid_grp.y;
     uint out_dim = params.out_dim;
     uint n_expert = params.index;
@@ -118,7 +118,7 @@ void moe_down_q4k(uint3 gid_grp : SV_GroupID,
     uint blocks = params.blocks;
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
-    if (row >= out_dim || pair >= n_tokens * n_expert) return;
+    if (pair >= n_tokens * n_expert) return;
     uint tok = pair / n_expert;
     uint slot = pair - tok * n_expert;
     int sel = selected_buf[tok * n_expert + slot];
@@ -131,14 +131,15 @@ void moe_down_q4k(uint3 gid_grp : SV_GroupID,
     } else {
         expert = (uint)sel;
     }
-    uint bbase = expert * expert_bytes + row * row_bytes;
     uint sub_blocks = blocks * 8u;
+    uint lsub = tid >> 3u;
+    uint sub = tid & 7u;
+    uint xb = pair * params.in_dim + tid * 32u;
+    MOE_ROWS_BEGIN(gid_grp.x, out_dim)
+    uint bbase = expert * expert_bytes + row * row_bytes;
     float acc = 0.0f;
     if (tid < sub_blocks) {
-        uint b = tid >> 3u;
-        uint sub = tid & 7u;
-        uint xb = pair * params.in_dim + tid * 32u;
-        acc = q4k_sub_dot(w_buf, bbase + b * 144u, sub, a_buf, xb);
+        acc = q4k_sub_dot(w_buf, bbase + lsub * 144u, sub, a_buf, xb);
     }
     moe_down_red[tid] = acc;
     GroupMemoryBarrierWithGroupSync();
@@ -151,4 +152,5 @@ void moe_down_q4k(uint3 gid_grp : SV_GroupID,
     if (tid == 0u) {
         out4_buf[pair * out_dim + row] = moe_down_red[0];
     }
+    MOE_ROWS_END
 }
