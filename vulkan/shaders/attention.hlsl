@@ -583,6 +583,127 @@ void attn_output_low_q8_v2(uint3 gid : SV_GroupID,
     }
 }
 
+/* v3: activation-reuse variant of attn_output_low_q8.  One workgroup
+ * computes AO_RT consecutive output rows of the same group: it quantizes the
+ * group activation ONCE into groupshared (Q8 blocks), then each of the
+ * AO_LANES lanes per row does the packed int8 dot against its weight rows.
+ * This removes the per-row redundant activation read+quantization of v1/v2
+ * (rank times per group) and uses all 256 threads.  Requires blocks <=
+ * AO_MAX_BLOCKS and rank % AO_RT == 0 (the host selects it only then). */
+#define AO_RT 8u
+#define AO_LANES 32u
+#define AO_MAX_BLOCKS 128u
+
+groupshared int   ao_q[AO_MAX_BLOCKS * 32u];
+groupshared float ao_scale[AO_MAX_BLOCKS];
+groupshared float ao_red[256];
+
+[numthreads(256, 1, 1)]
+void attn_output_low_q8_v3(uint3 gid : SV_GroupID,
+                           uint tid : SV_GroupThreadID) {
+    uint rank = params.out_dim;
+    uint group_dim = params.n;
+    uint blocks = params.blocks;
+    uint n_groups_total = params.index;
+    uint group0 = params.aux;
+    uint group_cnt = params.n_rot;
+    uint n_rows = params.rows;
+    uint tile = gid.x;
+    uint t = gid.y;
+    if (t >= n_rows || blocks > AO_MAX_BLOCKS) return;
+
+    uint row0 = tile * AO_RT;              /* local output row */
+    if (row0 >= group_cnt * rank) return;
+    uint g = group0 + row0 / rank;
+    uint xbase = t * n_groups_total * group_dim + g * group_dim;
+
+    /* 1) Quantize the group activation once (same math as v1). */
+    for (uint b = tid; b < blocks; b += 256u) {
+        uint i0 = b * 32u;
+        uint bn = min(32u, group_dim - i0);
+        float amax = 0.0f;
+        for (uint i = 0u; i < bn; i++) {
+            amax = max(amax, abs(q_buf[xbase + i0 + i]));
+        }
+        float d = amax / 127.0f;
+        float id = d != 0.0f ? 1.0f / d : 0.0f;
+        for (uint i = 0u; i < bn; i++) {
+            int q = (int)round(q_buf[xbase + i0 + i] * id);
+            q = min(q, 127);
+            q = max(q, -128);
+            ao_q[b * 32u + i] = q;
+        }
+        ao_scale[b] = d;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    /* 2) One lane per (row, 1/AO_LANES of the dim): packed int8 dot. */
+    uint row_in_tile = tid / AO_LANES;
+    uint lane = tid % AO_LANES;
+    uint row = row0 + row_in_tile;
+    float acc = 0.0f;
+    if (row < group_cnt * rank) {
+        uint gfull = group0 + row / rank;
+        uint r = row % rank;
+        uint wrow = gfull * rank + r;
+        float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+        uint ci = 0u;
+        for (uint b = lane; b < blocks; b += AO_LANES) {
+            uint wblock = wrow * blocks + b;
+            uint w_byte = wblock * 34u + 2u;
+            uint ww[8];
+            if ((wblock & 1u) != 0u) {
+                for (uint j = 0u; j < 8u; j++) {
+                    ww[j] = sink_buf.Load(w_byte + j * 4u);
+                }
+            } else {
+                uint prev = sink_buf.Load(w_byte - 2u);
+                for (uint j = 0u; j < 8u; j++) {
+                    uint nxt = sink_buf.Load(w_byte + 2u + j * 4u);
+                    ww[j] = (prev >> 16u) | (nxt << 16u);
+                    prev = nxt;
+                }
+            }
+            uint xoff = b * 32u;
+            int dot = 0;
+            for (uint j = 0u; j < 8u; j++) {
+                uint qw = ((uint)(ao_q[xoff + j * 4u + 0u] & 0xff)) |
+                          (((uint)(ao_q[xoff + j * 4u + 1u] & 0xff)) << 8u) |
+                          (((uint)(ao_q[xoff + j * 4u + 2u] & 0xff)) << 16u) |
+                          (((uint)(ao_q[xoff + j * 4u + 3u] & 0xff)) << 24u);
+                dot = dot4add_i8packed(qw, ww[j], dot);
+            }
+            const float contrib =
+                q8_scale(sink_buf, wblock) * ao_scale[b] * (float)dot;
+            if (ci == 0u) c0 = contrib;
+            else if (ci == 1u) c1 = contrib;
+            else if (ci == 2u) c2 = contrib;
+            else c3 = contrib;
+            ci++;
+        }
+        /* Reproduce v1's 256-way reduction order so the result is
+         * bit-identical: v1 sums the 128 blocks as
+         * p_l = c_l + c_{l+64}, q_l = p_l + p_{l+32}, then a 32-way tree
+         * (strides 16..1) - which is exactly the lane tree below. */
+        if (blocks == 128u) {
+            acc = (c0 + c2) + (c1 + c3);
+        } else {
+            acc = (c0 + c1) + (c2 + c3);
+        }
+    }
+    ao_red[tid] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            ao_red[tid] += ao_red[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0u && row < group_cnt * rank) {
+        heads_buf[t * (group_cnt * rank) + row] = ao_red[row_in_tile * AO_LANES];
+    }
+}
+
 /* Low-rank projection of the attention output (grouped Q4_K): same math and
  * layout as attn_output_low_q8, but out_a is Q4_K (144-byte 256-value blocks)
  * and the activation heads are used raw (f32, no inline Q8 quantization).
