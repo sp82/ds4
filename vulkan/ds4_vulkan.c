@@ -6502,22 +6502,59 @@ static void vulkan_autotune_moe_rows(void) {
         ds4_gpu_tensor_write(w, 0, wv, pairs * 4u);
 
         static const uint32_t cand[] = { 1u, 4u, 8u };
-        const int iters = 4;
+        const int n_cand = (int)(sizeof(cand) / sizeof(cand[0]));
+        const int max_iters = 1024;   /* stay under the descriptor-set HWM */
         const int profile = getenv("DS4_VULKAN_AUTOTUNE_PROFILE") != NULL;
+        double target_ms = 1000.0;    /* whole probe budget, GPU-independent */
+        {
+            const char *tm = getenv("DS4_VULKAN_AUTOTUNE_MS");
+            if (tm && *tm) {
+                double v = atof(tm);
+                if (v >= 10.0 && v <= 10000.0) target_ms = v;
+            }
+        }
+        const double per_cand_ms = target_ms / (double)n_cand;
+        auto do_moe = [&]() -> int {
+            return ds4_gpu_routed_moe_batch_tensor(
+                    out, gate, up, mid, down, map, map_size,
+                    0u, up_off, down_off, 39u, 39u,
+                    gate_expert, gate_row, down_expert, down_row,
+                    in_dim, mid_dim, out_dim, sel, w,
+                    n_total, n_used, 5.0f, x, 0u, n_tok, NULL, true);
+        };
+        /* Warm-up: prime the pipeline/descriptor state so the calibration is
+         * representative and not dominated by the first-dispatch cost. */
+        g_moe_rows = cand[0];
+        ds4_gpu_begin_commands();
+        (void)do_moe();
+        ds4_gpu_end_commands();
+        ds4_gpu_synchronize();
+
         uint32_t best = 8u;
         double best_ms = 0.0;
-        for (size_t ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ci++) {
+        for (int ci = 0; ci < n_cand; ci++) {
             g_moe_rows = cand[ci];
+            /* Calibrate with a couple of dispatches, then size the timed pass
+             * so each candidate is measured for ~per_cand_ms (GPU-independent
+             * probe cost and enough iterations to suppress clock/DPM noise). */
+            const int calib = 2;
+            ds4_gpu_begin_commands();
+            const double c0 = vulkan_now_ms();
+            for (int it = 0; it < calib; it++) (void)do_moe();
+            ds4_gpu_end_commands();
+            ds4_gpu_synchronize();
+            const double est = (vulkan_now_ms() - c0) / (double)calib;
+            int iters = max_iters;
+            if (est > 0.0) {
+                iters = (int)(per_cand_ms / est + 0.5);
+                if (iters < 1) iters = 1;
+                if (iters > max_iters) iters = max_iters;
+            }
             int ok = 1;
             ds4_gpu_begin_commands();
             const double t0 = vulkan_now_ms();
             for (int it = 0; it < iters; it++) {
-                if (!ds4_gpu_routed_moe_batch_tensor(
-                            out, gate, up, mid, down, map, map_size,
-                            0u, up_off, down_off, 39u, 39u,
-                            gate_expert, gate_row, down_expert, down_row,
-                            in_dim, mid_dim, out_dim, sel, w,
-                            n_total, n_used, 5.0f, x, 0u, n_tok, NULL, true)) {
+                if (!do_moe()) {
                     ok = 0;
                     break;
                 }
@@ -6527,8 +6564,9 @@ static void vulkan_autotune_moe_rows(void) {
             const double ms = (vulkan_now_ms() - t0) / (double)iters;
             if (profile)
                 fprintf(stderr, DS4_VULKAN_LOG_PREFIX
-                        "autotune: MOE_ROWS R=%u -> %.3f ms @16 tok\n",
-                        cand[ci], ms);
+                        "autotune: MOE_ROWS R=%u -> %.3f ms @16 tok "
+                        "(%d iters, calib %.3f ms)\n",
+                        cand[ci], ms, iters, est);
             if (ok && (best_ms == 0.0 || ms < best_ms)) {
                 best_ms = ms;
                 best = cand[ci];
