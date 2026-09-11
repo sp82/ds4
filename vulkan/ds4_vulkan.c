@@ -93,6 +93,20 @@ static VkPhysicalDevice  g_phys      = VK_NULL_HANDLE;
 static VkDevice          g_device    = VK_NULL_HANDLE;
 static VkQueue           g_queue     = VK_NULL_HANDLE;
 static uint32_t          g_queue_family = 0;
+
+/* GPU timestamp scope timing (DS4_VULKAN_DEBUG_GPU_TS).  Debug-only: writes a
+ * device timestamp at the first dispatch of a main compute scope and one right
+ * before the scope's vkEndCommandBuffer, then reports the delta.  This measures
+ * the scope's own GPU time, excluding any queue work queued ahead (e.g. the
+ * expert-store copy) that inflates the host-side fwait.  It requires the async
+ * overlap worker to be off (DS4_METAL_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP)
+ * so the single query slot is never touched by the worker thread. */
+static VkQueryPool       g_ts_pool = VK_NULL_HANDLE;
+static float             g_ts_period = 0.0f;
+static int               g_ts_on = 0;
+static int               g_ts_started = 0;
+static int               g_ts_router_written = 0;
+static uint32_t          g_ts_valid_bits = 0;
 static VkCommandPool     g_cmd_pool  = VK_NULL_HANDLE;
 /* Compute-scope command buffers, double-buffered (Fase 7 flush early-submit):
  * a scope can be submitted while the sibling CB records the next one, so the
@@ -982,6 +996,9 @@ static VkResult vulkan_create_device(void) {
             break;
         }
     }
+    if (compute_family >= 0) {
+        g_ts_valid_bits = families[compute_family].timestampValidBits;
+    }
     free(families);
     if (compute_family < 0) return VK_ERROR_INITIALIZATION_FAILED;
     g_queue_family = (uint32_t)compute_family;
@@ -1409,6 +1426,28 @@ static int vulkan_compute_init(void) {
         if (!g_pipes[i]) return 0;
     }
 
+    /* Debug GPU timestamps: create the query pool once if requested, the
+     * overlap worker is off, and the queue family supports timestamps. */
+    if (getenv("DS4_VULKAN_DEBUG_GPU_TS") != NULL &&
+        getenv("DS4_VULKAN_DEBUG_SUBMIT") != NULL &&
+        getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_SHARED_OVERLAP") != NULL &&
+        g_ts_valid_bits > 0 && g_device != VK_NULL_HANDLE) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(g_phys, &props);
+        g_ts_period = props.limits.timestampPeriod;
+        VkQueryPoolCreateInfo qpci = {};
+        qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 4;
+        if (g_ts_period > 0.0f &&
+            vkCreateQueryPool(g_device, &qpci, NULL, &g_ts_pool) == VK_SUCCESS) {
+            g_ts_on = 1;
+            fprintf(stderr,
+                    "ds4: GPU timestamp scope timing ON (period=%.1f ns)\n",
+                    (double)g_ts_period);
+        }
+    }
+
     return 1;
 }
 
@@ -1427,6 +1466,9 @@ static void vulkan_compute_cleanup(void) {
     if (g_pipe_layout) { vkDestroyPipelineLayout(g_device, g_pipe_layout, NULL); g_pipe_layout = VK_NULL_HANDLE; }
     if (g_desc_layout) { vkDestroyDescriptorSetLayout(g_device, g_desc_layout, NULL); g_desc_layout = VK_NULL_HANDLE; }
     if (g_desc_pool) { vkDestroyDescriptorPool(g_device, g_desc_pool, NULL); g_desc_pool = VK_NULL_HANDLE; }
+    if (g_ts_pool) { vkDestroyQueryPool(g_device, g_ts_pool, NULL); g_ts_pool = VK_NULL_HANDLE; }
+    g_ts_on = 0;
+    g_ts_started = 0;
 }
 
 /* --- public contract: lifecycle ---------------------------------------- */
@@ -2103,10 +2145,49 @@ static VkCommandBuffer vulkan_cb_acquire(int switch_ok) {
     return g_cmd[g_cmd_i];
 }
 
+/* --- GPU timestamp scope timing (see globals) --------------------------- */
+
+static void vulkan_ts_begin(VkCommandBuffer cb) {
+    if (!g_ts_on || !g_commands_active || g_ts_started || !cb) return;
+    vkCmdResetQueryPool(cb, g_ts_pool, 0, 4);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, g_ts_pool, 0);
+    g_ts_started = 1;
+    g_ts_router_written = 0;
+}
+
+static void vulkan_ts_end(VkCommandBuffer cb) {
+    if (!g_ts_on || !g_ts_started || !cb) return;
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, g_ts_pool, 1);
+}
+
+static void vulkan_ts_report(const char *tag) {
+    if (!g_ts_on || !g_ts_started) return;
+    uint64_t r[4] = {0, 0, 0, 0};
+    const uint32_t n = g_ts_router_written ? 4u : 2u;
+    const VkResult rc =
+        vkGetQueryPoolResults(g_device, g_ts_pool, 0, n, n * sizeof(uint64_t),
+                              r, sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT |
+                              VK_QUERY_RESULT_WAIT_BIT);
+    if (rc == VK_SUCCESS) {
+        const double scope = (double)(r[1] - r[0]) * (double)g_ts_period / 1e6;
+        fprintf(stderr, "ds4: gpu-ts %s: %.3f ms", tag, scope);
+        if (n == 4u) {
+            const double router =
+                (double)(r[3] - r[2]) * (double)g_ts_period / 1e6;
+            fprintf(stderr, " (router=%.3f ms)", router);
+        }
+        fprintf(stderr, "\n");
+    }
+    g_ts_started = 0;
+    g_ts_router_written = 0;
+}
+
 /* End + submit the currently recording CB with its in-flight fence (the
  * GPU starts it immediately; the fence marks the CB busy until it is
  * reused by vulkan_cb_acquire). */
 static int vulkan_cb_submit(void) {
+    vulkan_ts_end(g_cmd[g_cmd_i]);
     if (vkEndCommandBuffer(g_cmd[g_cmd_i]) != VK_SUCCESS) return 0;
     if (g_cb_fence[g_cmd_i] == VK_NULL_HANDLE) {
         VkFenceCreateInfo fci = {};
@@ -2319,6 +2400,7 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     do {
     if (getenv("DS4_VULKAN_DEBUG_SUBMIT") != NULL) {
         const double e0 = vulkan_now_ms();
+        vulkan_ts_end(g_cmd[g_cmd_i]);
         if (vkEndCommandBuffer(g_cmd[g_cmd_i]) != VK_SUCCESS) {
             g_commands_active = false;
             ret = 0;
@@ -2352,6 +2434,7 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
                                 UINT64_MAX) == VK_SUCCESS) {
                 wq = vulkan_now_ms() - tsub;
             }
+            vulkan_ts_report("attn+router");
         }
         const double e3 = vulkan_now_ms();
         g_commands_active = false;
@@ -2614,6 +2697,7 @@ static int vulkan_dispatch(VkPipeline pipeline,
     VkCommandBuffer cb = vulkan_dispatch_begin();
     if (!cb) return 0;
     const int oneshot = !g_commands_active;
+    vulkan_ts_begin(cb);
 
     const int dbg_disp = getenv("DS4_VULKAN_DEBUG_DISPATCH_TIME") != NULL;
     const double d0 = dbg_disp ? vulkan_now_ms() : 0.0;
@@ -2655,6 +2739,13 @@ static int vulkan_dispatch(VkPipeline pipeline,
     vkUpdateDescriptorSets(g_device, n_binds, writes, 0, NULL);
     const double d2 = dbg_disp ? vulkan_now_ms() : 0.0;
 
+    const int ts_router =
+        (g_ts_on && pipeline == g_pipes[DS4_PIPE_ROUTER_SELECT]);
+    if (ts_router) {
+        g_ts_router_written = 1;
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            g_ts_pool, 2);
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdPushConstants(cb, g_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, params_size, params);
@@ -2668,6 +2759,9 @@ static int vulkan_dispatch(VkPipeline pipeline,
         g_pfnCmdSetCheckpointNV(cb, (const void *)(uintptr_t)(uint32_t)dbg_pipe);
     }
     vkCmdDispatch(cb, gx, gy, gz);
+    if (ts_router)
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            g_ts_pool, 3);
     if (getenv("DS4_VULKAN_DEBUG_DISPATCH") != NULL) {
         int pipe_idx = -1;
         for (int pi = 0; pi < DS4_VK_PIPE_COUNT; pi++) {
@@ -2788,6 +2882,7 @@ int ds4_gpu_end_commands(void) {
              * left a dangling handle and crashed the next reset. */
             g_cmd_fence[g_cmd_i] = VK_NULL_HANDLE;
         }
+        vulkan_ts_report("scope");
         const double e3 = vulkan_now_ms();
         g_commands_active = false;
         fprintf(stderr, "ds4: Vulkan debug submit: end=%.3f ms queue=%.3f ms fwait=%.3f ms total=%.3f ms ndisp=%u binds=%u bytes=%llu\n",
