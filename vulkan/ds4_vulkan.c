@@ -182,6 +182,11 @@ static pthread_mutex_t g_device_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
  * device.  (Defined here so vulkan_device_wait can take it too.) */
 static pthread_mutex_t g_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Serialize g_readback_fence: the main thread resets+submits it (signal) while
+ * the async worker waits it (wait); Vulkan requires external synchronization
+ * of VkFence. */
+static pthread_mutex_t g_readback_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void vulkan_device_wait_impl(int reset_pool) {
     if (g_device == VK_NULL_HANDLE) return;
     pthread_mutex_lock(&g_device_wait_mutex);
@@ -2025,7 +2030,11 @@ static VkCommandBuffer vulkan_cb_acquire(int switch_ok) {
     if (g_cmd_fence[g_cmd_i] != VK_NULL_HANDLE) {
         const VkFence f = g_cmd_fence[g_cmd_i];
         vkWaitForFences(g_device, 1, &f, VK_TRUE, UINT64_MAX);
-        if (f != g_readback_fence) vkResetFences(g_device, 1, &f);
+        /* Destroy our own fence (the readback fence is a global reused by the
+         * signal/worker).  The old code only reset + NULLed it and created a
+         * fresh fence per submit, leaking one fence per submit until
+         * vkCreateFence failed with VK_ERROR_OUT_OF_HOST_MEMORY. */
+        if (f != g_readback_fence) vkDestroyFence(g_device, f, NULL);
         g_cmd_fence[g_cmd_i] = VK_NULL_HANDLE;
     }
     /* Descriptor-pool bound: no scope is open here, so a rare drain resets
@@ -2047,14 +2056,22 @@ static VkCommandBuffer vulkan_cb_acquire(int switch_ok) {
  * GPU starts it immediately; the fence marks the CB busy until it is
  * reused by vulkan_cb_acquire). */
 static int vulkan_cb_submit(void) {
-    if (vkEndCommandBuffer(g_cmd[g_cmd_i]) != VK_SUCCESS) return 0;
+    const VkResult er = vkEndCommandBuffer(g_cmd[g_cmd_i]);
+    if (er != VK_SUCCESS) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: cb_submit end rc=%d cmd=%p\n", (int)er, (void *)g_cmd[g_cmd_i]);
+        return 0;
+    }
     if (g_cmd_fence[g_cmd_i] == VK_NULL_HANDLE) {
         VkFenceCreateInfo fci = {};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        if (vkCreateFence(g_device, &fci, NULL, &g_cmd_fence[g_cmd_i]) != VK_SUCCESS) {
+        const VkResult cr = vkCreateFence(g_device, &fci, NULL, &g_cmd_fence[g_cmd_i]);
+        if (cr != VK_SUCCESS) {
+            if (getenv("DS4_VULKAN_DEBUG_FAIL")) fprintf(stderr, "ds4: cb_submit createfence rc=%d\n", (int)cr);
             return 0;
         }
     } else if (vkResetFences(g_device, 1, &g_cmd_fence[g_cmd_i]) != VK_SUCCESS) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL")) fprintf(stderr, "ds4: cb_submit resetfence failed\n");
         return 0;
     }
     VkSubmitInfo si = {};
@@ -2253,21 +2270,27 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     /* The readback fence doubles as the in-flight marker of this CB (the
      * worker waits the fence; vulkan_cb_acquire waits it too when the CB is
      * reused but never resets it, so the waits cannot race). */
+    pthread_mutex_lock(&g_readback_mutex);
+    int ret = 1;
+    do {
     if (getenv("DS4_VULKAN_DEBUG_SUBMIT") != NULL) {
         const double e0 = vulkan_now_ms();
         if (vkEndCommandBuffer(g_cmd[g_cmd_i]) != VK_SUCCESS) {
             g_commands_active = false;
-            return 0;
+            ret = 0;
+            break;
         }
         const double e1 = vulkan_now_ms();
         if (g_readback_fence == VK_NULL_HANDLE) {
             VkFenceCreateInfo fci = {};
             fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             if (vkCreateFence(g_device, &fci, NULL, &g_readback_fence) != VK_SUCCESS) {
-                return 0;
+                ret = 0;
+                break;
             }
         } else if (vkResetFences(g_device, 1, &g_readback_fence) != VK_SUCCESS) {
-            return 0;
+            ret = 0;
+            break;
         }
         VkSubmitInfo si = {};
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -2288,28 +2311,32 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
         g_scope_dispatch_count = 0;
         if (rc != VK_SUCCESS) {
             vulkan_log_vk(rc, "vkQueueSubmit(readback scope)");
-            return 0;
+            ret = 0;
+            break;
         }
         g_cmd_fence[g_cmd_i] = g_readback_fence;
         g_readback_fence_pending = 1;
         g_vulkan_device_dirty = 1;
-        return 1;
+        break;
     }
 
     if (vkEndCommandBuffer(g_cmd[g_cmd_i]) != VK_SUCCESS) {
         g_commands_active = false;
-        return 0;
+        ret = 0;
+        break;
     }
     if (g_readback_fence == VK_NULL_HANDLE) {
         VkFenceCreateInfo fci = {};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         if (vkCreateFence(g_device, &fci, NULL, &g_readback_fence) != VK_SUCCESS) {
             g_commands_active = false;
-            return 0;
+            ret = 0;
+            break;
         }
     } else if (vkResetFences(g_device, 1, &g_readback_fence) != VK_SUCCESS) {
         g_commands_active = false;
-        return 0;
+        ret = 0;
+        break;
     }
     VkSubmitInfo si = {};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -2319,12 +2346,15 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     g_commands_active = false;
     if (rc != VK_SUCCESS) {
         vulkan_log_vk(rc, "vkQueueSubmit(readback scope)");
-        return 0;
+        ret = 0;
+        break;
     }
     g_cmd_fence[g_cmd_i] = g_readback_fence;
     g_readback_fence_pending = 1;
     g_vulkan_device_dirty = 1;
-    return 1;
+} while (0);
+    pthread_mutex_unlock(&g_readback_mutex);
+    return ret;
 }
 
 extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value,
@@ -2332,11 +2362,16 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value,
     (void)event_value;
     (void)label;
     if (g_device == VK_NULL_HANDLE) return 1;
-    if (!g_readback_fence_pending) return 1;
-    const VkResult rc = vkWaitForFences(g_device, 1, &g_readback_fence,
-                                        VK_TRUE, UINT64_MAX);
-    g_readback_fence_pending = 0;
-    return rc == VK_SUCCESS ? 1 : 0;
+    pthread_mutex_lock(&g_readback_mutex);
+    int ret = 1;
+    if (g_readback_fence_pending) {
+        const VkResult rc = vkWaitForFences(g_device, 1, &g_readback_fence,
+                                            VK_TRUE, UINT64_MAX);
+        g_readback_fence_pending = 0;
+        ret = rc == VK_SUCCESS ? 1 : 0;
+    }
+    pthread_mutex_unlock(&g_readback_mutex);
+    return ret;
 }
 
 extern "C" int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value,
@@ -2640,12 +2675,18 @@ int ds4_gpu_flush_commands(void) {
     const char *feb = getenv("DS4_VULKAN_FLUSH_END_BEGIN");
     if (feb != NULL && feb[0] == '0') return 1;
     if (!vulkan_cb_submit()) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: flush: cb_submit failed\n");
         g_commands_active = false;
         return 0;
     }
     g_commands_active = false;
     g_cmd_i = 1 - g_cmd_i;
-    if (vulkan_cb_acquire(0) == VK_NULL_HANDLE) return 0;
+    if (vulkan_cb_acquire(0) == VK_NULL_HANDLE) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: flush: cb_acquire failed\n");
+        return 0;
+    }
     g_commands_active = true;
     return 1;
 }
@@ -6041,10 +6082,16 @@ static int vulkan_routed_moe_launch(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t layer_index) {
+    if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+        fprintf(stderr, "ds4: MoE launch layer=%u ntok=%u gate=%u down=%u indim=%u mid=%u out=%u\n",
+                layer_index, n_tokens, gate_type, down_type,
+                expert_in_dim, expert_mid_dim, out_dim);
     if (!out || !gate || !up || !mid || !down || !model_map || !selected ||
         !weights || !x || n_tokens == 0 || n_total_expert == 0 ||
         n_expert == 0 || expert_in_dim == 0 || expert_mid_dim == 0 ||
         out_dim == 0) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: MoE fail: bad args layer=%u\n", layer_index);
         return 0;
     }
     /* Fase 7: wait any pending worker pool store (async expert load) before
@@ -6055,16 +6102,23 @@ static int vulkan_routed_moe_launch(
     const int q4_path = (gate_type == 12u && down_type == 12u);
     const int mxfp4_path = (gate_type == 39u && down_type == 39u);
     if (!q8_path && !iq2_path && !q4_path && !mxfp4_path) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: MoE fail: quant gate=%u down=%u layer=%u\n",
+                    gate_type, down_type, layer_index);
         return 0;   /* Q8_0, IQ2_XXS+Q2_K, Q4_K or MXFP4 experts */
     }
     /* The IQ2_XXS/Q2_K and Q4_K kernels dequant 256-value super-blocks; MXFP4
      * uses 32-value blocks (handled by the generic /32 path below). */
     if ((iq2_path || q4_path) &&
         (expert_in_dim % 256u != 0 || expert_mid_dim % 256u != 0)) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: MoE fail: iq2/q4 divisibility layer=%u\n", layer_index);
         return 0;
     }
     if (mxfp4_path &&
         (expert_in_dim % 32u != 0 || expert_mid_dim % 32u != 0)) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: MoE fail: mxfp4 divisibility layer=%u\n", layer_index);
         return 0;
     }
     const uint64_t gate_region = (uint64_t)n_total_expert * gate_expert_bytes;
@@ -6073,6 +6127,10 @@ static int vulkan_routed_moe_launch(
     if (gate_region > UINT32_MAX || down_region > UINT32_MAX ||
         pair_count > UINT32_MAX || expert_in_dim > UINT32_MAX ||
         expert_mid_dim > UINT32_MAX || out_dim > UINT32_MAX) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: MoE fail: region size layer=%u gate_region=%llu down_region=%llu\n",
+                    layer_index, (unsigned long long)gate_region,
+                    (unsigned long long)down_region);
         return 0;
     }
     if (x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
@@ -6083,6 +6141,13 @@ static int vulkan_routed_moe_launch(
         mid->bytes < pair_count * expert_mid_dim * sizeof(float) ||
         down->bytes < pair_count * out_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: MoE fail: tensor size layer=%u pair=%llu xb=%llu selb=%llu wb=%llu gateb=%llu\n",
+                    layer_index, (unsigned long long)pair_count,
+                    (unsigned long long)x->bytes,
+                    (unsigned long long)selected->bytes,
+                    (unsigned long long)weights->bytes,
+                    (unsigned long long)gate->bytes);
         return 0;
     }
 
@@ -6103,11 +6168,19 @@ static int vulkan_routed_moe_launch(
         if (gate_offset > model_size || gate_region > model_size - gate_offset ||
             up_offset > model_size || gate_region > model_size - up_offset ||
             down_offset > model_size || down_region > model_size - down_offset) {
+            if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+                fprintf(stderr, "ds4: MoE fail: region bounds layer=%u\n", layer_index);
             return 0;
         }
         if (!vulkan_model_range_ok(gate_offset, gate_region) ||
             !vulkan_model_range_ok(up_offset, gate_region) ||
             !vulkan_model_range_ok(down_offset, down_region)) {
+            if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+                fprintf(stderr, "ds4: MoE fail: window not covering layer=%u gate=%llu up=%llu down=%llu\n",
+                        layer_index,
+                        (unsigned long long)gate_offset,
+                        (unsigned long long)up_offset,
+                        (unsigned long long)down_offset);
             return 0;
         }
         gate_b = vulkan_bind_model(DS4_VK_BINDING_B, gate_offset, gate_region);
@@ -6177,6 +6250,9 @@ static int vulkan_routed_moe_launch(
                    : g_pipes[DS4_PIPE_MOE_GATE_UP_MID_Q8]));
     if (!vulkan_dispatch(gate_pipe, &p, sizeof(p),
                          binds, nb, expert_mid_dim, (uint32_t)pair_count, 1)) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: MoE fail: gate dispatch layer=%u pool=%d\n",
+                    layer_index, pool_mode);
         return 0;
     }
 
@@ -6201,6 +6277,9 @@ static int vulkan_routed_moe_launch(
                    : g_pipes[DS4_PIPE_MOE_DOWN_Q8]));
     if (!vulkan_dispatch(down_pipe, &p, sizeof(p),
                          binds, nb, out_dim, (uint32_t)pair_count, 1)) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: MoE fail: down dispatch layer=%u pool=%d\n",
+                    layer_index, pool_mode);
         return 0;
     }
 
@@ -6213,8 +6292,13 @@ static int vulkan_routed_moe_launch(
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT5, out);
     const uint64_t n = (uint64_t)n_tokens * out_dim;
     const uint32_t groups = (uint32_t)((n + 255u) / 256u);
-    return vulkan_dispatch(g_pipes[DS4_PIPE_MOE_SUM], &p, sizeof(p),
-                           binds, nb, groups, 1, 1);
+    if (!vulkan_dispatch(g_pipes[DS4_PIPE_MOE_SUM], &p, sizeof(p),
+                         binds, nb, groups, 1, 1)) {
+        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
+            fprintf(stderr, "ds4: MoE fail: sum dispatch layer=%u\n", layer_index);
+        return 0;
+    }
+    return 1;
 }
 
 int ds4_gpu_routed_moe_one_tensor(
