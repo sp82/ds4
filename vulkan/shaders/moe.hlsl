@@ -42,7 +42,6 @@ groupshared float moe_down_red[256];
 [numthreads(256, 1, 1)]
 void moe_gate_up_mid_q8(uint3 gid_grp : SV_GroupID,
                         uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x;
     uint pair = gid_grp.y;
     uint mid_dim = params.out_dim;
     uint n_expert = params.index;
@@ -51,7 +50,7 @@ void moe_gate_up_mid_q8(uint3 gid_grp : SV_GroupID,
     uint blocks = params.blocks;
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
-    if (row >= mid_dim || pair >= n_tokens * n_expert) return;
+    if (pair >= n_tokens * n_expert) return;
     uint tok = pair / n_expert;
     uint slot = pair - tok * n_expert;
     int sel = selected_buf[tok * n_expert + slot];
@@ -64,9 +63,10 @@ void moe_gate_up_mid_q8(uint3 gid_grp : SV_GroupID,
     } else {
         expert = (uint)sel;
     }
+    uint xoff = tok * in_dim;
+    MOE_ROWS_BEGIN(gid_grp.x, mid_dim)
     uint gbase = expert * expert_bytes + row * row_bytes;
     uint ubase = expert * expert_bytes + row * row_bytes;
-    uint xoff = tok * in_dim;
     float gacc = 0.0f;
     float uacc = 0.0f;
     for (uint b = tid; b < blocks; b += 256u) {
@@ -114,6 +114,7 @@ void moe_gate_up_mid_q8(uint3 gid_grp : SV_GroupID,
         out4_buf[off] = (g / (1.0f + exp(-g))) * u *
                         weights_buf[tok * n_expert + slot];
     }
+    MOE_ROWS_END
 }
 
 /* One block per (row, pair): down[slot][row] = Q8_0 dot of the selected
@@ -124,7 +125,6 @@ void moe_gate_up_mid_q8(uint3 gid_grp : SV_GroupID,
 [numthreads(256, 1, 1)]
 void moe_down_q8(uint3 gid_grp : SV_GroupID,
                  uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x;
     uint pair = gid_grp.y;
     uint out_dim = params.out_dim;
     uint n_expert = params.index;
@@ -133,7 +133,7 @@ void moe_down_q8(uint3 gid_grp : SV_GroupID,
     uint blocks = params.blocks;
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
-    if (row >= out_dim || pair >= n_tokens * n_expert) return;
+    if (pair >= n_tokens * n_expert) return;
     uint tok = pair / n_expert;
     uint slot = pair - tok * n_expert;
     int sel = selected_buf[tok * n_expert + slot];
@@ -146,8 +146,9 @@ void moe_down_q8(uint3 gid_grp : SV_GroupID,
     } else {
         expert = (uint)sel;
     }
-    uint base = expert * expert_bytes + row * row_bytes;
     uint xoff = pair * in_dim;
+    MOE_ROWS_BEGIN(gid_grp.x, out_dim)
+    uint base = expert * expert_bytes + row * row_bytes;
     float acc = 0.0f;
     for (uint b = tid; b < blocks; b += 256u) {
         uint xb = xoff + b * 32u;
@@ -178,6 +179,7 @@ void moe_down_q8(uint3 gid_grp : SV_GroupID,
     if (tid == 0u) {
         out4_buf[pair * out_dim + row] = moe_down_red[0];
     }
+    MOE_ROWS_END
 }
 
 /* out[tok][row] = sum_slot down[(tok*n_expert+slot)][row].

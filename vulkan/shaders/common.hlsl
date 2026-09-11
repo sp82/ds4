@@ -44,9 +44,27 @@ struct DS4Params {
     uint  aux;        /* window / raw_cap / spare */
     uint  ratio;      /* compression ratio */
     uint  flags;      /* use_comp_mask / use_mask / spare */
-    uint  rsvd2;
+    uint  rsvd2;      /* MoE routed v2: rows per workgroup (R) */
     uint  rsvd3;
 };
+
+/* MoE routed rows-per-workgroup (SPECS_AUTOTUNE.md §2.5).  params.rsvd2 = R
+ * consecutive output rows processed per workgroup; R=0/1 is the classic
+ * one-row-per-workgroup grid.  Every MoE gate/down kernel wraps its
+ * row-dependent body:
+ *
+ *     MOE_ROWS_BEGIN(gid_grp.x, out_dim)
+ *         ... body using `row` ...
+ *     MOE_ROWS_END
+ *
+ * (the macro declares `row`; the pair/expert lookup stays outside the loop). */
+#define MOE_ROWS_BEGIN(gx, dim)                          \
+    uint moe_R = params.rsvd2;                           \
+    if (moe_R == 0u) moe_R = 1u;                         \
+    for (uint moe_rr = 0u; moe_rr < moe_R; moe_rr++) {   \
+        uint row = (gx) * moe_R + moe_rr;                \
+        if (row >= (dim)) break;
+#define MOE_ROWS_END }
 
 /* Q8_0 block: { uint16_t scale_half; int8_t qs[32]; } = 34 bytes.  The
  * blocks are not 4-byte aligned (34 % 4 == 2), so the byte helpers below

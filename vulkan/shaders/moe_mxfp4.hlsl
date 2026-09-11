@@ -43,7 +43,6 @@ groupshared float moe_down_red[256];
 [numthreads(256, 1, 1)]
 void moe_gate_up_mid_mxfp4(uint3 gid_grp : SV_GroupID,
                            uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x;
     uint pair = gid_grp.y;
     uint mid_dim = params.out_dim;
     uint n_expert = params.index;
@@ -51,7 +50,7 @@ void moe_gate_up_mid_mxfp4(uint3 gid_grp : SV_GroupID,
     uint blocks = params.blocks;
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
-    if (row >= mid_dim || pair >= n_tokens * n_expert) return;
+    if (pair >= n_tokens * n_expert) return;
     uint tok = pair / n_expert;
     uint slot = pair - tok * n_expert;
     int sel = selected_buf[tok * n_expert + slot];
@@ -64,6 +63,7 @@ void moe_gate_up_mid_mxfp4(uint3 gid_grp : SV_GroupID,
     } else {
         expert = (uint)sel;
     }
+    MOE_ROWS_BEGIN(gid_grp.x, mid_dim)
     uint gbase = expert * expert_bytes + row * row_bytes;
     uint ubase = expert * expert_bytes + row * row_bytes;
     float gacc = 0.0f;
@@ -96,6 +96,7 @@ void moe_gate_up_mid_mxfp4(uint3 gid_grp : SV_GroupID,
         out4_buf[off] = (g / (1.0f + exp(-g))) * u *
                         weights_buf[tok * n_expert + slot];
     }
+    MOE_ROWS_END
 }
 
 /* One block per (row, pair): down[slot][row] = MXFP4 dot of the selected
@@ -106,7 +107,6 @@ void moe_gate_up_mid_mxfp4(uint3 gid_grp : SV_GroupID,
 [numthreads(256, 1, 1)]
 void moe_down_mxfp4(uint3 gid_grp : SV_GroupID,
                     uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x;
     uint pair = gid_grp.y;
     uint out_dim = params.out_dim;
     uint n_expert = params.index;
@@ -114,7 +114,7 @@ void moe_down_mxfp4(uint3 gid_grp : SV_GroupID,
     uint blocks = params.blocks;
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
-    if (row >= out_dim || pair >= n_tokens * n_expert) return;
+    if (pair >= n_tokens * n_expert) return;
     uint tok = pair / n_expert;
     uint slot = pair - tok * n_expert;
     int sel = selected_buf[tok * n_expert + slot];
@@ -127,6 +127,7 @@ void moe_down_mxfp4(uint3 gid_grp : SV_GroupID,
     } else {
         expert = (uint)sel;
     }
+    MOE_ROWS_BEGIN(gid_grp.x, out_dim)
     uint bbase = expert * expert_bytes + row * row_bytes;
     float acc = 0.0f;
     for (uint b = tid; b < blocks; b += 256u) {
@@ -144,6 +145,7 @@ void moe_down_mxfp4(uint3 gid_grp : SV_GroupID,
     if (tid == 0u) {
         out4_buf[pair * out_dim + row] = moe_down_red[0];
     }
+    MOE_ROWS_END
 }
 
 /* Partial MXFP4 block dot over `bc` qs bytes starting at byte b0 (0..15) of
@@ -162,22 +164,24 @@ static float mxfp4_partial_dot(ByteAddressBuffer w, uint bbase,
     }
     return acc;
 }
-
 /* v2: same as moe_gate_up_mid_mxfp4 but two lanes share each 32-value block
  * (half the qs bytes each) so all 256 lanes are active at in_dim/32 blocks
- * (e.g. 128 at in_dim=4096).  The tree reduce is unchanged. */
+ * (e.g. 128 at in_dim=4096).  The tree reduce is unchanged.  Each workgroup
+ * processes params.rsvd2 consecutive rows: the prefill grid is
+ * dispatch-bound on NVIDIA (one tiny workgroup per (row, pair) = millions),
+ * so amortising the per-workgroup cost over several rows is a large win.
+ * rsvd2 (rows/workgroup) is set by the host; 0/1 = the classic one-row grid. */
 [numthreads(256, 1, 1)]
 void moe_gate_up_mid_mxfp4_v2(uint3 gid_grp : SV_GroupID,
                               uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x;
-    uint pair = gid_grp.y;
     uint mid_dim = params.out_dim;
     uint n_expert = params.index;
     uint n_tokens = params.rows;
     uint blocks = params.blocks;
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
-    if (row >= mid_dim || pair >= n_tokens * n_expert) return;
+    uint pair = gid_grp.y;
+    if (pair >= n_tokens * n_expert) return;
     uint apair = ((params.flags & 2u) != 0u) ? order_buf[pair] : pair;
     uint tok = apair / n_expert;
     uint slot = apair - tok * n_expert;
@@ -191,55 +195,63 @@ void moe_gate_up_mid_mxfp4_v2(uint3 gid_grp : SV_GroupID,
     } else {
         expert = (uint)sel;
     }
-    uint gbase = expert * expert_bytes + row * row_bytes;
+    uint R = params.rsvd2;
+    if (R == 0u) R = 1u;
     uint b = tid >> 1u;
     uint h = tid & 1u;
-    float gacc = 0.0f;
-    float uacc = 0.0f;
-    for (; b < blocks; b += 128u) {
-        uint xb = tok * params.in_dim + b * 32u;
-        gacc += mxfp4_partial_dot(w_buf, gbase + b * 17u, a_buf, xb, h * 8u, 8u);
-        uacc += mxfp4_partial_dot(up_w_buf, gbase + b * 17u, a_buf, xb,
-                                  h * 8u, 8u);
-    }
-    moe_gate_red[tid] = gacc;
-    moe_up_red[tid] = uacc;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            moe_gate_red[tid] += moe_gate_red[tid + stride];
-            moe_up_red[tid] += moe_up_red[tid + stride];
+    for (uint rr = 0u; rr < R; rr++) {
+        uint row = gid_grp.x * R + rr;
+        if (row >= mid_dim) break;
+        uint gbase = expert * expert_bytes + row * row_bytes;
+        float gacc = 0.0f;
+        float uacc = 0.0f;
+        for (uint bb = b; bb < blocks; bb += 128u) {
+            uint xb = tok * params.in_dim + bb * 32u;
+            gacc += mxfp4_partial_dot(w_buf, gbase + bb * 17u, a_buf, xb,
+                                      h * 8u, 8u);
+            uacc += mxfp4_partial_dot(up_w_buf, gbase + bb * 17u, a_buf, xb,
+                                      h * 8u, 8u);
         }
+        moe_gate_red[tid] = gacc;
+        moe_up_red[tid] = uacc;
         GroupMemoryBarrierWithGroupSync();
-    }
-    if (tid == 0u) {
-        float g = moe_gate_red[0];
-        float u = moe_up_red[0];
-        if (params.clamp > 1.0e-6f) {
-            g = min(g, params.clamp);
-            u = min(max(u, -params.clamp), params.clamp);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                moe_gate_red[tid] += moe_gate_red[tid + stride];
+                moe_up_red[tid] += moe_up_red[tid + stride];
+            }
+            GroupMemoryBarrierWithGroupSync();
         }
-        uint off = apair * mid_dim + row;
-        out2_buf[off] = g;
-        out3_buf[off] = u;
-        out4_buf[off] = (g / (1.0f + exp(-g))) * u * weights_buf[apair];
+        if (tid == 0u) {
+            float g = moe_gate_red[0];
+            float u = moe_up_red[0];
+            if (params.clamp > 1.0e-6f) {
+                g = min(g, params.clamp);
+                u = min(max(u, -params.clamp), params.clamp);
+            }
+            uint off = apair * mid_dim + row;
+            out2_buf[off] = g;
+            out3_buf[off] = u;
+            out4_buf[off] = (g / (1.0f + exp(-g))) * u *
+                            weights_buf[apair];
+        }
     }
 }
 
 /* v2 down: four lanes share each 32-value block (four qs bytes each) so all
- * 256 lanes are active at mid_dim/32 blocks (e.g. 64 at mid_dim=2048). */
+ * 256 lanes are active at mid_dim/32 blocks (e.g. 64 at mid_dim=2048).  Like
+ * the gate/up v2, each workgroup processes DS4_MOE_ROWS_PER_GROUP rows. */
 [numthreads(256, 1, 1)]
 void moe_down_mxfp4_v2(uint3 gid_grp : SV_GroupID,
                        uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x;
-    uint pair = gid_grp.y;
     uint out_dim = params.out_dim;
     uint n_expert = params.index;
     uint n_tokens = params.rows;
     uint blocks = params.blocks;
     uint expert_bytes = params.aux;
     uint row_bytes = params.ratio;
-    if (row >= out_dim || pair >= n_tokens * n_expert) return;
+    uint pair = gid_grp.y;
+    if (pair >= n_tokens * n_expert) return;
     uint apair = ((params.flags & 2u) != 0u) ? order_buf[pair] : pair;
     uint tok = apair / n_expert;
     uint slot = apair - tok * n_expert;
@@ -253,23 +265,30 @@ void moe_down_mxfp4_v2(uint3 gid_grp : SV_GroupID,
     } else {
         expert = (uint)sel;
     }
-    uint bbase = expert * expert_bytes + row * row_bytes;
+    uint R = params.rsvd2;
+    if (R == 0u) R = 1u;
     uint b = tid >> 2u;
     uint h = tid & 3u;
-    float acc = 0.0f;
-    for (; b < blocks; b += 64u) {
-        uint xb = apair * params.in_dim + b * 32u;
-        acc += mxfp4_partial_dot(w_buf, bbase + b * 17u, a_buf, xb, h * 4u, 4u);
-    }
-    moe_down_red[tid] = acc;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            moe_down_red[tid] += moe_down_red[tid + stride];
+    for (uint rr = 0u; rr < R; rr++) {
+        uint row = gid_grp.x * R + rr;
+        if (row >= out_dim) break;
+        uint bbase = expert * expert_bytes + row * row_bytes;
+        float acc = 0.0f;
+        for (uint bb = b; bb < blocks; bb += 64u) {
+            uint xb = apair * params.in_dim + bb * 32u;
+            acc += mxfp4_partial_dot(w_buf, bbase + bb * 17u, a_buf, xb,
+                                     h * 4u, 4u);
         }
+        moe_down_red[tid] = acc;
         GroupMemoryBarrierWithGroupSync();
-    }
-    if (tid == 0u) {
-        out4_buf[apair * out_dim + row] = moe_down_red[0];
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                moe_down_red[tid] += moe_down_red[tid + stride];
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (tid == 0u) {
+            out4_buf[apair * out_dim + row] = moe_down_red[0];
+        }
     }
 }
