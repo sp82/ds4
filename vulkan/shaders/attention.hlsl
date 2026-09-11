@@ -499,6 +499,90 @@ void attn_output_low_q8(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadID) {
     }
 }
 
+/* v2: packed-dot variant of attn_output_low_q8.  Same math and output as v1
+ * (activation quantized inline identically: amax/127, round, clamp), but the
+ * Q8 weight is read as 32-bit words and the int8 dot uses dot4add_i8packed
+ * (OpSDot, requires VK_KHR_shader_integer_dot_product, compiled as cs_6_4).
+ * The host selects this only when the device exposes the feature. */
+[numthreads(256, 1, 1)]
+void attn_output_low_q8_v2(uint3 gid : SV_GroupID,
+                           uint tid : SV_GroupThreadID) {
+    uint row = gid.x;
+    uint t = gid.y;
+    uint rank = params.out_dim;
+    uint group_dim = params.n;
+    uint blocks = params.blocks;
+    uint n_groups_total = params.index;
+    uint group0 = params.aux;
+    uint group_cnt = params.n_rot;
+    uint n_rows = params.rows;
+    if (row >= group_cnt * rank || t >= n_rows) return;
+
+    uint g = group0 + row / rank;
+    uint r = row % rank;
+    uint wrow = g * rank + r;
+    uint xbase = t * n_groups_total * group_dim + g * group_dim;
+
+    float acc = 0.0f;
+    for (uint b = tid; b < blocks; b += 256u) {
+        uint i0 = b * 32u;
+        uint bn = min(32u, group_dim - i0);
+        float amax = 0.0f;
+        for (uint i = 0u; i < bn; i++) {
+            amax = max(amax, abs(q_buf[xbase + i0 + i]));
+        }
+        float d = amax / 127.0f;
+        float id = d != 0.0f ? 1.0f / d : 0.0f;
+        uint qw[8];
+        for (uint j = 0u; j < 8u; j++) {
+            uint packed = 0u;
+            for (uint k = 0u; k < 4u; k++) {
+                uint idx = j * 4u + k;
+                int q = 0;
+                if (idx < bn) {
+                    q = (int)round(q_buf[xbase + i0 + idx] * id);
+                    q = min(q, 127);
+                    q = max(q, -128);
+                }
+                packed |= ((uint)(q & 0xff)) << (k * 8u);
+            }
+            qw[j] = packed;
+        }
+        uint wblock = wrow * blocks + b;
+        uint w_byte = wblock * 34u + 2u;
+        uint ww[8];
+        if ((wblock & 1u) != 0u) {
+            for (uint j = 0u; j < 8u; j++) {
+                ww[j] = sink_buf.Load(w_byte + j * 4u);
+            }
+        } else {
+            uint prev = sink_buf.Load(w_byte - 2u);
+            for (uint j = 0u; j < 8u; j++) {
+                uint nxt = sink_buf.Load(w_byte + 2u + j * 4u);
+                ww[j] = (prev >> 16u) | (nxt << 16u);
+                prev = nxt;
+            }
+        }
+        int dot = 0;
+        for (uint j = 0u; j < 8u; j++) {
+            dot = dot4add_i8packed(qw[j], ww[j], dot);
+        }
+        acc += q8_scale(sink_buf, wblock) * d * (float)dot;
+    }
+
+    attn_partial[tid] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            attn_partial[tid] += attn_partial[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        heads_buf[t * (group_cnt * rank) + row] = attn_partial[0];
+    }
+}
+
 /* Low-rank projection of the attention output (grouped Q4_K): same math and
  * layout as attn_output_low_q8, but out_a is Q4_K (144-byte 256-value blocks)
  * and the activation heads are used raw (f32, no inline Q8 quantization).
