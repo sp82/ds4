@@ -138,6 +138,12 @@ static uint32_t g_scope_bind_count = 0;
 static uint32_t g_scope_dispatch_count = 0;
 
 static VkPhysicalDeviceProperties    g_props;
+/* VK_NV_device_diagnostic_checkpoints debug (DS4_VULKAN_CHECKPOINTS): insert a
+ * marker per dispatch; after a device lost the queue's last checkpoint names
+ * the faulting kernel (no serialization, unlike timestamps). */
+static PFN_vkCmdSetCheckpointNV          g_pfnCmdSetCheckpointNV = NULL;
+static PFN_vkGetQueueCheckpointDataNV    g_pfnGetQueueCheckpointDataNV = NULL;
+static int                               g_dbg_checkpoints = -1;
 static VkPhysicalDeviceMemoryProperties g_mem_props;
 static uint32_t g_host_visible_mem_type = UINT32_MAX;
 static uint32_t g_device_local_mem_type = UINT32_MAX; /* pure VRAM (no map) */
@@ -989,9 +995,12 @@ static VkResult vulkan_create_device(void) {
     const char *bda_ext = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
     const char *intdot_ext =
         VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
-    const char *dev_exts[2];
+    const char *chkpt_ext =
+        VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
+    const char *dev_exts[3];
     uint32_t n_dev_exts = 0;
     const int want_bda = getenv("DS4_VULKAN_DEBUG_BINDS") != NULL;
+    const int want_chkpt = getenv("DS4_VULKAN_CHECKPOINTS") != NULL;
     VkPhysicalDeviceFeatures2 feat2 = {};
     VkPhysicalDeviceDescriptorIndexingFeatures desc_index = {};
     VkPhysicalDeviceShaderIntegerDotProductFeatures intdot_feat = {};
@@ -1021,6 +1030,10 @@ static VkResult vulkan_create_device(void) {
                     } else if (want_bda &&
                                strcmp(dexts[i].extensionName, bda_ext) == 0) {
                         dev_exts[n_dev_exts++] = bda_ext;
+                    } else if (want_chkpt &&
+                               strcmp(dexts[i].extensionName, chkpt_ext) == 0) {
+                        dev_exts[n_dev_exts++] = chkpt_ext;
+                        g_dbg_checkpoints = 1;
                     }
                 }
                 free(dexts);
@@ -1088,6 +1101,16 @@ static VkResult vulkan_create_device(void) {
     if (n_dev_exts > 0) {
         g_vk_bda = (PFN_vkGetBufferDeviceAddressKHR)vkGetDeviceProcAddr(
                 g_device, "vkGetBufferDeviceAddressKHR");
+    }
+    if (g_dbg_checkpoints == 1) {
+        g_pfnCmdSetCheckpointNV = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(
+                g_device, "vkCmdSetCheckpointNV");
+        g_pfnGetQueueCheckpointDataNV =
+            (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(
+                g_device, "vkGetQueueCheckpointDataNV");
+        if (!g_pfnCmdSetCheckpointNV || !g_pfnGetQueueCheckpointDataNV) {
+            g_dbg_checkpoints = 0;
+        }
     }
 
     VkCommandPoolCreateInfo cpci = {};
@@ -1989,11 +2012,35 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 /* Every submission to g_queue goes through this helper.  The lock covers only
  * the submit, not GPU execution, so the async overlap is preserved. */
+/* After a device lost, report the last checkpoint markers the GPU reached
+ * (DS4_VULKAN_CHECKPOINTS) so the faulting dispatch is identifiable. */
+static void vulkan_dbg_dump_checkpoints(void) {
+    if (g_dbg_checkpoints != 1 || !g_pfnGetQueueCheckpointDataNV) return;
+    uint32_t n = 0;
+    g_pfnGetQueueCheckpointDataNV(g_queue, &n, NULL);
+    if (n == 0) {
+        fprintf(stderr, "ds4: checkpoints: none recorded\n");
+        return;
+    }
+    if (n > 64) n = 64;
+    VkCheckpointDataNV data[64];
+    for (uint32_t i = 0; i < n; i++) {
+        data[i].sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+        data[i].pNext = NULL;
+    }
+    g_pfnGetQueueCheckpointDataNV(g_queue, &n, data);
+    for (uint32_t i = 0; i < n; i++) {
+        fprintf(stderr, "ds4: GPU last checkpoint pipe=%u\n",
+                (uint32_t)(uintptr_t)data[i].pCheckpointMarker);
+    }
+}
+
 static VkResult vulkan_queue_submit(uint32_t count, const VkSubmitInfo *si,
                                     VkFence fence) {
     pthread_mutex_lock(&g_queue_mutex);
     const VkResult rc = vkQueueSubmit(g_queue, count, si, fence);
     pthread_mutex_unlock(&g_queue_mutex);
+    if (rc != VK_SUCCESS) vulkan_dbg_dump_checkpoints();
     return rc;
 }
 
@@ -2463,34 +2510,45 @@ static int vulkan_model_range_ok(uint64_t offset, uint64_t bytes) {
  * is still in flight while layer N+1 records).  Settle the device before
  * freeing, otherwise the in-flight shader reads/writes an unmapped buffer and
  * the GPU reports a GPUVM fault (RW=WRITE, one past the old buffer end). */
+/* Free a scratch buffer that may still be referenced by the OPEN command
+ * scope.  vulkan_device_wait() only drains submitted work, so submit the
+ * current scope first; otherwise the GPU reads/writes the freed buffer when
+ * the open scope executes (device lost / Xid).  Scratch growth is rare, so
+ * the extra submit is cheap. */
+static void vulkan_scratch_retire(ds4_gpu_tensor **slot) {
+    if (!*slot) return;
+    if (g_commands_active) {
+        (void)ds4_gpu_flush_commands();
+    }
+    vulkan_device_wait();
+    ds4_gpu_tensor_free(*slot);
+    *slot = NULL;
+}
+
 static ds4_gpu_tensor *vulkan_scratch_a(uint64_t bytes) {
     if (g_scratch_a && g_scratch_a->bytes >= bytes) return g_scratch_a;
-    vulkan_device_wait();
-    if (g_scratch_a) ds4_gpu_tensor_free(g_scratch_a);
+    vulkan_scratch_retire(&g_scratch_a);
     g_scratch_a = ds4_gpu_tensor_alloc(bytes);
     return g_scratch_a;
 }
 
 static ds4_gpu_tensor *vulkan_scratch_b(uint64_t bytes) {
     if (g_scratch_b && g_scratch_b->bytes >= bytes) return g_scratch_b;
-    vulkan_device_wait();
-    if (g_scratch_b) ds4_gpu_tensor_free(g_scratch_b);
+    vulkan_scratch_retire(&g_scratch_b);
     g_scratch_b = ds4_gpu_tensor_alloc(bytes);
     return g_scratch_b;
 }
 
 static ds4_gpu_tensor *vulkan_scratch_c(uint64_t bytes) {
     if (g_scratch_c && g_scratch_c->bytes >= bytes) return g_scratch_c;
-    vulkan_device_wait();
-    if (g_scratch_c) ds4_gpu_tensor_free(g_scratch_c);
+    vulkan_scratch_retire(&g_scratch_c);
     g_scratch_c = ds4_gpu_tensor_alloc(bytes);
     return g_scratch_c;
 }
 
 static ds4_gpu_tensor *vulkan_scratch_d(uint64_t bytes) {
     if (g_scratch_d && g_scratch_d->bytes >= bytes) return g_scratch_d;
-    vulkan_device_wait();
-    if (g_scratch_d) ds4_gpu_tensor_free(g_scratch_d);
+    vulkan_scratch_retire(&g_scratch_d);
     g_scratch_d = ds4_gpu_tensor_alloc(bytes);
     return g_scratch_d;
 }
@@ -2591,6 +2649,13 @@ static int vulkan_dispatch(VkPipeline pipeline,
                        0, params_size, params);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                             g_pipe_layout, 0, 1, &set, 0, NULL);
+    if (g_dbg_checkpoints == 1 && g_pfnCmdSetCheckpointNV) {
+        int dbg_pipe = -1;
+        for (int pi = 0; pi < DS4_VK_PIPE_COUNT; pi++) {
+            if (g_pipes[pi] == pipeline) { dbg_pipe = pi; break; }
+        }
+        g_pfnCmdSetCheckpointNV(cb, (const void *)(uintptr_t)(uint32_t)dbg_pipe);
+    }
     vkCmdDispatch(cb, gx, gy, gz);
     if (getenv("DS4_VULKAN_DEBUG_DISPATCH") != NULL) {
         int pipe_idx = -1;
