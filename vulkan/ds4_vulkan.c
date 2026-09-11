@@ -145,6 +145,9 @@ static VkFence           g_worker_fence = VK_NULL_HANDLE;
 static int               g_worker_fence_pending = 0;
 /* VK_KHR_shader_integer_dot_product available (hardware packed int8 dot). */
 static int               g_has_int_dot = 0;
+/* attn_output_low variant chosen by the init autotuner: -1 = not yet, 0/1/2 =
+ * v1/v2/v3.  See vulkan_autotune_attn_out. */
+static int               g_attn_out_autotuned = -1;
 /* Fence signaling the router-scope submission that produced the selection
  * read back by the worker (signal_selected_readback_ready / wait). */
 static VkFence           g_readback_fence = VK_NULL_HANDLE;
@@ -250,7 +253,7 @@ static void vulkan_device_wait_impl(int reset_pool) {
  * worker uses vulkan_device_wait_impl(0) to drain without touching the pool. */
 static void vulkan_device_wait(void) { vulkan_device_wait_impl(1); }
 
-#define DS4_VK_PIPE_COUNT 73
+#define DS4_VK_PIPE_COUNT 74
 static VkPipeline     g_pipes[DS4_VK_PIPE_COUNT];
 static VkShaderModule g_mods[DS4_VK_PIPE_COUNT];
 
@@ -328,6 +331,7 @@ enum ds4_vk_pipe {
     DS4_PIPE_MATMUL_Q4K,
     DS4_PIPE_MATMUL_Q4_0,
     DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2,
+    DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V3,
 };
 
 /* Whole-model wrapper (Fase 6 step 2 staging pool).  The windows requested by
@@ -1418,6 +1422,8 @@ static int vulkan_compute_init(void) {
         { ds4_spv_matmul_q4_0, ds4_spv_matmul_q4_0_len, "matmul_q4_0" },
         { ds4_spv_attn_output_low_q8_v2, ds4_spv_attn_output_low_q8_v2_len,
           "attn_output_low_q8_v2" },
+        { ds4_spv_attn_output_low_q8_v3, ds4_spv_attn_output_low_q8_v3_len,
+          "attn_output_low_q8_v3" },
     };
     for (uint32_t i = 0; i < DS4_VK_PIPE_COUNT; i++) {
         snprintf(g_pipe_names[i], sizeof(g_pipe_names[i]), "%s",
@@ -1431,6 +1437,11 @@ static int vulkan_compute_init(void) {
             continue;
         }
         if (i == DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2 && !g_has_int_dot) {
+            g_mods[i] = VK_NULL_HANDLE;
+            g_pipes[i] = VK_NULL_HANDLE;
+            continue;
+        }
+        if (i == DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V3 && !g_has_int_dot) {
             g_mods[i] = VK_NULL_HANDLE;
             g_pipes[i] = VK_NULL_HANDLE;
             continue;
@@ -1492,6 +1503,7 @@ static void vulkan_compute_cleanup(void) {
 /* --- public contract: lifecycle ---------------------------------------- */
 
 static void vulkan_autotune_moe_rows(void);
+static void vulkan_autotune_attn_out(void);
 
 int ds4_gpu_init(void) {
     if (g_device != VK_NULL_HANDLE) return 1; /* already initialized */
@@ -1541,6 +1553,7 @@ int ds4_gpu_init(void) {
         return 0;
     }
     vulkan_autotune_moe_rows();
+    vulkan_autotune_attn_out();
     return 1;
 }
 
@@ -3742,16 +3755,32 @@ static VkPipeline vulkan_pipe_q8_preq(void) {
     return g_pipes[DS4_PIPE_MATMUL_Q8_0_PREQ_V2];
 }
 
-/* attn_output_low Q8 variant: v2 uses dot4add_i8packed (packed int8 dot) when
- * the device exposes VK_KHR_shader_integer_dot_product, else the original
- * byte-by-byte v1.  DS4_VULKAN_FORCE_VARIANT=ATTN_OUT_LOW:0|1 for bisect. */
-static VkPipeline vulkan_pipe_attn_output_low(void) {
-    if (vulkan_force_variant("ATTN_OUT_LOW", "0")) {
-        return g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8];
-    }
-    if (g_has_int_dot && g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2] != VK_NULL_HANDLE) {
-        return g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2];
-    }
+/* attn_output_low variant selection.  v3 (activation reuse) and v2 (DP4A)
+ * need VK_KHR_shader_integer_dot_product; v3 additionally needs blocks<=128
+ * and rank%8==0.  The init autotuner (vulkan_autotune_attn_out) pins the
+ * fastest per device in g_attn_out_autotuned; DS4_VULKAN_FORCE_VARIANT=
+ * ATTN_OUT_LOW:0|1|2 overrides for bisect.  Defaults: best supported. */
+static int vulkan_attn_out_variant(uint32_t blocks, uint64_t rank) {
+    const int v3_ok = g_has_int_dot && blocks <= 128u && (rank % 8u) == 0u &&
+                      g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V3] != VK_NULL_HANDLE;
+    const int v2_ok = g_has_int_dot &&
+                      g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2] != VK_NULL_HANDLE;
+    int want = -1;
+    if (vulkan_force_variant("ATTN_OUT_LOW", "0")) want = 0;
+    else if (vulkan_force_variant("ATTN_OUT_LOW", "1")) want = 1;
+    else if (vulkan_force_variant("ATTN_OUT_LOW", "2")) want = 2;
+    else if (g_attn_out_autotuned >= 0) want = g_attn_out_autotuned;
+    if (want == 2 && v3_ok) return 2;
+    if (want == 1 && v2_ok) return 1;
+    if (want == 0) return 0;
+    if (v3_ok) return 2;
+    if (v2_ok) return 1;
+    return 0;
+}
+
+static VkPipeline vulkan_pipe_attn_output_low_variant(int v) {
+    if (v == 2) return g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V3];
+    if (v == 1) return g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2];
     return g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8];
 }
 
@@ -5066,8 +5095,15 @@ static int vulkan_attn_output_low_q8(ds4_gpu_tensor *low,
     binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_W, a_offset, out_a_bytes);
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, low);
     if (low_dim > UINT32_MAX || n_rows > UINT32_MAX) return 0;
-    return vulkan_dispatch(vulkan_pipe_attn_output_low(), &p, sizeof(p),
-                           binds, nb, (uint32_t)low_dim, n_rows, 1);
+    const int var = vulkan_attn_out_variant((uint32_t)blocks_a, rank);
+    if (var == 2) {
+        /* v3: one workgroup per AO_RT=8 rows. */
+        const uint32_t gx = (uint32_t)((low_dim + 7u) / 8u);
+        return vulkan_dispatch(vulkan_pipe_attn_output_low_variant(2), &p,
+                               sizeof(p), binds, nb, gx, n_rows, 1);
+    }
+    return vulkan_dispatch(vulkan_pipe_attn_output_low_variant(var), &p,
+                           sizeof(p), binds, nb, (uint32_t)low_dim, n_rows, 1);
 }
 
 /* Full attention output: low = heads @ out_a^T (grouped Q8_0), then
@@ -6624,6 +6660,99 @@ int ds4_gpu_routed_moe_batch_tensor(
  * leaves the runtime exactly as the explicit DS4_VULKAN_MOE_ROWS override
  * would.  Skipped when DS4_VULKAN_MOE_ROWS is set or DS4_VULKAN_AUTOTUNE_OFF=1;
  * DS4_VULKAN_AUTOTUNE_PROFILE=1 logs each measurement. */
+/* Benchmark the attn_output_low variants at init and pin the fastest per
+ * device in g_attn_out_autotuned.  Uses a synthetic Q8 weight map and an
+ * activation scratch (timing is shape-bound, data-independent), like
+ * vulkan_autotune_moe_rows.  Skips when int-dot is unavailable (only v1) or a
+ * forced variant is set. */
+static void vulkan_autotune_attn_out(void) {
+    if (getenv("DS4_VULKAN_AUTOTUNE_OFF")) return;
+    if (getenv("DS4_VULKAN_FORCE_VARIANT")) return;
+    if (!g_has_int_dot) return;
+    if (g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2] == VK_NULL_HANDLE) return;
+
+    /* DS4 Flash attention output shape. */
+    const uint64_t group_dim = 4096u, rank = 1024u;
+    const uint32_t n_groups = 8u;
+    const uint64_t blocks = group_dim / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t map_size =
+        ((uint64_t)n_groups * rank * row_bytes + 4095u) & ~(uint64_t)4095u;
+
+    uint8_t *map = NULL;
+    ds4_gpu_tensor *low = NULL, *heads = NULL;
+    float *hv = NULL;
+    if (posix_memalign((void **)&map, 4096, (size_t)map_size) == 0) {
+        for (uint64_t i = 0; i < map_size; i++) {
+            map[i] = (uint8_t)(i * 131u + 7u);
+        }
+        low = ds4_gpu_tensor_alloc((uint64_t)n_groups * rank * 4u);
+        heads = ds4_gpu_tensor_alloc((uint64_t)n_groups * group_dim * 4u);
+        if (low && heads) {
+            hv = (float *)malloc((size_t)n_groups * group_dim * 4u);
+        }
+    }
+    if (map && low && heads && hv) {
+        for (uint64_t i = 0; i < (uint64_t)n_groups * group_dim; i++) {
+            hv[i] = 0.2f * (float)(i % 13u) - 0.5f;
+        }
+        ds4_gpu_set_model_map(map, map_size);
+        ds4_gpu_tensor_write(heads, 0, hv,
+                             (uint64_t)n_groups * group_dim * 4u);
+
+        int best = 0;
+        double best_ms = 0.0;
+        for (int v = 0; v < 3; v++) {
+            if (v == 1 &&
+                g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2] == VK_NULL_HANDLE)
+                continue;
+            if (v == 2 &&
+                (g_pipes[DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V3] == VK_NULL_HANDLE ||
+                 blocks > 128u || (rank % 8u) != 0u))
+                continue;
+            g_attn_out_autotuned = v;
+            /* Warm-up primes pipeline/descriptor state. */
+            ds4_gpu_begin_commands();
+            (void)vulkan_attn_output_low_q8(low, map, map_size, 0u, group_dim,
+                                            rank, n_groups, 0u, n_groups,
+                                            heads, 1u);
+            ds4_gpu_end_commands();
+            ds4_gpu_synchronize();
+            const int iters = 30;
+            ds4_gpu_begin_commands();
+            const double t0 = vulkan_now_ms();
+            for (int it = 0; it < iters; it++) {
+                (void)vulkan_attn_output_low_q8(low, map, map_size, 0u,
+                                                group_dim, rank, n_groups, 0u,
+                                                n_groups, heads, 1u);
+            }
+            ds4_gpu_end_commands();
+            ds4_gpu_synchronize();
+            const double ms = (vulkan_now_ms() - t0) / (double)iters;
+            if (getenv("DS4_VULKAN_AUTOTUNE_PROFILE")) {
+                fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                        "autotune: ATTN_OUT v%d -> %.3f ms\n", v, ms);
+            }
+            if (best_ms == 0.0 || ms < best_ms) {
+                best_ms = ms;
+                best = v;
+            }
+        }
+        g_attn_out_autotuned = best;
+        fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                "autotune: attn_output_low variant = v%d (%.3f ms, "
+                "gdim=%llu rank=%llu)\n",
+                best, best_ms, (unsigned long long)group_dim,
+                (unsigned long long)rank);
+    }
+
+    free(hv);
+    ds4_gpu_tensor_free(low);
+    ds4_gpu_tensor_free(heads);
+    ds4_gpu_set_model_map(NULL, 0);
+    free(map);
+}
+
 static void vulkan_autotune_moe_rows(void) {
     if (getenv("DS4_VULKAN_AUTOTUNE_OFF")) return;
     {
