@@ -103,6 +103,9 @@ static VkCommandPool     g_cmd_pool  = VK_NULL_HANDLE;
  * an acquire only waits it, never resets it, to not race the worker's wait). */
 static VkCommandBuffer   g_cmd[2]    = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 static VkFence           g_cmd_fence[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+/* Persistent per-CB fence, created once and reused; g_cmd_fence[i] is only the
+ * in-flight marker (this fence, or g_readback_fence for a readback scope). */
+static VkFence           g_cb_fence[2]  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 static int               g_cmd_i     = 0;   /* CB currently recording */
 static bool              g_commands_active = false;
 
@@ -1475,9 +1478,9 @@ void ds4_gpu_cleanup(void) {
         }
         g_model_window_count = 0;
         for (int i = 0; i < 2; i++) {
-            if (g_cmd_fence[i] != VK_NULL_HANDLE &&
-                g_cmd_fence[i] != g_readback_fence) {
-                vkDestroyFence(g_device, g_cmd_fence[i], NULL);
+            if (g_cb_fence[i] != VK_NULL_HANDLE) {
+                vkDestroyFence(g_device, g_cb_fence[i], NULL);
+                g_cb_fence[i] = VK_NULL_HANDLE;
             }
             g_cmd_fence[i] = VK_NULL_HANDLE;
         }
@@ -2030,11 +2033,9 @@ static VkCommandBuffer vulkan_cb_acquire(int switch_ok) {
     if (g_cmd_fence[g_cmd_i] != VK_NULL_HANDLE) {
         const VkFence f = g_cmd_fence[g_cmd_i];
         vkWaitForFences(g_device, 1, &f, VK_TRUE, UINT64_MAX);
-        /* Destroy our own fence (the readback fence is a global reused by the
-         * signal/worker).  The old code only reset + NULLed it and created a
-         * fresh fence per submit, leaking one fence per submit until
-         * vkCreateFence failed with VK_ERROR_OUT_OF_HOST_MEMORY. */
-        if (f != g_readback_fence) vkDestroyFence(g_device, f, NULL);
+        /* Clear the in-flight marker; the CB's own persistent fence stays in
+         * g_cb_fence[] and is reset+reused by the next vulkan_cb_submit (the
+         * readback fence is a global owned by the signal). */
         g_cmd_fence[g_cmd_i] = VK_NULL_HANDLE;
     }
     /* Descriptor-pool bound: no scope is open here, so a rare drain resets
@@ -2056,33 +2057,26 @@ static VkCommandBuffer vulkan_cb_acquire(int switch_ok) {
  * GPU starts it immediately; the fence marks the CB busy until it is
  * reused by vulkan_cb_acquire). */
 static int vulkan_cb_submit(void) {
-    const VkResult er = vkEndCommandBuffer(g_cmd[g_cmd_i]);
-    if (er != VK_SUCCESS) {
-        if (getenv("DS4_VULKAN_DEBUG_FAIL"))
-            fprintf(stderr, "ds4: cb_submit end rc=%d cmd=%p\n", (int)er, (void *)g_cmd[g_cmd_i]);
-        return 0;
-    }
-    if (g_cmd_fence[g_cmd_i] == VK_NULL_HANDLE) {
+    if (vkEndCommandBuffer(g_cmd[g_cmd_i]) != VK_SUCCESS) return 0;
+    if (g_cb_fence[g_cmd_i] == VK_NULL_HANDLE) {
         VkFenceCreateInfo fci = {};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        const VkResult cr = vkCreateFence(g_device, &fci, NULL, &g_cmd_fence[g_cmd_i]);
-        if (cr != VK_SUCCESS) {
-            if (getenv("DS4_VULKAN_DEBUG_FAIL")) fprintf(stderr, "ds4: cb_submit createfence rc=%d\n", (int)cr);
+        if (vkCreateFence(g_device, &fci, NULL, &g_cb_fence[g_cmd_i]) != VK_SUCCESS) {
             return 0;
         }
-    } else if (vkResetFences(g_device, 1, &g_cmd_fence[g_cmd_i]) != VK_SUCCESS) {
-        if (getenv("DS4_VULKAN_DEBUG_FAIL")) fprintf(stderr, "ds4: cb_submit resetfence failed\n");
+    } else if (vkResetFences(g_device, 1, &g_cb_fence[g_cmd_i]) != VK_SUCCESS) {
         return 0;
     }
     VkSubmitInfo si = {};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cmd[g_cmd_i];
-    const VkResult rc = vulkan_queue_submit(1, &si, g_cmd_fence[g_cmd_i]);
+    const VkResult rc = vulkan_queue_submit(1, &si, g_cb_fence[g_cmd_i]);
     if (rc != VK_SUCCESS) {
         vulkan_log_vk(rc, "vkQueueSubmit(scope)");
         return 0;
     }
+    g_cmd_fence[g_cmd_i] = g_cb_fence[g_cmd_i];
     g_vulkan_device_dirty = 1;
     return 1;
 }
