@@ -2340,10 +2340,18 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &g_cmd[g_cmd_i];
+        const double tsub = vulkan_now_ms();
         const VkResult rc = vulkan_queue_submit(1, &si, g_readback_fence);
         double wq = 0.0;
         if (rc == VK_SUCCESS) {
-            wq = 0.0;
+            /* Measurement only (DEBUG_SUBMIT): wait the attention+router scope
+             * so the print attributes its GPU time. The worker and the next
+             * signal still own the fence; waiting does not reset it, so the
+             * async path is unaffected outside the debug run. */
+            if (vkWaitForFences(g_device, 1, &g_readback_fence, VK_TRUE,
+                                UINT64_MAX) == VK_SUCCESS) {
+                wq = vulkan_now_ms() - tsub;
+            }
         }
         const double e3 = vulkan_now_ms();
         g_commands_active = false;
@@ -2772,9 +2780,12 @@ int ds4_gpu_end_commands(void) {
         if (fence != VK_NULL_HANDLE) {
             vkWaitForFences(g_device, 1, &fence, VK_TRUE, UINT64_MAX);
             wq = vulkan_now_ms() - e1;
-            /* The scope is complete: drop the fence so the next acquire does
-             * not wait a (reset) never-signaled fence. */
-            vkDestroyFence(g_device, fence, NULL);
+            /* Clear the in-flight marker only, exactly like vulkan_cb_acquire.
+             * The CB's persistent fence stays in g_cb_fence[] and is
+             * reset+reused by the next vulkan_cb_submit; the readback fence
+             * (which may occupy this slot for a signal-submitted scope) is a
+             * global owned/reset by the signal path. Destroying either here
+             * left a dangling handle and crashed the next reset. */
             g_cmd_fence[g_cmd_i] = VK_NULL_HANDLE;
         }
         const double e3 = vulkan_now_ms();
