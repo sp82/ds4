@@ -71811,6 +71811,55 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
+            /* Multi-tier model mapping (SPECS_MGPU.md M5): every tier maps the
+             * spans it executes.  Static tiers map all weights of their layers
+             * (dense + experts, resident); the dynamic tier maps only the
+             * non-expert decode spans (its experts stream through the pool). */
+            if (e->ssd_streaming) ds4_gpu_set_ssd_streaming(1);
+            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+            for (int t = 0; t < e->gpu_cfg.n_gpus; t++) {
+                int ls = -1, le = -1;
+                for (int il = 0; il < (int)DS4_N_LAYER; il++) {
+                    if (e->placement[il + 1] == t) {
+                        if (ls < 0) ls = il;
+                        le = il;
+                    }
+                }
+                if (ls < 0) continue;
+                const bool inc_tok = (e->placement[0] == t);
+                const bool inc_out = (e->placement[DS4_N_LAYER + 1] == t);
+                if (ds4_gpu_set_current_device(t) != 0) continue;
+                ds4_gpu_set_streaming_expert_cache_layer_count(DS4_N_LAYER);
+                if (e->ssd_streaming && e->ssd_streaming_cache_experts > 0) {
+                    ds4_gpu_set_streaming_expert_cache_budget(
+                            e->ssd_streaming_cache_experts);
+                }
+                ds4_model_map_span_vec spans;
+                bool spans_ok;
+                if (e->gpu_cfg.dev_mode[t] == 1) {
+                    spans_ok = weights_model_map_decode_static_slice_spans(
+                            &e->weights, (uint32_t)ls, (uint32_t)le,
+                            inc_tok, inc_out, &spans);
+                } else {
+                    spans_ok = weights_model_map_spans(
+                            &e->weights, (uint32_t)ls, (uint32_t)le,
+                            inc_out, &spans);
+                }
+                if (spans_ok) {
+                    if (!metal_graph_install_model_spans(&e->model, &spans,
+                                                         "multi-tier")) {
+                        fprintf(stderr,
+                                "ds4: multi-tier model map install failed for tier %d\n",
+                                t);
+                    }
+                    free(spans.v);
+                } else {
+                    fprintf(stderr,
+                            "ds4: multi-tier span build failed for tier %d\n",
+                            t);
+                }
+            }
+            ds4_gpu_set_current_device(0);
             /* GPU-only multi-tier execution is now wired up
              * (B2-B6: per-tier graph allocation, dispatch loops, boundary
              * copies). CPU-spill placements were rejected by
