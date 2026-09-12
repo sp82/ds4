@@ -356,6 +356,32 @@ static int init_device(Dev *d) {
     return 1;
 }
 
+/* PCI bus/device/function (needs VK_EXT_pci_bus_info) so the Vulkan index
+ * can be mapped to the real slot (lspci/sysfs link width). */
+static void query_pci(VkPhysicalDevice phys, uint32_t *dom, uint32_t *bus,
+                      uint32_t *dev, uint32_t *fn) {
+    *dom = *bus = *dev = *fn = 0;
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &n, NULL);
+    VkExtensionProperties *e = (VkExtensionProperties *)malloc(sizeof(*e) * (n ? n : 1));
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &n, e);
+    const int ok = has_ext(e, n, "VK_EXT_pci_bus_info");
+    free(e);
+    if (!ok) return;
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci;
+    memset(&pci, 0, sizeof(pci));
+    pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 p2;
+    memset(&p2, 0, sizeof(p2));
+    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    p2.pNext = &pci;
+    vkGetPhysicalDeviceProperties2(phys, &p2);
+    *dom = pci.pciDomain;
+    *bus = pci.pciBus;
+    *dev = pci.pciDevice;
+    *fn = pci.pciFunction;
+}
+
 int main(int argc, char **argv) {
     uint64_t mb = 256;
     int iters = 5;
@@ -416,7 +442,12 @@ int main(int argc, char **argv) {
     Dev devs[16];
     memset(devs, 0, sizeof(devs));
     int nd = 0;
+    const int include_cpu = getenv("DS4_MGPU_PROBE_CPU") != NULL;
     for (uint32_t i = 0; i < np && nd < 16; i++) {
+        VkPhysicalDeviceProperties pprops;
+        vkGetPhysicalDeviceProperties(phys[i], &pprops);
+        if (!include_cpu && pprops.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
+            continue;
         if (devfilter && *devfilter) {
             char buf[64];
             snprintf(buf, sizeof(buf), ",%u,", i);
@@ -441,7 +472,10 @@ int main(int argc, char **argv) {
         for (uint32_t k = 0; k < qn; k++)
             if (q[k].queueFlags & VK_QUEUE_COMPUTE_BIT) { d->qfam = k; break; }
         free(q);
-        printf("\n" LOG "device[%d] (plat=%u): %s\n", nd, i, d->props.deviceName);
+        uint32_t pd = 0, pb = 0, pdev = 0, pfn = 0;
+        query_pci(d->phys, &pd, &pb, &pdev, &pfn);
+        printf("\n" LOG "device[%d] (plat=%u) bdf=%04x:%02x:%02x.%x: %s\n", nd, i,
+               pd, pb, pdev, pfn, d->props.deviceName);
         printf(LOG "  type=%d api=%u.%u.%u vram=%.2f GiB\n", d->props.deviceType,
                VK_VERSION_MAJOR(d->props.apiVersion), VK_VERSION_MINOR(d->props.apiVersion),
                VK_VERSION_PATCH(d->props.apiVersion),
