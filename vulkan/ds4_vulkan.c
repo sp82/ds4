@@ -34,6 +34,7 @@
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
+#include "ds4_vulkan_mgpu.h"
 
 #include "shaders/ds4_vulkan_shaders.inc"
 
@@ -751,7 +752,14 @@ static int vulkan_device_compute_queue(VkPhysicalDevice phys,
  * current_link_width reports the max link width, not the negotiated one, and
  * is misleading on the 4x RX 6900 XT server (3 cards report "16x" but run at
  * ~0.8 GB/s = x1, measured).  A device with no compute queue probes 0. */
-static double vulkan_probe_transfer_bw(VkPhysicalDevice phys) {
+/* Measured host<->device bandwidth cache, keyed by physical device handle.
+ * Filled by ds4_vulkan_probe_devices() and reused by vulkan_pick_device() so
+ * the throwaway-device probe runs at most once per GPU. */
+struct vulkan_bw_cache_entry { VkPhysicalDevice phys; double bw; };
+static struct vulkan_bw_cache_entry g_bw_cache[DS4_VK_MAX_DEVICES];
+static int g_bw_cache_n = 0;
+
+static double vulkan_probe_transfer_bw_uncached(VkPhysicalDevice phys) {
     uint32_t qfamily = UINT32_MAX;
     if (!vulkan_device_compute_queue(phys, &qfamily)) return 0.0;
 
@@ -873,22 +881,36 @@ static double vulkan_probe_transfer_bw(VkPhysicalDevice phys) {
     return bw;
 }
 
+static double vulkan_probe_transfer_bw(VkPhysicalDevice phys) {
+    for (int i = 0; i < g_bw_cache_n; i++) {
+        if (g_bw_cache[i].phys == phys) return g_bw_cache[i].bw;
+    }
+    const double bw = vulkan_probe_transfer_bw_uncached(phys);
+    if (g_bw_cache_n < DS4_VK_MAX_DEVICES) {
+        g_bw_cache[g_bw_cache_n].phys = phys;
+        g_bw_cache[g_bw_cache_n].bw = bw;
+        g_bw_cache_n++;
+    }
+    return bw;
+}
+
 /* PCI bus/device/function of a physical device (VK_EXT_pci_bus_info), so the
  * Vulkan index printed at startup can be mapped to the real slot.  Best-effort:
  * returns 0 (and zeros) when the extension is unavailable. */
-static int vulkan_query_bdf(VkPhysicalDevice phys, uint32_t *dom, uint32_t *bus,
-                            uint32_t *dev, uint32_t *fn) {
+static int vulkan_query_bdf_inst(VkInstance inst, VkPhysicalDevice phys,
+                                 uint32_t *dom, uint32_t *bus,
+                                 uint32_t *dev, uint32_t *fn) {
     if (dom) *dom = 0;
     if (bus) *bus = 0;
     if (dev) *dev = 0;
     if (fn) *fn = 0;
-    if (!phys || g_instance == VK_NULL_HANDLE) return 0;
+    if (!phys || inst == VK_NULL_HANDLE) return 0;
     PFN_vkGetPhysicalDeviceProperties2 p2 =
         (PFN_vkGetPhysicalDeviceProperties2)vkGetInstanceProcAddr(
-            g_instance, "vkGetPhysicalDeviceProperties2");
+            inst, "vkGetPhysicalDeviceProperties2");
     if (!p2) {
         p2 = (PFN_vkGetPhysicalDeviceProperties2)vkGetInstanceProcAddr(
-            g_instance, "vkGetPhysicalDeviceProperties2KHR");
+            inst, "vkGetPhysicalDeviceProperties2KHR");
     }
     if (!p2) return 0;
     uint32_t n = 0;
@@ -919,6 +941,11 @@ static int vulkan_query_bdf(VkPhysicalDevice phys, uint32_t *dom, uint32_t *bus,
     if (dev) *dev = pci.pciDevice;
     if (fn) *fn = pci.pciFunction;
     return 1;
+}
+
+static int vulkan_query_bdf(VkPhysicalDevice phys, uint32_t *dom, uint32_t *bus,
+                            uint32_t *dev, uint32_t *fn) {
+    return vulkan_query_bdf_inst(g_instance, phys, dom, bus, dev, fn);
 }
 
 static int vulkan_pick_device(void) {
@@ -1633,6 +1660,24 @@ int ds4_gpu_init(void) {
     if (rc != VK_SUCCESS) {
         vulkan_log_vk(rc, "vkCreateInstance");
         return 0;
+    }
+    /* Multi-GPU discovery/classification (SPECS_MGPU.md M1): measure the real
+     * host<->device PCIe bandwidth of every usable device and mark fast/slow.
+     * Cached for the pick below (and for the future multi-device planner). */
+    {
+        ds4_vk_dev_info dinfo[DS4_VK_MAX_DEVICES];
+        const int nd = ds4_vulkan_probe_devices(dinfo, DS4_VK_MAX_DEVICES);
+        if (nd > 1) {
+            for (int i = 0; i < nd; i++) {
+                fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                        "device[%u] %s bdf=%s bw=%.1f GB/s vram=%.1f GiB %s\n",
+                        dinfo[i].vk_index, dinfo[i].name, dinfo[i].bdf,
+                        dinfo[i].bw_gbps,
+                        (double)dinfo[i].vram_bytes / (1024.0 * 1024.0 * 1024.0),
+                        !dinfo[i].usable ? "unusable"
+                                         : (dinfo[i].is_fast ? "FAST" : "SLOW"));
+            }
+        }
     }
     if (!vulkan_pick_device()) {
         vkDestroyInstance(g_instance, NULL);
@@ -3140,6 +3185,83 @@ extern "C" void ds4_vulkan_set_ssd_streaming(int enabled) {
  * full backend init (used by --gpu-vram auto, which runs during CLI parsing).
  * Creates a throwaway instance, prefers a discrete GPU, and returns the
  * largest DEVICE_LOCAL heap; 0 on failure. */
+/* Largest DEVICE_LOCAL heap of a physical device (0 when none). */
+static uint64_t vulkan_phys_vram_bytes(VkPhysicalDevice phys) {
+    VkPhysicalDeviceMemoryProperties mem;
+    vkGetPhysicalDeviceMemoryProperties(phys, &mem);
+    uint64_t vram = 0;
+    for (uint32_t i = 0; i < mem.memoryHeapCount; i++) {
+        if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) &&
+            mem.memoryHeaps[i].size > vram) {
+            vram = mem.memoryHeaps[i].size;
+        }
+    }
+    return vram;
+}
+
+/* Enumerate and classify every physical device (see ds4_vulkan_mgpu.h).
+ * Creates a throwaway instance when g_instance is not yet up. */
+extern "C" int ds4_vulkan_probe_devices(ds4_vk_dev_info *out, int max_devices) {
+    if (!out || max_devices <= 0) return 0;
+    VkInstance inst = g_instance;
+    int own_instance = 0;
+    if (inst == VK_NULL_HANDLE) {
+        VkApplicationInfo ai = {};
+        ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        ai.apiVersion = VK_API_VERSION_1_0;
+        VkInstanceCreateInfo ici = {};
+        ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        ici.pApplicationInfo = &ai;
+        if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS) return 0;
+        own_instance = 1;
+    }
+
+    double fast_threshold = 10.0;
+    const char *thr_env = getenv("DS4_VULKAN_FAST_LINK_GBPS");
+    if (thr_env && *thr_env) {
+        const double v = atof(thr_env);
+        if (v > 0.0) fast_threshold = v;
+    }
+
+    uint32_t count = 0;
+    int n = 0;
+    if (vkEnumeratePhysicalDevices(inst, &count, NULL) == VK_SUCCESS && count) {
+        VkPhysicalDevice *devs = (VkPhysicalDevice *)calloc(count, sizeof(*devs));
+        if (devs &&
+            vkEnumeratePhysicalDevices(inst, &count, devs) == VK_SUCCESS) {
+            for (uint32_t i = 0; i < count && n < max_devices; i++) {
+                VkPhysicalDeviceProperties props;
+                vkGetPhysicalDeviceProperties(devs[i], &props);
+                ds4_vk_dev_info *d = &out[n];
+                memset(d, 0, sizeof(*d));
+                d->vk_index = i;
+                snprintf(d->name, sizeof(d->name), "%s", props.deviceName);
+                uint32_t qfamily = UINT32_MAX;
+                const int has_queue =
+                    vulkan_device_compute_queue(devs[i], &qfamily);
+                const int is_cpu =
+                    props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ||
+                    props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
+                d->usable = has_queue && !is_cpu;
+                uint32_t dom = 0, bus = 0, dev = 0, fn = 0;
+                if (vulkan_query_bdf_inst(inst, devs[i], &dom, &bus, &dev, &fn)) {
+                    snprintf(d->bdf, sizeof(d->bdf), "%04x:%02x:%02x.%x",
+                             dom, bus, dev, fn);
+                } else {
+                    snprintf(d->bdf, sizeof(d->bdf), "n/a");
+                }
+                d->vram_bytes = vulkan_phys_vram_bytes(devs[i]);
+                d->bw_gbps = d->usable ? vulkan_probe_transfer_bw(devs[i]) : 0.0;
+                d->is_fast = d->usable && d->bw_gbps >= fast_threshold;
+                n++;
+            }
+        }
+        free(devs);
+    }
+    if (own_instance) vkDestroyInstance(inst, NULL);
+    return n;
+}
+
 extern "C" uint64_t ds4_vulkan_probe_vram_bytes(void) {
     VkApplicationInfo ai = {};
     ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;

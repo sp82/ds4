@@ -940,6 +940,12 @@ tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
 tests/test_layer_pack: tests/test_layer_pack.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_mgpu_config.o: tests/test_mgpu_config.c ds4_layer_pack.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_mgpu_config: tests/test_mgpu_config.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 tests/test_gpu_args.o: tests/test_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -c -o $@ $<
 
