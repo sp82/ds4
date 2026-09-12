@@ -33912,6 +33912,16 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const bool layer_profile = getenv("DS4_METAL_GRAPH_LAYER_PROFILE") != NULL;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const double tl0 = (profile || layer_profile) ? now_sec() : 0.0;
+        /* Multi-tier: switch to this layer's home tier BEFORE staging its
+         * model spans, so the windows land on the device that will run it
+         * (metal_graph_encode_decode_layer below would switch too late). */
+        if (g->placement) {
+            const int this_tier = g->placement[il + 1];
+            if (!metal_graph_set_active_tier_decode(g, this_tier)) {
+                ok = false;
+                break;
+            }
+        }
         if (!static_decode_map && !metal_graph_stream_map_layer_decode(model, weights, il)) {
             ok = false;
             break;
@@ -33960,7 +33970,14 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
     }
 
-    if (ok && logits && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
+    if (ok && logits && !static_decode_map) {
+        /* Multi-tier: stage the output spans on the head tier. */
+        if (g->placement) {
+            (void)metal_graph_set_active_tier_decode(
+                    g, g->placement[DS4_N_LAYER + 1]);
+        }
+        ok = metal_graph_stream_map_output(model, weights);
+    }
     const double t_head0 = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
     if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
