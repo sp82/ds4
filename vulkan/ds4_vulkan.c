@@ -685,6 +685,217 @@ static ds4_gpu_tensor *g_pool_staging = NULL;
  * (see moe_group.hlsl); grows to the largest pair count seen. */
 static ds4_gpu_tensor *g_moe_order = NULL;
 
+/* --- per-device context (M4, SPECS_MGPU.md) ---------------------------- */
+
+/* Every device-dependent handle the single-device backend kept in a global.
+ * The compute/staging/dispatch code keeps using the globals; switching tiers
+ * saves them into the leaving slot and loads them from the entering slot, so
+ * that (large) code is unchanged.  Vulkan objects (pipelines, command pools,
+ * memories, fences) are per-VkDevice, hence per tier. */
+struct ds4_vk_dev_ctx {
+    VkPhysicalDevice phys;
+    VkDevice         device;
+    VkQueue          queue;
+    uint32_t         queue_family;
+    uint32_t         device_index;
+    VkPhysicalDeviceProperties       props;
+    VkPhysicalDeviceMemoryProperties mem_props;
+    uint32_t host_visible_mem_type;
+    uint32_t device_local_mem_type;
+    uint32_t uma_mem_type;
+    int      is_uma;
+    uint64_t host_pointer_align;
+    uint32_t ts_valid_bits;
+    PFN_vkCmdSetCheckpointNV       pfn_cmd_checkpoint;
+    PFN_vkGetQueueCheckpointDataNV pfn_get_checkpoint;
+    int      dbg_checkpoints;
+    PFN_vkGetBufferDeviceAddressKHR vk_bda;
+    int      has_int_dot;
+    int      attn_out_autotuned;
+    VkCommandPool   cmd_pool;
+    VkCommandBuffer cmd[2];
+    VkFence         cmd_fence[2];
+    VkFence         cb_fence[2];
+    int             cmd_i;
+    bool            commands_active;
+    VkCommandPool   worker_pool;
+    VkCommandBuffer worker_cb;
+    VkFence         worker_fence;
+    int             worker_fence_pending;
+    VkFence         readback_fence;
+    int             readback_fence_pending;
+    VkQueryPool     ts_pool;
+    float           ts_period;
+    int             ts_on;
+    int             ts_started;
+    int             ts_router_written;
+    int             ts_verbose;
+    VkDescriptorPool      desc_pool;
+    VkDescriptorSetLayout desc_layout;
+    VkPipelineLayout      pipe_layout;
+    uint32_t              desc_sets_allocated;
+    int                   vulkan_device_dirty;
+    VkPipeline     pipes[DS4_VK_PIPE_COUNT];
+    VkShaderModule mods[DS4_VK_PIPE_COUNT];
+    struct ds4_vk_model_window model_windows[DS4_VK_MAX_MODEL_WINDOWS];
+    uint32_t model_window_count;
+    uint64_t device_local_bytes;
+    ds4_gpu_tensor *scratch_a;
+    ds4_gpu_tensor *scratch_b;
+    ds4_gpu_tensor *scratch_c;
+    ds4_gpu_tensor *scratch_d;
+    ds4_gpu_tensor *pool_staging;
+    ds4_gpu_tensor *moe_order;
+    struct ds4_vk_pool_layer pool_layers[DS4_VK_POOL_MAX_LAYERS];
+    uint32_t pool_slots_per_layer;
+    uint32_t pool_budget;
+    uint32_t pool_layer_count;
+    uint64_t pool_per_expert_bytes;
+    uint64_t pool_total_bytes;
+    int      pool_ready;
+};
+
+static struct ds4_vk_dev_ctx g_vk_ctx[DS4_MAX_GPUS];
+static int g_vk_ctx_count = 0;
+static int g_vk_ctx_active = -1;
+
+static void vulkan_ctx_save(struct ds4_vk_dev_ctx *c) {
+    memset(c, 0, sizeof(*c));
+    c->phys = g_phys;
+    c->device = g_device;
+    c->queue = g_queue;
+    c->queue_family = g_queue_family;
+    c->device_index = g_device_index;
+    c->props = g_props;
+    c->mem_props = g_mem_props;
+    c->host_visible_mem_type = g_host_visible_mem_type;
+    c->device_local_mem_type = g_device_local_mem_type;
+    c->uma_mem_type = g_uma_mem_type;
+    c->is_uma = g_is_uma;
+    c->host_pointer_align = g_host_pointer_align;
+    c->ts_valid_bits = g_ts_valid_bits;
+    c->pfn_cmd_checkpoint = g_pfnCmdSetCheckpointNV;
+    c->pfn_get_checkpoint = g_pfnGetQueueCheckpointDataNV;
+    c->dbg_checkpoints = g_dbg_checkpoints;
+    c->vk_bda = g_vk_bda;
+    c->has_int_dot = g_has_int_dot;
+    c->attn_out_autotuned = g_attn_out_autotuned;
+    c->cmd_pool = g_cmd_pool;
+    memcpy(c->cmd, g_cmd, sizeof(g_cmd));
+    memcpy(c->cmd_fence, g_cmd_fence, sizeof(g_cmd_fence));
+    memcpy(c->cb_fence, g_cb_fence, sizeof(g_cb_fence));
+    c->cmd_i = g_cmd_i;
+    c->commands_active = g_commands_active;
+    c->worker_pool = g_worker_pool;
+    c->worker_cb = g_worker_cb;
+    c->worker_fence = g_worker_fence;
+    c->worker_fence_pending = g_worker_fence_pending;
+    c->readback_fence = g_readback_fence;
+    c->readback_fence_pending = g_readback_fence_pending;
+    c->ts_pool = g_ts_pool;
+    c->ts_period = g_ts_period;
+    c->ts_on = g_ts_on;
+    c->ts_started = g_ts_started;
+    c->ts_router_written = g_ts_router_written;
+    c->ts_verbose = g_ts_verbose;
+    c->desc_pool = g_desc_pool;
+    c->desc_layout = g_desc_layout;
+    c->pipe_layout = g_pipe_layout;
+    c->desc_sets_allocated = g_desc_sets_allocated;
+    c->vulkan_device_dirty = g_vulkan_device_dirty;
+    memcpy(c->pipes, g_pipes, sizeof(g_pipes));
+    memcpy(c->mods, g_mods, sizeof(g_mods));
+    memcpy(c->model_windows, g_model_windows, sizeof(g_model_windows));
+    c->model_window_count = g_model_window_count;
+    c->device_local_bytes = g_device_local_bytes;
+    c->scratch_a = g_scratch_a;
+    c->scratch_b = g_scratch_b;
+    c->scratch_c = g_scratch_c;
+    c->scratch_d = g_scratch_d;
+    c->pool_staging = g_pool_staging;
+    c->moe_order = g_moe_order;
+    memcpy(c->pool_layers, g_pool_layers, sizeof(g_pool_layers));
+    c->pool_slots_per_layer = g_pool_slots_per_layer;
+    c->pool_budget = g_pool_budget;
+    c->pool_layer_count = g_pool_layer_count;
+    c->pool_per_expert_bytes = g_pool_per_expert_bytes;
+    c->pool_total_bytes = g_pool_total_bytes;
+    c->pool_ready = g_pool_ready;
+}
+
+static void vulkan_ctx_load(const struct ds4_vk_dev_ctx *c) {
+    g_phys = c->phys;
+    g_device = c->device;
+    g_queue = c->queue;
+    g_queue_family = c->queue_family;
+    g_device_index = c->device_index;
+    g_props = c->props;
+    g_mem_props = c->mem_props;
+    g_host_visible_mem_type = c->host_visible_mem_type;
+    g_device_local_mem_type = c->device_local_mem_type;
+    g_uma_mem_type = c->uma_mem_type;
+    g_is_uma = c->is_uma;
+    g_host_pointer_align = c->host_pointer_align;
+    g_ts_valid_bits = c->ts_valid_bits;
+    g_pfnCmdSetCheckpointNV = c->pfn_cmd_checkpoint;
+    g_pfnGetQueueCheckpointDataNV = c->pfn_get_checkpoint;
+    g_dbg_checkpoints = c->dbg_checkpoints;
+    g_vk_bda = c->vk_bda;
+    g_has_int_dot = c->has_int_dot;
+    g_attn_out_autotuned = c->attn_out_autotuned;
+    g_cmd_pool = c->cmd_pool;
+    memcpy(g_cmd, c->cmd, sizeof(g_cmd));
+    memcpy(g_cmd_fence, c->cmd_fence, sizeof(g_cmd_fence));
+    memcpy(g_cb_fence, c->cb_fence, sizeof(g_cb_fence));
+    g_cmd_i = c->cmd_i;
+    g_commands_active = c->commands_active;
+    g_worker_pool = c->worker_pool;
+    g_worker_cb = c->worker_cb;
+    g_worker_fence = c->worker_fence;
+    g_worker_fence_pending = c->worker_fence_pending;
+    g_readback_fence = c->readback_fence;
+    g_readback_fence_pending = c->readback_fence_pending;
+    g_ts_pool = c->ts_pool;
+    g_ts_period = c->ts_period;
+    g_ts_on = c->ts_on;
+    g_ts_started = c->ts_started;
+    g_ts_router_written = c->ts_router_written;
+    g_ts_verbose = c->ts_verbose;
+    g_desc_pool = c->desc_pool;
+    g_desc_layout = c->desc_layout;
+    g_pipe_layout = c->pipe_layout;
+    g_desc_sets_allocated = c->desc_sets_allocated;
+    g_vulkan_device_dirty = c->vulkan_device_dirty;
+    memcpy(g_pipes, c->pipes, sizeof(g_pipes));
+    memcpy(g_mods, c->mods, sizeof(g_mods));
+    memcpy(g_model_windows, c->model_windows, sizeof(g_model_windows));
+    g_model_window_count = c->model_window_count;
+    g_device_local_bytes = c->device_local_bytes;
+    g_scratch_a = c->scratch_a;
+    g_scratch_b = c->scratch_b;
+    g_scratch_c = c->scratch_c;
+    g_scratch_d = c->scratch_d;
+    g_pool_staging = c->pool_staging;
+    g_moe_order = c->moe_order;
+    memcpy(g_pool_layers, c->pool_layers, sizeof(g_pool_layers));
+    g_pool_slots_per_layer = c->pool_slots_per_layer;
+    g_pool_budget = c->pool_budget;
+    g_pool_layer_count = c->pool_layer_count;
+    g_pool_per_expert_bytes = c->pool_per_expert_bytes;
+    g_pool_total_bytes = c->pool_total_bytes;
+    g_pool_ready = c->pool_ready;
+}
+
+/* Select the logical tier that subsequent ds4_gpu_* calls operate on. */
+extern "C" int ds4_vulkan_set_current_device(int tier) {
+    if (tier < 0 || tier >= g_vk_ctx_count) return 1;
+    if (tier == g_vk_ctx_active) return 0;
+    if (g_vk_ctx_active >= 0) vulkan_ctx_save(&g_vk_ctx[g_vk_ctx_active]);
+    vulkan_ctx_load(&g_vk_ctx[tier]);
+    g_vk_ctx_active = tier;
+    return 0;
+}
+
 /* Per-tensor device handle.  tensor->ptr points at one of these (heap). */
 struct ds4_vulkan_tensor {
     VkBuffer         buffer;
@@ -693,6 +904,7 @@ struct ds4_vulkan_tensor {
     uint64_t         bytes;
     int              owner;       /* owns buffer+memory */
     int              device_local; /* memory lives in the device-local heap */
+    int              tier;         /* logical device tier that owns the buffer */
     unsigned char   *host_map;    /* persistent mapping of memory */
 };
 
@@ -948,7 +1160,7 @@ static int vulkan_query_bdf(VkPhysicalDevice phys, uint32_t *dom, uint32_t *bus,
     return vulkan_query_bdf_inst(g_instance, phys, dom, bus, dev, fn);
 }
 
-static int vulkan_pick_device(void) {
+static int vulkan_pick_device_ex(int forced_override) {
     uint32_t count = 0;
     VkResult rc = vkEnumeratePhysicalDevices(g_instance, &count, NULL);
     if (rc != VK_SUCCESS || count == 0) {
@@ -975,8 +1187,8 @@ static int vulkan_pick_device(void) {
      * software rendering.  Fall back to the first usable device if no probe
      * succeeds. */
     const char *dev_env = getenv("DS4_VULKAN_DEVICE_INDEX");
-    int forced = -1;
-    if (dev_env) {
+    int forced = forced_override;
+    if (forced < 0 && dev_env) {
         char *end = NULL;
         long v = strtol(dev_env, &end, 10);
         if (end != dev_env && v >= 0 && v < (long)count) forced = (int)v;
@@ -1101,6 +1313,10 @@ static int vulkan_pick_device(void) {
                     : 0.0);
     }
     return 1;
+}
+
+static int vulkan_pick_device(void) {
+    return vulkan_pick_device_ex(-1);
 }
 
 static VkResult vulkan_create_device(void) {
@@ -1724,6 +1940,125 @@ int ds4_gpu_init(void) {
     }
     vulkan_autotune_moe_rows();
     vulkan_autotune_attn_out();
+    vulkan_ctx_save(&g_vk_ctx[0]);
+    g_vk_ctx_count = 1;
+    g_vk_ctx_active = 0;
+    return 1;
+}
+
+/* Create the shared VkInstance (idempotent) and log the M1 classification of
+ * every physical device.  Shared by ds4_gpu_init (single) and the multi-device
+ * init below. */
+static int vulkan_instance_init(void) {
+    if (g_instance != VK_NULL_HANDLE) return 1;
+    VkApplicationInfo app = {};
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.pApplicationName = "ds4";
+    app.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
+    app.apiVersion = VK_API_VERSION_1_0;
+
+    const char *inst_exts[1];
+    uint32_t n_inst_exts = 0;
+    {
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+        if (n > 0) {
+            VkExtensionProperties *e = (VkExtensionProperties *)malloc(sizeof(*e) * n);
+            if (e) {
+                vkEnumerateInstanceExtensionProperties(NULL, &n, e);
+                for (uint32_t i = 0; i < n; i++) {
+                    if (strcmp(e[i].extensionName,
+                               "VK_KHR_get_physical_device_properties2") == 0) {
+                        inst_exts[n_inst_exts++] =
+                            "VK_KHR_get_physical_device_properties2";
+                        break;
+                    }
+                }
+                free(e);
+            }
+        }
+    }
+    VkInstanceCreateInfo ici = {};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &app;
+    ici.enabledExtensionCount = n_inst_exts;
+    ici.ppEnabledExtensionNames = n_inst_exts ? inst_exts : NULL;
+    VkResult rc = vkCreateInstance(&ici, NULL, &g_instance);
+    if (rc != VK_SUCCESS) {
+        vulkan_log_vk(rc, "vkCreateInstance");
+        return 0;
+    }
+    ds4_vk_dev_info dinfo[DS4_VK_MAX_DEVICES];
+    const int nd = ds4_vulkan_probe_devices(dinfo, DS4_VK_MAX_DEVICES);
+    if (nd > 1) {
+        for (int i = 0; i < nd; i++) {
+            fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                    "device[%u] %s bdf=%s bw=%.1f GB/s vram=%.1f GiB %s\n",
+                    dinfo[i].vk_index, dinfo[i].name, dinfo[i].bdf,
+                    dinfo[i].bw_gbps,
+                    (double)dinfo[i].vram_bytes / (1024.0 * 1024.0 * 1024.0),
+                    !dinfo[i].usable ? "unusable"
+                                     : (dinfo[i].is_fast ? "FAST" : "SLOW"));
+        }
+    }
+    return 1;
+}
+
+/* Zero the device-dependent globals so the next device starts from a clean
+ * slate (pipeline creation is gated on g_desc_layout == NULL). */
+static void vulkan_ctx_clear(void) {
+    struct ds4_vk_dev_ctx zero;
+    memset(&zero, 0, sizeof(zero));
+    zero.host_pointer_align = 4096;
+    vulkan_ctx_load(&zero);
+}
+
+/* Multi-device init: one VkDevice per logical tier (the engine's placement
+ * order), each with its own pipelines, command pool, scratch and pool state.
+ * SPECS_MGPU.md M4. */
+extern "C" int ds4_vulkan_init_multi(const ds4_gpu_config *cfg) {
+    if (!cfg || cfg->n_gpus <= 1) return ds4_gpu_init();
+    if (cfg->n_gpus > DS4_MAX_GPUS) return 0;
+    if (!vulkan_instance_init()) return 0;
+
+    g_vk_ctx_count = 0;
+    g_vk_ctx_active = -1;
+    g_n_gpus = 0;
+    for (int tier = 0; tier < cfg->n_gpus; tier++) {
+        const int phys_idx = cfg->device_indices[tier];
+        vulkan_ctx_clear();
+        if (!vulkan_pick_device_ex(phys_idx)) {
+            fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                    "tier %d: device index %d unavailable\n", tier, phys_idx);
+            return 0;
+        }
+        if (vulkan_create_device() != VK_SUCCESS) return 0;
+        uint32_t dom = 0, bus = 0, dev = 0, fn = 0;
+        char bdf[32];
+        if (vulkan_query_bdf(g_phys, &dom, &bus, &dev, &fn)) {
+            snprintf(bdf, sizeof(bdf), "%04x:%02x:%02x.%x", dom, bus, dev, fn);
+        } else {
+            snprintf(bdf, sizeof(bdf), "n/a");
+        }
+        fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                "tier %d: device[%u] %s bdf=%s (%.1f GiB)\n",
+                tier, g_device_index, g_props.deviceName, bdf,
+                (double)cfg->vram_bytes[tier] / (1024.0 * 1024.0 * 1024.0));
+        if (!vulkan_compute_init()) {
+            fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                    "tier %d: compute init failed\n", tier);
+            return 0;
+        }
+        vulkan_autotune_moe_rows();
+        vulkan_autotune_attn_out();
+        vulkan_ctx_save(&g_vk_ctx[tier]);
+        g_vk_ctx_count = tier + 1;
+        g_gpu[tier].device_id = phys_idx;
+        g_gpu[tier].budget_bytes = cfg->vram_bytes[tier];
+        g_n_gpus = tier + 1;
+    }
+    g_vk_ctx_active = -1;
+    if (ds4_vulkan_set_current_device(0) != 0) return 0;
     return 1;
 }
 
@@ -1799,6 +2134,8 @@ extern "C" void *ds4_vulkan_device_handle(void) {
 extern "C" void ds4_vulkan_tensor_release_device(ds4_gpu_tensor *t) {
     struct ds4_vulkan_tensor *h = vulkan_tensor_handle(t);
     if (!h || !h->owner) return;
+    if (g_vk_ctx_count > 1 && h->tier != g_vk_ctx_active)
+        ds4_vulkan_set_current_device(h->tier);
     if (h->buffer && g_device != VK_NULL_HANDLE) {
         if (h->host_map) vkUnmapMemory(g_device, h->memory);
         vkDestroyBuffer(g_device, h->buffer, NULL);
@@ -1828,8 +2165,10 @@ static ds4_gpu_tensor *vulkan_tensor_new(void) {
 }
 
 static struct ds4_vulkan_tensor *vulkan_handle_new(void) {
-    return (struct ds4_vulkan_tensor *)calloc(1,
+    struct ds4_vulkan_tensor *h = (struct ds4_vulkan_tensor *)calloc(1,
             sizeof(struct ds4_vulkan_tensor));
+    if (h) h->tier = g_vk_ctx_active >= 0 ? g_vk_ctx_active : 0;
+    return h;
 }
 
 static void vulkan_handle_free(struct ds4_vulkan_tensor *h) {
@@ -1960,6 +2299,21 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     VkBuffer buffer = vulkan_create_host_buffer(bytes, &mem, &map);
     if (buffer == VK_NULL_HANDLE) return NULL;
     return vulkan_tensor_wrap_buffer(buffer, mem, map, bytes);
+}
+
+/* Allocate a host-visible tensor on a specific logical tier and restore the
+ * previously active tier.  Used by the engine's multi-tier allocations
+ * (SPECS_MGPU.md M4). */
+extern "C" ds4_gpu_tensor *ds4_vulkan_tensor_alloc_ptr_on(int tier,
+                                                          uint64_t bytes) {
+    if (tier < 0 || tier >= g_vk_ctx_count) return NULL;
+    const int prev = g_vk_ctx_active;
+    if (ds4_vulkan_set_current_device(tier) != 0) return NULL;
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(bytes);
+    struct ds4_vulkan_tensor *h = t ? vulkan_tensor_handle(t) : NULL;
+    if (h) h->tier = tier;
+    if (prev >= 0 && prev != tier) ds4_vulkan_set_current_device(prev);
+    return t;
 }
 
 /* Fase 6 step 4a: device-local tensor (VRAM).  On UMA/APU the only
@@ -2105,6 +2459,8 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     struct ds4_vulkan_tensor *h = vulkan_tensor_handle(tensor);
     if (h) {
+        if (g_vk_ctx_count > 1 && h->tier != g_vk_ctx_active)
+            ds4_vulkan_set_current_device(h->tier);
         if (h->owner && h->buffer && g_device != VK_NULL_HANDLE) {
             if (getenv("DS4_VULKAN_DEBUG_FREE") != NULL && g_vulkan_device_dirty) {
                 void *ra = __builtin_return_address(0);
@@ -2178,7 +2534,7 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
      * The one-shot path stays a synchronous host memmove so standalone
      * copies keep their blocking semantics. */
     if (g_commands_active && g_device != VK_NULL_HANDLE &&
-        dh->buffer && sh->buffer) {
+        dh->buffer && sh->buffer && dh->tier == sh->tier) {
         const uint64_t d_start = dh->offset + dst_offset;
         const uint64_t s_start = sh->offset + src_offset;
         const uint64_t d_end = d_start + bytes;
@@ -3547,6 +3903,16 @@ int ds4_gpu_set_model_fd(int fd) {
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     g_vulkan_model_fd = fd;
     g_vulkan_model_map = model_map;
+    return 1;
+}
+
+/* Multi-tier startup registers the host mmap WITHOUT staging any window (the
+ * per-tier selective caches are not implemented on Vulkan; weights are staged
+ * on demand by the model-window path per active tier). */
+int ds4_gpu_register_model_map_no_copy(const void *model_map,
+                                       uint64_t model_size) {
+    g_vulkan_model_map = model_map;
+    g_vulkan_model_size = model_size;
     return 1;
 }
 

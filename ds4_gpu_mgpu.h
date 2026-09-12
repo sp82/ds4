@@ -81,6 +81,14 @@ typedef struct ds4_gpu_config {
     size_t vram_bytes[DS4_MAX_GPUS];
     int    n_gpus;
     size_t safety_margin_bytes;            /* per-device reserve */
+    /* Multi-GPU native Vulkan (SPECS_MGPU.md): per-logical-tier role, filled
+     * by the Vulkan auto-probe.  Zero-init means "static" (back-compat with
+     * the CUDA callers, which ignore these fields). */
+    int    dev_mode[DS4_MAX_GPUS];          /* 0 static, 1 dynamic */
+    int    dev_is_fast[DS4_MAX_GPUS];
+    size_t dev_expert_cache_bytes[DS4_MAX_GPUS];
+    int    dev_pin_experts[DS4_MAX_GPUS];
+    int    dev_pin_tokens[DS4_MAX_GPUS];
 } ds4_gpu_config;
 
 typedef struct {

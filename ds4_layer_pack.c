@@ -492,6 +492,15 @@ int ds4_mgpu_plan(const ds4_mgpu_config *cfg,
                    ? rem[t] - tiers[t].expert_cache_bytes : 0;
         }
     }
+    /* The output head is resident (never streamed): reserve it on the last
+     * tier up front so the layer fill cannot consume its space. */
+    const int head_tier = n_tiers - 1;
+    if (output_bytes > rem[head_tier]) {
+        mgpu_err(err, errlen, "planner: output head does not fit the last tier");
+        return 1;
+    }
+    rem[head_tier] -= output_bytes;
+
     if (embedding_bytes > rem[0]) {
         mgpu_err(err, errlen, "planner: embedding does not fit tier 0");
         return 1;
@@ -512,15 +521,6 @@ int ds4_mgpu_plan(const ds4_mgpu_config *cfg,
         placement_out[il + 1] = t;
         rem[t] -= cost;
     }
-    int head_tier = 0;
-    for (int il = 0; il < n_layers; il++) {
-        if (placement_out[il + 1] >= 0) head_tier = placement_out[il + 1];
-    }
-    if (output_bytes <= rem[head_tier]) {
-        placement_out[n_layers + 1] = head_tier;
-        rem[head_tier] -= output_bytes;
-    } else {
-        placement_out[n_layers + 1] = DS4_LAYER_PACK_CPU;
-    }
+    placement_out[n_layers + 1] = head_tier;
     return 0;
 }

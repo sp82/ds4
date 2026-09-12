@@ -14,6 +14,7 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 #include "ds4_gpu_args.h"
+#include "ds4_vulkan_mgpu.h"
 
 #define DS4_VULKAN_LOG_PREFIX "ds4: Vulkan "
 
@@ -45,26 +46,29 @@ extern "C" void ds4_vulkan_stream_pool_reset(void);
 extern "C" void ds4_vulkan_stream_pool_reset_hotness(void);
 extern "C" void ds4_vulkan_telemetry_snapshot(ds4_gpu_expert_telemetry *t);
 
+extern "C" int ds4_vulkan_set_current_device(int tier);
+extern "C" ds4_gpu_tensor *ds4_vulkan_tensor_alloc_ptr_on(int tier, uint64_t bytes);
+
 static int vulkan_tier_valid(int tier) {
-    return tier == 0 && g_n_gpus == 1;
+    return g_n_gpus > 0 && tier >= 0 && tier < g_n_gpus;
 }
 
 /* --- multi-GPU init (single-GPU enforcement) ---------------------------- */
 
+extern "C" int ds4_vulkan_init_multi(const ds4_gpu_config *cfg);
+
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
-    if (!cfg || cfg->n_gpus != 1) {
+    if (!cfg || cfg->n_gpus < 1) {
         fprintf(stderr, DS4_VULKAN_LOG_PREFIX
                 "supports one GPU per process for now\n");
         return 0;
     }
-    g_gpu[0].device_id = cfg->device_indices[0];
-    g_n_gpus = 1;
-    return ds4_gpu_init();
+    return ds4_vulkan_init_multi(cfg);
 }
 
 extern "C" int ds4_gpu_set_current_device(int tier) {
     if (!vulkan_tier_valid(tier)) return 1;
-    return 0;
+    return ds4_vulkan_set_current_device(tier);
 }
 
 extern "C" int ds4_gpu_set_current_device_fenced(int tier) {
@@ -77,7 +81,7 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int tier,
                                        uint64_t bytes) {
     if (!t) return 1;
     if (!vulkan_tier_valid(tier)) return 2;
-    ds4_gpu_tensor *alloced = ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_tensor *alloced = ds4_vulkan_tensor_alloc_ptr_on(tier, bytes);
     if (!alloced) return 3;
     *t = *alloced;
     free(alloced);
@@ -87,12 +91,13 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int tier,
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier,
                                                        uint64_t bytes) {
     if (!vulkan_tier_valid(tier)) return NULL;
-    return ds4_gpu_tensor_alloc(bytes);
+    return ds4_vulkan_tensor_alloc_ptr_on(tier, bytes);
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier,
                                                            uint64_t bytes) {
     if (!vulkan_tier_valid(tier)) return NULL;
+    if (ds4_vulkan_set_current_device(tier) != 0) return NULL;
     return ds4_gpu_tensor_alloc_managed(bytes);
 }
 
@@ -155,22 +160,61 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int tier) {
 extern "C" int ds4_gpu_args_probe_auto_cuda(
         const int *device_filter, int filter_len, ds4_gpu_config *out,
         size_t safety_margin_bytes, char *errbuf, size_t errbuflen) {
-    (void)device_filter;
-    (void)filter_len;
     if (!out) {
         if (errbuf && errbuflen) {
             snprintf(errbuf, errbuflen, "internal: NULL out");
         }
         return 1;
     }
-    /* Report a single device with the real device-local heap size. */
     memset(out, 0, sizeof(*out));
-    out->device_indices[0] = 0;
-    out->vram_bytes[0] = ds4_vulkan_probe_vram_bytes();
-    if (out->vram_bytes[0] == 0) {
-        out->vram_bytes[0] = 16ull * 1024ull * 1024ull * 1024ull;
+
+    /* Multi-device Vulkan probe (SPECS_MGPU.md M3): enumerate every usable
+     * device, order the tiers SLOW-FIRST (the slow x1 cards take the first
+     * layers statically, the fast x16 takes the rest dynamically) and report
+     * the real device-local heap as the budget. */
+    ds4_vk_dev_info info[DS4_VK_MAX_DEVICES];
+    const int n = ds4_vulkan_probe_devices(info, DS4_VK_MAX_DEVICES);
+    int chosen[DS4_VK_MAX_DEVICES];
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (!info[i].usable) continue;
+        if (device_filter && filter_len > 0) {
+            int ok = 0;
+            for (int j = 0; j < filter_len; j++) {
+                if (device_filter[j] == (int)info[i].vk_index) { ok = 1; break; }
+            }
+            if (!ok) continue;
+        }
+        chosen[m++] = i;
     }
-    out->n_gpus = 1;
+    if (m == 0) {
+        if (errbuf && errbuflen) {
+            snprintf(errbuf, errbuflen, "no usable Vulkan devices found");
+        }
+        return 1;
+    }
+    for (int a = 0; a < m; a++) {
+        for (int b = a + 1; b < m; b++) {
+            if (info[chosen[b]].bw_gbps < info[chosen[a]].bw_gbps) {
+                const int t = chosen[a];
+                chosen[a] = chosen[b];
+                chosen[b] = t;
+            }
+        }
+    }
+    for (int k = 0; k < m; k++) {
+        const ds4_vk_dev_info *d = &info[chosen[k]];
+        const size_t budget = d->vram_bytes > safety_margin_bytes
+                            ? d->vram_bytes - safety_margin_bytes : 0;
+        out->device_indices[k] = (int)d->vk_index;
+        out->vram_bytes[k] = budget;
+        out->dev_is_fast[k] = d->is_fast;
+        out->dev_mode[k] = d->is_fast ? 1 : 0;         /* slow=static, fast=dynamic */
+        out->dev_expert_cache_bytes[k] = d->is_fast ? budget * 4u / 10u : 0;
+        out->dev_pin_experts[k] = d->is_fast ? 0 : 1;
+        out->dev_pin_tokens[k] = d->is_fast ? 3 : 0;
+    }
+    out->n_gpus = m;
     out->safety_margin_bytes = safety_margin_bytes;
     return 0;
 }

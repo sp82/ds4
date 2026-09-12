@@ -69766,6 +69766,30 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     return 0;
 }
 
+/* Per-layer dense vs routed-expert byte split for the asymmetric multi-GPU
+ * planner (SPECS_MGPU.md M2/M3): static tiers pay dense+experts, dynamic
+ * tiers pay only dense (experts stream through the per-device pool). */
+static void engine_compute_layer_bytes(const ds4_engine *e,
+                                       ds4_mgpu_layer_bytes *out) {
+    for (int i = 0; i < (int)DS4_N_LAYER; i++) {
+        out[i].dense_bytes = 0;
+        out[i].expert_bytes = 0;
+    }
+    if (!e) return;
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const ds4_tensor *t = &e->model.tensors[i];
+        if (t->bytes == 0) continue;
+        const int entry = tensor_to_entry(t, DS4_N_LAYER);
+        if (entry < 1 || entry > (int)DS4_N_LAYER) continue;
+        uint64_t per_expert = 0;
+        if (engine_deepseek_routed_expert_tensor(e, t, entry, &per_expert)) {
+            out[entry - 1].expert_bytes += t->bytes;
+        } else {
+            out[entry - 1].dense_bytes += t->bytes;
+        }
+    }
+}
+
 static bool engine_cuda_tp_decode_requested(const ds4_engine *e) {
 #if defined(__APPLE__) && !defined(DS4_TEST_HOOKS)
     (void)e;
@@ -70070,11 +70094,54 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     if (cuda_tp_ep && engine_reserve_cuda_ep_output_shards(e, &pcfg) != 0) {
         return -1;
     }
-    const int placement_rc = cuda_tp_ep
-        ? engine_compute_cuda_ep_placement(entry_bytes, DS4_N_LAYER + 2,
-                                           &pcfg, e->placement)
-        : ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg,
-                                      e->placement);
+    int mgpu_dynamic = 0;
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        if (e->gpu_cfg.dev_mode[d] == 1) { mgpu_dynamic = 1; break; }
+    }
+    int placement_rc;
+    if (!cuda_tp_ep && mgpu_dynamic) {
+        /* Asymmetric multi-GPU (SPECS_MGPU.md): slow (static) tiers take the
+         * first contiguous layers; the fast (dynamic) tier streams the rest. */
+        ds4_mgpu_layer_bytes lb[DS4_MAX_LAYER];
+        engine_compute_layer_bytes(e, lb);
+        ds4_mgpu_tier tiers[DS4_LAYER_PACK_MAX_GPUS];
+        memset(tiers, 0, sizeof(tiers));
+        for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+            tiers[d].physical_index = e->gpu_cfg.device_indices[d];
+            tiers[d].is_fast = e->gpu_cfg.dev_is_fast[d];
+            tiers[d].mode = e->gpu_cfg.dev_mode[d];
+            tiers[d].budget_bytes = pcfg.gpu_budget_bytes[d];
+            tiers[d].expert_cache_bytes = e->gpu_cfg.dev_expert_cache_bytes[d];
+            tiers[d].pin_experts = e->gpu_cfg.dev_pin_experts[d];
+            tiers[d].pin_tokens = e->gpu_cfg.dev_pin_tokens[d];
+        }
+        char perr[160] = {0};
+        placement_rc = ds4_mgpu_plan(NULL, tiers, e->gpu_cfg.n_gpus, lb,
+                                     (int)DS4_N_LAYER,
+                                     entry_bytes[0],
+                                     entry_bytes[DS4_N_LAYER + 1],
+                                     e->placement, perr, sizeof(perr));
+        if (placement_rc == 0) {
+            fprintf(stderr, "ds4: multi-GPU asymmetric placement "
+                    "(slow=static / fast=dynamic):\n");
+            for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+                fprintf(stderr,
+                        "  tier %d device %d %s cache=%.1fGiB pin=%d tokens=%d\n",
+                        d, tiers[d].physical_index,
+                        tiers[d].mode ? "dynamic" : "static",
+                        (double)tiers[d].expert_cache_bytes / 1073741824.0,
+                        tiers[d].pin_experts, tiers[d].pin_tokens);
+            }
+        } else {
+            fprintf(stderr, "ds4: multi-GPU planner: %s\n", perr);
+        }
+    } else {
+        placement_rc = cuda_tp_ep
+            ? engine_compute_cuda_ep_placement(entry_bytes, DS4_N_LAYER + 2,
+                                               &pcfg, e->placement)
+            : ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg,
+                                          e->placement);
+    }
     if (placement_rc != 0) {
         return -1;
     }
@@ -71524,7 +71591,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->multi_tier) {
+    if (e->ssd_streaming && e->multi_tier
+#if defined(DS4_VULKAN_BUILD)
+        && e->backend != DS4_BACKEND_VULKAN
+#endif
+    ) {
         fprintf(stderr,
                 "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
         ds4_engine_close(e);
