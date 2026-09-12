@@ -5230,6 +5230,289 @@ static uint32_t ds4_streaming_cache_experts_for_byte_budget(
 }
 
 #ifndef DS4_NO_GPU
+/*
+ * --- model-part: esperti caldi su un secondo disco ------------------------
+ * SPECS_MODEL_PART.md.  Il file "part" e' uno sparse mirror del modello:
+ * ogni esperto ospitato e' copiato agli STESSI offset del file modello, cosi'
+ * il runtime legge part_map + offset invece di model_map + offset.  I byte sono
+ * identici.  La selezione e' per-esperto, guidata dalla hotlist di popolarita'.
+ */
+#define DS4_MODEL_PART_MAGIC      UINT64_C(0x3154524150443453) /* "S4DPART1" */
+#define DS4_MODEL_PART_VERSION    1u
+#define DS4_MODEL_PART_MASK_WORDS 6u  /* 384 bit = DS4_MAX_EXPERT */
+#define DS4_MODEL_PART_NTENS      3u  /* gate, up, down */
+
+typedef struct {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t mask_words;
+    uint64_t model_size;
+    uint64_t model_mtime;
+    uint64_t budget_bytes;
+    uint64_t used_bytes;
+    uint32_t n_layer;
+    uint32_t n_expert;
+    uint32_t hotlist_id;
+    uint32_t reserved;
+} ds4_model_part_header;
+
+typedef struct {
+    bool     active;
+    int      fd;
+    const uint8_t *map;
+    uint64_t size;
+    uint64_t used_bytes;
+    uint32_t n_layer;
+    uint32_t n_expert;
+    uint32_t mask_words;
+    uint64_t mask[DS4_MAX_LAYER][DS4_MODEL_PART_NTENS][DS4_MODEL_PART_MASK_WORDS];
+} ds4_model_part;
+
+static ds4_model_part g_model_part = { .fd = -1 };
+
+static bool model_part_mask_test(const uint64_t *w, uint32_t e) {
+    return (w[e / 64u] >> (e % 64u)) & UINT64_C(1);
+}
+
+static void model_part_mask_set(uint64_t *w, uint32_t e) {
+    w[e / 64u] |= UINT64_C(1) << (e % 64u);
+}
+
+static bool model_part_default_hotlist(uint32_t *id_out,
+                                       const uint16_t (**list_out)[2],
+                                       uint32_t *count_out) {
+    *id_out = 0;
+    *list_out = NULL;
+    *count_out = 0;
+    if (g_ds4_shape.variant == DS4_VARIANT_PRO) {
+        *id_out = 1; *list_out = ds4_default_streaming_hotlist_pro;
+        *count_out = ds4_default_streaming_hotlist_pro_count;
+        return true;
+    }
+    if (g_ds4_shape.variant == DS4_VARIANT_FLASH) {
+        *id_out = 2; *list_out = ds4_default_streaming_hotlist_flash;
+        *count_out = ds4_default_streaming_hotlist_flash_count;
+        return true;
+    }
+    if (g_ds4_shape.variant == DS4_VARIANT_GLM52) {
+        *id_out = 3; *list_out = ds4_default_streaming_hotlist_glm52;
+        *count_out = ds4_default_streaming_hotlist_glm52_count;
+        return true;
+    }
+    return false;
+}
+
+static void model_part_close(ds4_model_part *p) {
+    if (!p) return;
+    if (p->map && p->map != (const uint8_t *)MAP_FAILED && p->size)
+        munmap((void *)p->map, (size_t)p->size);
+    if (p->fd >= 0) close(p->fd);
+    memset(p, 0, sizeof(*p));
+    p->fd = -1;
+}
+
+static bool model_part_idx_path(const char *path, char *out, size_t out_sz) {
+    const size_t n = strlen(path);
+    if (n + 5 > out_sz) return false;
+    memcpy(out, path, n);
+    memcpy(out + n, ".idx", 5);
+    return true;
+}
+
+static bool model_part_copy_range(int in_fd, int out_fd,
+                                  uint64_t off, uint64_t len) {
+    uint8_t *buf = (uint8_t *)malloc(1u << 20);
+    if (!buf) return false;
+    bool ok = true;
+    uint64_t pos = 0;
+    while (pos < len) {
+        size_t chunk = (size_t)(len - pos);
+        if (chunk > (1u << 20)) chunk = (1u << 20);
+        ssize_t r = pread(in_fd, buf, chunk, (off_t)(off + pos));
+        if (r > 0 && (size_t)r == chunk)
+            r = pwrite(out_fd, buf, chunk, (off_t)(off + pos));
+        if (r < 0 || (size_t)r != chunk) { ok = false; break; }
+        pos += chunk;
+    }
+    free(buf);
+    return ok;
+}
+
+static bool model_part_write_idx(const char *path, const ds4_model_part *p,
+                                 uint64_t model_mtime, uint64_t budget,
+                                 uint32_t hotlist_id) {
+    char ipath[4096];
+    if (!model_part_idx_path(path, ipath, sizeof(ipath))) return false;
+    FILE *fp = fopen(ipath, "wb");
+    if (!fp) return false;
+    ds4_model_part_header h;
+    memset(&h, 0, sizeof(h));
+    h.magic = DS4_MODEL_PART_MAGIC;
+    h.version = DS4_MODEL_PART_VERSION;
+    h.mask_words = DS4_MODEL_PART_MASK_WORDS;
+    h.model_size = p->size;
+    h.model_mtime = model_mtime;
+    h.budget_bytes = budget;
+    h.used_bytes = p->used_bytes;
+    h.n_layer = p->n_layer;
+    h.n_expert = p->n_expert;
+    h.hotlist_id = hotlist_id;
+    bool ok = fwrite(&h, sizeof(h), 1, fp) == 1;
+    const size_t mask_bytes = (size_t)p->n_layer * DS4_MODEL_PART_NTENS *
+                              DS4_MODEL_PART_MASK_WORDS * sizeof(uint64_t);
+    if (ok) ok = fwrite(p->mask, 1, mask_bytes, fp) == mask_bytes;
+    if (fclose(fp) != 0) ok = false;
+    return ok;
+}
+
+static bool model_part_try_load(const char *path, uint64_t model_size,
+                                uint64_t model_mtime, uint64_t budget,
+                                uint32_t hotlist_id, ds4_model_part *p) {
+    struct stat ps;
+    if (stat(path, &ps) != 0 || (uint64_t)ps.st_size != model_size) return false;
+    char ipath[4096];
+    if (!model_part_idx_path(path, ipath, sizeof(ipath))) return false;
+    FILE *fp = fopen(ipath, "rb");
+    if (!fp) return false;
+    ds4_model_part_header h;
+    bool ok = fread(&h, sizeof(h), 1, fp) == 1 &&
+        h.magic == DS4_MODEL_PART_MAGIC &&
+        h.version == DS4_MODEL_PART_VERSION &&
+        h.mask_words == DS4_MODEL_PART_MASK_WORDS &&
+        h.model_size == model_size &&
+        h.model_mtime == model_mtime &&
+        h.budget_bytes == budget &&
+        h.hotlist_id == hotlist_id &&
+        h.n_layer == DS4_N_LAYER &&
+        h.n_expert == DS4_N_EXPERT;
+    if (ok) {
+        p->n_layer = h.n_layer;
+        p->n_expert = h.n_expert;
+        p->used_bytes = h.used_bytes;
+        p->size = model_size;
+        p->mask_words = DS4_MODEL_PART_MASK_WORDS;
+        const size_t mask_bytes = (size_t)p->n_layer * DS4_MODEL_PART_NTENS *
+                                  DS4_MODEL_PART_MASK_WORDS * sizeof(uint64_t);
+        ok = fread(p->mask, 1, mask_bytes, fp) == mask_bytes;
+    }
+    fclose(fp);
+    return ok;
+}
+
+static bool model_part_build(const ds4_model *model, const ds4_weights *w,
+                             const char *path, uint64_t model_mtime,
+                             uint64_t budget, uint32_t hotlist_id,
+                             const uint16_t (*hotlist)[2], uint32_t hotlist_count,
+                             ds4_model_part *p) {
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: --ssd-part: cannot open %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    if (ftruncate(fd, (off_t)model->size) != 0) {
+        fprintf(stderr, "ds4: --ssd-part: ftruncate %s failed: %s\n",
+                path, strerror(errno));
+        close(fd);
+        return false;
+    }
+    p->n_layer = DS4_N_LAYER;
+    p->n_expert = DS4_N_EXPERT;
+    p->mask_words = DS4_MODEL_PART_MASK_WORDS;
+    p->size = model->size;
+    p->used_bytes = 0;
+    memset(p->mask, 0, sizeof(p->mask));
+
+    uint32_t entries = 0;
+    bool ok = true;
+    for (uint32_t i = 0; i < hotlist_count && ok; i++) {
+        const uint32_t il = hotlist[i][0];
+        const uint32_t e  = hotlist[i][1];
+        if (il >= DS4_N_LAYER || e >= DS4_N_EXPERT) continue;
+        if (model_part_mask_test(p->mask[il][0], e)) continue;
+        const ds4_layer_weights *l = &w->layer[il];
+        uint64_t gate_bytes = 0, down_bytes = 0;
+        if (!streaming_layer_gate_down_expert_bytes(l, &gate_bytes, &down_bytes))
+            continue;
+        const uint64_t per = 2u * gate_bytes + down_bytes;
+        if (per == 0) continue;
+        if (p->used_bytes + per > budget) break; /* hotlist sorted by popularity */
+        const uint64_t range_off[3] = {
+            l->ffn_gate_exps->abs_offset + (uint64_t)e * gate_bytes,
+            l->ffn_up_exps->abs_offset   + (uint64_t)e * gate_bytes,
+            l->ffn_down_exps->abs_offset + (uint64_t)e * down_bytes,
+        };
+        const uint64_t range_len[3] = { gate_bytes, gate_bytes, down_bytes };
+        for (int t = 0; t < 3 && ok; t++)
+            ok = model_part_copy_range(model->fd, fd, range_off[t], range_len[t]);
+        if (ok) {
+            model_part_mask_set(p->mask[il][0], e);
+            model_part_mask_set(p->mask[il][1], e);
+            model_part_mask_set(p->mask[il][2], e);
+            p->used_bytes += per;
+            entries++;
+        }
+    }
+    if (ok)
+        ok = model_part_write_idx(path, p, model_mtime, budget, hotlist_id);
+    if (!ok) {
+        close(fd);
+        return false;
+    }
+    fprintf(stderr,
+            "ds4: --ssd-part: built %s: %u experts, %.2f GiB of %.2f GiB budget\n",
+            path, entries, (double)p->used_bytes / 1073741824.0,
+            (double)budget / 1073741824.0);
+    p->fd = fd;
+    p->active = true;
+    return true;
+}
+
+static void model_part_setup(const ds4_model *model, const ds4_weights *w,
+                             const char *path, uint64_t budget) {
+    if (!model || !w || !path || !path[0] || budget == 0) return;
+    uint32_t hotlist_id = 0;
+    const uint16_t (*hotlist)[2] = NULL;
+    uint32_t hotlist_count = 0;
+    if (!model_part_default_hotlist(&hotlist_id, &hotlist, &hotlist_count) ||
+        hotlist_count == 0) {
+        fprintf(stderr, "ds4: --ssd-part: no default hotlist for this model; "
+                        "disabling model-part\n");
+        return;
+    }
+    struct stat st;
+    uint64_t model_mtime = 0;
+    if (fstat(model->fd, &st) == 0) model_mtime = (uint64_t)st.st_mtime;
+
+    if (!model_part_try_load(path, model->size, model_mtime, budget,
+                             hotlist_id, &g_model_part)) {
+        if (!model_part_build(model, w, path, model_mtime, budget, hotlist_id,
+                              hotlist, hotlist_count, &g_model_part))
+            return;
+    }
+    int fd = g_model_part.fd;
+    if (fd < 0) {
+        fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "ds4: --ssd-part: cannot open %s: %s\n",
+                    path, strerror(errno));
+            return;
+        }
+        g_model_part.fd = fd;
+    }
+    void *m = mmap(NULL, (size_t)g_model_part.size, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+        fprintf(stderr, "ds4: --ssd-part: mmap %s failed: %s\n",
+                path, strerror(errno));
+        model_part_close(&g_model_part);
+        return;
+    }
+    g_model_part.map = (const uint8_t *)m;
+    g_model_part.active = true;
+    fprintf(stderr, "ds4: --ssd-part active: %s (%.2f GiB cached experts)\n",
+            path, (double)g_model_part.used_bytes / 1073741824.0);
+}
+
 static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
         const ds4_model         *model,
         const ds4_layer_weights *layer,
@@ -5248,6 +5531,14 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
     table.down_offset = layer->ffn_down_exps ? layer->ffn_down_exps->abs_offset : 0;
     table.gate_expert_bytes = gate_expert_bytes;
     table.down_expert_bytes = down_expert_bytes;
+    if (g_model_part.active && il < g_model_part.n_layer) {
+        table.part_map = g_model_part.map;
+        table.part_size = g_model_part.size;
+        table.part_mask_words = g_model_part.mask_words;
+        table.part_mask_gate = g_model_part.mask[il][0];
+        table.part_mask_up   = g_model_part.mask[il][1];
+        table.part_mask_down = g_model_part.mask[il][2];
+    }
     return table;
 }
 #endif
@@ -71570,6 +71861,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
 #endif
         ds4_gpu_set_streaming_expert_cache_layer_count(DS4_N_LAYER);
+#ifndef DS4_NO_GPU
+        if (e->ssd_streaming && e->backend == DS4_BACKEND_VULKAN &&
+            opt->model_part_path && opt->model_part_path[0]) {
+            uint64_t part_budget = opt->model_part_bytes;
+            if (part_budget == 0) part_budget = 30ull << 30;
+            model_part_setup(&e->model, &e->weights, opt->model_part_path,
+                             part_budget);
+        }
+#endif
         if (e->ssd_streaming) {
             /*
              * Pin the expert cache's slab size class to the model's uniform

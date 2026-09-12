@@ -361,6 +361,16 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    down_offset;
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
+    /* model-part (SPECS_MODEL_PART.md): optional second source for a
+     * popularity-selected subset of experts. The part file is a sparse mirror
+     * of the model (same byte offsets), so a hosted expert is read as
+     * part_map + offset instead of model_map + offset. NULL = disabled. */
+    const void     *part_map;
+    uint64_t        part_size;
+    const uint64_t *part_mask_gate;
+    const uint64_t *part_mask_up;
+    const uint64_t *part_mask_down;
+    uint32_t        part_mask_words;
 } ds4_gpu_stream_expert_table;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Optional CUDA look-ahead between completed layers, inside the existing

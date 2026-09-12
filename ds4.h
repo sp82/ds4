@@ -149,6 +149,10 @@ typedef struct {
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
+    /* model-part (SPECS_MODEL_PART.md): spare mirror of popularity-selected
+     * routed experts on a second, low-latency disk. NULL path = disabled. */
+    const char *model_part_path;
+    uint64_t model_part_bytes;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;

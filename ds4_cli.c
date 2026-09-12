@@ -2105,6 +2105,15 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--ssd-part")) {
+            c.engine.model_part_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ssd-part-bytes")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.engine.model_part_bytes)) {
+                fprintf(stderr,
+                        "ds4: --ssd-part-bytes must be a positive GiB value, e.g. 30GB\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--vulkan-stats")) {
             c.vulkan_stats = true;
         } else if (!strcmp(arg, "--simulate-used-memory")) {

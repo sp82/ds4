@@ -161,6 +161,9 @@ static uint32_t g_scope_bind_count = 0;
 static uint32_t g_scope_dispatch_count = 0;
 
 static VkPhysicalDeviceProperties    g_props;
+/* Physical-device index chosen at init (forced or auto-picked).  Printed at
+ * startup so a test session can confirm which GPU ran without inferring. */
+static uint32_t                      g_device_index = 0;
 /* VK_NV_device_diagnostic_checkpoints debug (DS4_VULKAN_CHECKPOINTS): insert a
  * marker per dispatch; after a device lost the queue's last checkpoint names
  * the faulting kernel (no serialization, unlike timestamps). */
@@ -424,6 +427,11 @@ struct ds4_vk_pool_layer {
     uint32_t         route_hotness[DS4_VK_POOL_TABLE_ENTRIES]; /* per-expert LFU ticks */
     uint32_t         route_seed_count;  /* routed seeds seen (approx. tokens) */
     uint32_t         route_last_decay;  /* decay watermark in seed_count */
+    /* Recency pin (DS4_VULKAN_POOL_PIN_TOKENS): epoch of the last routed seed
+     * that requested each expert, so the previous tokens' working set can be
+     * protected from eviction.  0 = never requested. */
+    uint32_t         seed_epoch;
+    uint32_t         last_used[DS4_VK_POOL_TABLE_ENTRIES];
 };
 
 /* Bisect gate: DS4_VULKAN_HOTNESS_OFF=1 restores the legacy LRU-only eviction
@@ -532,6 +540,31 @@ static struct ds4_vk_pool_tel g_pool_tel[DS4_VK_POOL_MAX_LAYERS];
  * fence.  Only the main thread writes this (the worker submits without
  * waiting), but it stays atomic for safe snapshot reads. */
 static std::atomic<uint64_t> g_pool_tel_wait_us(0);
+
+/* Debug-only breakdown of the expert pool store (DS4_VULKAN_DEBUG_POOL_TIME):
+ * host copy time (memcpy from the mmap: page faults + RAM copy) vs the GPU
+ * submit/wait.  Answers whether the store is disk/fault-bound or submit-bound. */
+static std::atomic<uint64_t> g_dbg_store_copy_us(0);
+static std::atomic<uint64_t> g_dbg_store_submit_us(0);
+static std::atomic<uint64_t> g_dbg_store_bytes(0);
+static std::atomic<uint64_t> g_dbg_store_calls(0);
+static std::atomic<int> g_dbg_store_time_reg(0);
+
+static void vulkan_store_time_report(void) {
+    const uint64_t copy = g_dbg_store_copy_us.load();
+    const uint64_t sub = g_dbg_store_submit_us.load();
+    const uint64_t bytes = g_dbg_store_bytes.load();
+    const uint64_t calls = g_dbg_store_calls.load();
+    const double copy_ms = (double)copy / 1000.0;
+    const double sub_ms = (double)sub / 1000.0;
+    const double mib = (double)bytes / (1024.0 * 1024.0);
+    fprintf(stderr,
+            "ds4: vulkan store-time: calls=%llu bytes=%.1f MiB "
+            "copy=%.1f ms (%.1f MiB/s) submit=%.1f ms total=%.1f ms\n",
+            (unsigned long long)calls, mib, copy_ms,
+            copy_ms > 0.0 ? mib / (copy_ms / 1000.0) : 0.0,
+            sub_ms, copy_ms + sub_ms);
+}
 
 /* Count the reloads among the experts being loaded now: an expert whose
  * weights were stored in this pool before (ever_loaded) and evicted since is
@@ -840,6 +873,54 @@ static double vulkan_probe_transfer_bw(VkPhysicalDevice phys) {
     return bw;
 }
 
+/* PCI bus/device/function of a physical device (VK_EXT_pci_bus_info), so the
+ * Vulkan index printed at startup can be mapped to the real slot.  Best-effort:
+ * returns 0 (and zeros) when the extension is unavailable. */
+static int vulkan_query_bdf(VkPhysicalDevice phys, uint32_t *dom, uint32_t *bus,
+                            uint32_t *dev, uint32_t *fn) {
+    if (dom) *dom = 0;
+    if (bus) *bus = 0;
+    if (dev) *dev = 0;
+    if (fn) *fn = 0;
+    if (!phys || g_instance == VK_NULL_HANDLE) return 0;
+    PFN_vkGetPhysicalDeviceProperties2 p2 =
+        (PFN_vkGetPhysicalDeviceProperties2)vkGetInstanceProcAddr(
+            g_instance, "vkGetPhysicalDeviceProperties2");
+    if (!p2) {
+        p2 = (PFN_vkGetPhysicalDeviceProperties2)vkGetInstanceProcAddr(
+            g_instance, "vkGetPhysicalDeviceProperties2KHR");
+    }
+    if (!p2) return 0;
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &n, NULL);
+    if (n == 0) return 0;
+    VkExtensionProperties *e = (VkExtensionProperties *)malloc(sizeof(*e) * n);
+    if (!e) return 0;
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &n, e);
+    int has = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (strcmp(e[i].extensionName, "VK_EXT_pci_bus_info") == 0) {
+            has = 1;
+            break;
+        }
+    }
+    free(e);
+    if (!has) return 0;
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci;
+    memset(&pci, 0, sizeof(pci));
+    pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 props2;
+    memset(&props2, 0, sizeof(props2));
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &pci;
+    p2(phys, &props2);
+    if (dom) *dom = pci.pciDomain;
+    if (bus) *bus = pci.pciBus;
+    if (dev) *dev = pci.pciDevice;
+    if (fn) *fn = pci.pciFunction;
+    return 1;
+}
+
 static int vulkan_pick_device(void) {
     uint32_t count = 0;
     VkResult rc = vkEnumeratePhysicalDevices(g_instance, &count, NULL);
@@ -873,13 +954,14 @@ static int vulkan_pick_device(void) {
         long v = strtol(dev_env, &end, 10);
         if (end != dev_env && v >= 0 && v < (long)count) forced = (int)v;
     }
+    uint32_t chosen_idx = 0;
     if (forced >= 0) {
         chosen = devices[forced];
+        chosen_idx = (uint32_t)forced;
     } else {
         VkPhysicalDevice first_usable = VK_NULL_HANDLE;
         uint32_t first_usable_idx = 0;
         double best_bw = 0.0;
-        uint32_t chosen_idx = 0;
         for (uint32_t i = 0; i < count; i++) {
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(devices[i], &props);
@@ -911,6 +993,7 @@ static int vulkan_pick_device(void) {
     }
     free(devices);
     if (chosen == VK_NULL_HANDLE) return 0;
+    g_device_index = chosen_idx;
 
     g_phys = chosen;
     vkGetPhysicalDeviceProperties(g_phys, &g_props);
@@ -1514,13 +1597,37 @@ int ds4_gpu_init(void) {
     app.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
     app.apiVersion = VK_API_VERSION_1_0;
 
-    /* Instance extensions: none required (Vulkan 1.0 core). */
+    /* Instance extensions: VK_KHR_get_physical_device_properties2 (when
+     * present) lets the startup log report the PCI BDF via
+     * VK_EXT_pci_bus_info.  Nothing else is required (Vulkan 1.0 core). */
+    const char *inst_exts[1];
+    uint32_t n_inst_exts = 0;
+    {
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+        if (n > 0) {
+            VkExtensionProperties *e =
+                (VkExtensionProperties *)malloc(sizeof(*e) * n);
+            if (e) {
+                vkEnumerateInstanceExtensionProperties(NULL, &n, e);
+                for (uint32_t i = 0; i < n; i++) {
+                    if (strcmp(e[i].extensionName,
+                               "VK_KHR_get_physical_device_properties2") == 0) {
+                        inst_exts[n_inst_exts++] =
+                            "VK_KHR_get_physical_device_properties2";
+                        break;
+                    }
+                }
+                free(e);
+            }
+        }
+    }
 
     VkInstanceCreateInfo ici = {};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = 0;
-    ici.ppEnabledExtensionNames = NULL;
+    ici.enabledExtensionCount = n_inst_exts;
+    ici.ppEnabledExtensionNames = n_inst_exts ? inst_exts : NULL;
 
     VkResult rc = vkCreateInstance(&ici, NULL, &g_instance);
     if (rc != VK_SUCCESS) {
@@ -1539,8 +1646,26 @@ int ds4_gpu_init(void) {
         return 0;
     }
 
-    fprintf(stderr, DS4_VULKAN_LOG_PREFIX "initialized: %s (api 0x%08x)\n",
-            g_props.deviceName, (unsigned)g_props.apiVersion);
+    uint32_t bdf_dom = 0, bdf_bus = 0, bdf_dev = 0, bdf_fn = 0;
+    const int have_bdf = vulkan_query_bdf(g_phys, &bdf_dom, &bdf_bus,
+                                          &bdf_dev, &bdf_fn);
+    char bdf_str[32];
+    if (have_bdf) {
+        snprintf(bdf_str, sizeof(bdf_str), "%04x:%02x:%02x.%x",
+                 bdf_dom, bdf_bus, bdf_dev, bdf_fn);
+    } else {
+        snprintf(bdf_str, sizeof(bdf_str), "n/a");
+    }
+    fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+            "initialized: device[%u] %s bdf=%s (api 0x%08x)\n",
+            g_device_index, g_props.deviceName, bdf_str,
+            (unsigned)g_props.apiVersion);
+    if (getenv("DS4_VULKAN_INFO_ONLY") != NULL) {
+        fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                "device index %u selected; exiting (DS4_VULKAN_INFO_ONLY)\n",
+                g_device_index);
+        exit(0);
+    }
     ds4_vulkan_report_unavailable();
     g_gpu[0].device_id = 0;
     g_gpu[0].stream = NULL;
@@ -5773,6 +5898,33 @@ static int vulkan_pool_id_requested(const int32_t *ids, uint32_t n_ids,
     return 0;
 }
 
+/* Recency pin: an expert requested within the last N routed seeds for this
+ * layer (N tokens) is protected from eviction while an unpinned victim exists.
+ * Default 3, DS4_VULKAN_POOL_PIN_TOKENS=0 disables. */
+static uint32_t vulkan_pool_pin_tokens(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_VULKAN_POOL_PIN_TOKENS");
+        if (v && *v) {
+            const long x = strtol(v, NULL, 10);
+            cached = x > 0 ? (int)x : 0;
+        } else {
+            cached = 3;
+        }
+    }
+    return (uint32_t)cached;
+}
+
+static int vulkan_pool_id_pinned(const struct ds4_vk_pool_layer *l, int32_t e) {
+    const uint32_t pin = vulkan_pool_pin_tokens();
+    if (!l || !pin || e < 0 || (uint32_t)e >= DS4_VK_POOL_TABLE_ENTRIES) {
+        return 0;
+    }
+    const uint32_t last = l->last_used[(uint32_t)e];
+    if (last == 0) return 0;
+    return l->seed_epoch - last < pin;
+}
+
 /* Copy expert e's gate/up/down from the model map into pool slot `slot`.
  * NOTE: this is the batched-only store; the actual upload happens in
  * vulkan_pool_store_batch below so a layer seed issues ONE staging copy +
@@ -5801,34 +5953,44 @@ static int vulkan_pool_slot_reserve_only(struct ds4_vk_pool_layer *l,
         return (int)slot;
     }
     uint32_t victim = UINT32_MAX;
-    if (vulkan_pool_hotness_off()) {
-        /* Legacy LRU-only (bisect DS4_VULKAN_HOTNESS_OFF). */
-        uint32_t min_age = UINT32_MAX;
-        for (uint32_t i = 0; i < l->n_slots; i++) {
-            if (vulkan_pool_id_requested(ids, n_ids, l->slots[i])) continue;
-            if (l->slot_age[i] < min_age) {
-                min_age = l->slot_age[i];
-                victim = i;
+    /* Pass 0 respects the recency pin (last N tokens); pass 1 falls back to
+     * ignoring it when every candidate is pinned. */
+    for (int pass = 0; pass < 2 && victim == UINT32_MAX; pass++) {
+        const int respect_pin = (pass == 0 && vulkan_pool_pin_tokens() != 0);
+        if (vulkan_pool_hotness_off()) {
+            /* Legacy LRU-only (bisect DS4_VULKAN_HOTNESS_OFF). */
+            uint32_t min_age = UINT32_MAX;
+            for (uint32_t i = 0; i < l->n_slots; i++) {
+                if (vulkan_pool_id_requested(ids, n_ids, l->slots[i])) continue;
+                if (respect_pin &&
+                    vulkan_pool_id_pinned(l, l->slots[i])) continue;
+                if (l->slot_age[i] < min_age) {
+                    min_age = l->slot_age[i];
+                    victim = i;
+                }
             }
-        }
-    } else {
-        /* LFU victim: lowest route hotness, tiebreak LRU slot_age (Metal
-         * prune semantics). */
-        uint32_t lowest_hotness = UINT32_MAX;
-        uint32_t oldest_age = UINT32_MAX;
-        for (uint32_t i = 0; i < l->n_slots; i++) {
-            if (vulkan_pool_id_requested(ids, n_ids, l->slots[i])) continue;
-            const int32_t slot_expert = l->slots[i];
-            uint32_t hotness = 0;
-            if (slot_expert >= 0 &&
-                (uint32_t)slot_expert < DS4_VK_POOL_TABLE_ENTRIES) {
-                hotness = l->route_hotness[(uint32_t)slot_expert];
-            }
-            if (hotness < lowest_hotness ||
-                (hotness == lowest_hotness && l->slot_age[i] < oldest_age)) {
-                lowest_hotness = hotness;
-                oldest_age = l->slot_age[i];
-                victim = i;
+        } else {
+            /* LFU victim: lowest route hotness, tiebreak LRU slot_age (Metal
+             * prune semantics). */
+            uint32_t lowest_hotness = UINT32_MAX;
+            uint32_t oldest_age = UINT32_MAX;
+            for (uint32_t i = 0; i < l->n_slots; i++) {
+                if (vulkan_pool_id_requested(ids, n_ids, l->slots[i])) continue;
+                if (respect_pin &&
+                    vulkan_pool_id_pinned(l, l->slots[i])) continue;
+                const int32_t slot_expert = l->slots[i];
+                uint32_t hotness = 0;
+                if (slot_expert >= 0 &&
+                    (uint32_t)slot_expert < DS4_VK_POOL_TABLE_ENTRIES) {
+                    hotness = l->route_hotness[(uint32_t)slot_expert];
+                }
+                if (hotness < lowest_hotness ||
+                    (hotness == lowest_hotness &&
+                     l->slot_age[i] < oldest_age)) {
+                    lowest_hotness = hotness;
+                    oldest_age = l->slot_age[i];
+                    victim = i;
+                }
             }
         }
     }
@@ -5843,6 +6005,22 @@ static int vulkan_pool_slot_reserve_only(struct ds4_vk_pool_layer *l,
     }
     if (!vulkan_pool_slot_mark(l, victim, e)) return -1;
     return (int)victim;
+}
+
+/* model-part (SPECS_MODEL_PART.md): pick the sparse-mirror source for a
+ * hosted expert.  The part file mirrors the model at the same byte offsets, so
+ * a hosted expert is read from part_map at the SAME offset.  Returns
+ * model_map when no part file covers this expert. */
+static const uint8_t *vulkan_expert_src(const ds4_gpu_stream_expert_table *t,
+                                        const uint64_t *mask, int32_t e) {
+    if (t->part_map && mask && e >= 0) {
+        const uint32_t ue = (uint32_t)e;
+        if (t->part_mask_words > ue / 64u &&
+            ((mask[ue / 64u] >> (ue % 64u)) & UINT64_C(1))) {
+            return (const uint8_t *)t->part_map;
+        }
+    }
+    return (const uint8_t *)t->model_map;
 }
 
 /* Upload the weights of the given (already reserved) experts into their pool
@@ -5862,6 +6040,15 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
     if (per == 0 || n_missing > UINT64_MAX / per) return 0;
     const uint64_t total = (uint64_t)n_missing * per;
 
+    const bool dbg_time = getenv("DS4_VULKAN_DEBUG_POOL_TIME") != NULL;
+    double dbg_copy0 = 0.0, dbg_sub0 = 0.0;
+    if (dbg_time) {
+        if (!g_dbg_store_time_reg.exchange(1)) atexit(vulkan_store_time_report);
+        g_dbg_store_calls.fetch_add(1, std::memory_order_relaxed);
+        g_dbg_store_bytes.fetch_add(total, std::memory_order_relaxed);
+        dbg_copy0 = vulkan_now_ms();
+    }
+
     struct ds4_vulkan_tensor *ph = vulkan_tensor_handle(l->tensor);
     if (!ph) return 0;
     if (ph->host_map) {
@@ -5870,19 +6057,26 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
             const int slot = vulkan_pool_slot_for(l, e);
             if (slot < 0 || e < 0) return 0;
             const uint64_t eg = (uint64_t)e;
+            const uint8_t *gsrc = vulkan_expert_src(table, table->part_mask_gate, e);
+            const uint8_t *usrc = vulkan_expert_src(table, table->part_mask_up, e);
+            const uint8_t *dsrc = vulkan_expert_src(table, table->part_mask_down, e);
             memcpy(ph->host_map + ph->offset + vulkan_pool_gate_base(l) +
                        (uint64_t)slot * l->gate_expert_bytes,
-                   src + table->gate_offset + eg * l->gate_expert_bytes,
+                   gsrc + table->gate_offset + eg * l->gate_expert_bytes,
                    (size_t)l->gate_expert_bytes);
             memcpy(ph->host_map + ph->offset + vulkan_pool_up_base(l) +
                        (uint64_t)slot * l->gate_expert_bytes,
-                   src + table->up_offset + eg * l->gate_expert_bytes,
+                   usrc + table->up_offset + eg * l->gate_expert_bytes,
                    (size_t)l->gate_expert_bytes);
             memcpy(ph->host_map + ph->offset + vulkan_pool_down_base(l) +
                        (uint64_t)slot * l->down_expert_bytes,
-                   src + table->down_offset + eg * l->down_expert_bytes,
+                   dsrc + table->down_offset + eg * l->down_expert_bytes,
                    (size_t)l->down_expert_bytes);
         }
+        if (dbg_time)
+            g_dbg_store_copy_us.fetch_add(
+                (uint64_t)((vulkan_now_ms() - dbg_copy0) * 1000.0),
+                std::memory_order_relaxed);
         return 1;
     }
 
@@ -5901,14 +6095,18 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
     VkBufferCopy regions[3 * DS4_VK_POOL_MAX_SLOTS];
     uint32_t nr = 0;
     uint64_t s_off = 0;
+    if (dbg_time) dbg_copy0 = vulkan_now_ms();
     for (uint32_t i = 0; i < n_missing; i++) {
         const int32_t e = missing[i];
         const int slot = vulkan_pool_slot_for(l, e);
         if (slot < 0 || e < 0 || nr + 3 > 3 * DS4_VK_POOL_MAX_SLOTS) return 0;
         const uint64_t eg = (uint64_t)e;
+        const uint8_t *gsrc = vulkan_expert_src(table, table->part_mask_gate, e);
+        const uint8_t *usrc = vulkan_expert_src(table, table->part_mask_up, e);
+        const uint8_t *dsrc = vulkan_expert_src(table, table->part_mask_down, e);
         /* gate */
         memcpy(sh->host_map + sh->offset + s_off,
-               src + table->gate_offset + eg * l->gate_expert_bytes,
+               gsrc + table->gate_offset + eg * l->gate_expert_bytes,
                (size_t)l->gate_expert_bytes);
         regions[nr].srcOffset = sh->offset + s_off;
         regions[nr].dstOffset = ph->offset + vulkan_pool_gate_base(l) +
@@ -5918,7 +6116,7 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
         s_off += l->gate_expert_bytes;
         /* up */
         memcpy(sh->host_map + sh->offset + s_off,
-               src + table->up_offset + eg * l->gate_expert_bytes,
+               usrc + table->up_offset + eg * l->gate_expert_bytes,
                (size_t)l->gate_expert_bytes);
         regions[nr].srcOffset = sh->offset + s_off;
         regions[nr].dstOffset = ph->offset + vulkan_pool_up_base(l) +
@@ -5928,7 +6126,7 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
         s_off += l->gate_expert_bytes;
         /* down */
         memcpy(sh->host_map + sh->offset + s_off,
-               src + table->down_offset + eg * l->down_expert_bytes,
+               dsrc + table->down_offset + eg * l->down_expert_bytes,
                (size_t)l->down_expert_bytes);
         regions[nr].srcOffset = sh->offset + s_off;
         regions[nr].dstOffset = ph->offset + vulkan_pool_down_base(l) +
@@ -5937,13 +6135,22 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
         nr++;
         s_off += l->down_expert_bytes;
     }
+    if (dbg_time) {
+        g_dbg_store_copy_us.fetch_add(
+            (uint64_t)((vulkan_now_ms() - dbg_copy0) * 1000.0),
+            std::memory_order_relaxed);
+        dbg_sub0 = vulkan_now_ms();
+    }
     if (!vulkan_compute_init()) return 0;
     if (async) {
-        if (!vulkan_worker_copy_submit_multi(sh->buffer, ph->buffer, regions,
-                                             nr)) {
-            return 0;
-        }
-        return 1;
+        const int src_ok = vulkan_worker_copy_submit_multi(sh->buffer,
+                                                           ph->buffer, regions,
+                                                           nr);
+        if (dbg_time)
+            g_dbg_store_submit_us.fetch_add(
+                (uint64_t)((vulkan_now_ms() - dbg_sub0) * 1000.0),
+                std::memory_order_relaxed);
+        return src_ok ? 1 : 0;
     }
     VkCommandBuffer cb = vulkan_dispatch_begin();
     if (!cb) return 0;
@@ -5955,7 +6162,12 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                          1, &mb, 0, NULL, 0, NULL);
-    return vulkan_submit_one_shot();
+    const int sub_ok = vulkan_submit_one_shot();
+    if (dbg_time)
+        g_dbg_store_submit_us.fetch_add(
+            (uint64_t)((vulkan_now_ms() - dbg_sub0) * 1000.0),
+            std::memory_order_relaxed);
+    return sub_ok;
 }
 
 /* Seed the layer pool with the given selection and keep the on-device
@@ -5975,6 +6187,17 @@ static int vulkan_pool_seed_remap(struct ds4_vk_pool_layer *l,
                                   int phase) {
     if (!l || !table || !ids || !remap_out || n_ids == 0) return -1;
     if (n_ids > DS4_VK_POOL_SEL_CAP || !l->tensor || !l->meta) return -1;
+
+    /* New routed seed (approximately a new token for this layer): advance the
+     * recency epoch and stamp the current selection so it stays pinned for the
+     * next DS4_VULKAN_POOL_PIN_TOKENS seeds. */
+    l->seed_epoch++;
+    for (uint32_t i = 0; i < n_ids; i++) {
+        const int32_t e = ids[i];
+        if (e >= 0 && (uint32_t)e < DS4_VK_POOL_TABLE_ENTRIES) {
+            l->last_used[(uint32_t)e] = l->seed_epoch;
+        }
+    }
 
     /* Collect the experts that are not resident yet. */
     int32_t missing[DS4_VK_POOL_MAX_SLOTS];
