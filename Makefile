@@ -615,6 +615,17 @@ vkbench: $(VKBENCH_DIR)/vkbench.o
 
 .PHONY: vkbench
 
+# --- mgpu-probe multi-GPU capability probe (vulkan/tools/mgpu_probe) --------
+MGPU_PROBE_DIR = vulkan/tools/mgpu_probe
+
+$(MGPU_PROBE_DIR)/mgpu_probe.o: $(MGPU_PROBE_DIR)/mgpu_probe.c
+	gcc $(CFLAGS) -D_GNU_SOURCE -c -o $@ $(MGPU_PROBE_DIR)/mgpu_probe.c
+
+mgpu-probe: $(MGPU_PROBE_DIR)/mgpu_probe.o
+	gcc -o $@ $^ -lvulkan -lm
+
+.PHONY: mgpu-probe
+
 # --- kbench kernel microbenchmark (vulkan/tools/kbench, Fase 7 tuning) -------
 KBENCH_DIR = vulkan/tools/kbench
 
