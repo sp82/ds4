@@ -8736,6 +8736,9 @@ static bool vulkan_streaming_pool_format(const ds4_layer_weights *l) {
     return iq2 || q4 || mxfp4;
 }
 
+/* Defined in ds4_vulkan.c: true once ds4_gpu_init_multi brought up >1 device. */
+extern int ds4_vulkan_multi_tier_active(void);
+
 static bool vulkan_streaming_pool_active(const ds4_weights *w) {
     if (!w || DS4_N_LAYER == 0) return false;
     /* A distributed slice process only loads a contiguous layer range (the
@@ -8769,7 +8772,7 @@ static void model_map_span_vec_include_layer_decode(
      * pool is active the experts are served from the device-local pool, so the
      * full expert blobs must NOT be mapped here. */
 #if defined(DS4_VULKAN_BUILD)
-    if (!vulkan_streaming_pool_active(w)) {
+    if (!vulkan_streaming_pool_active(w) || ds4_vulkan_multi_tier_active()) {
         model_map_span_vec_include_one(spans, l->ffn_gate_exps);
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
         model_map_span_vec_include_one(spans, l->ffn_down_exps);
@@ -8795,6 +8798,7 @@ static bool weights_model_map_decode_static_supported(const ds4_weights *w) {
      * per-layer expert windows.  Exception (Fase 6 step 3): with the expert
      * pool active the decode maps exclude the expert blobs, so the static map
      * holds every layer's non-expert tensors and is staged a single time. */
+    if (ds4_vulkan_multi_tier_active()) return false;
     return vulkan_streaming_pool_active(w);
 #else
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -22427,8 +22431,8 @@ static bool metal_graph_decode_hc_pre(
                ds4_gpu_hc_weighted_sum_tensor(out,
                                                  residual_hc,
                                                  split,
-                                                 DS4_N_EMBD,
-                                                 DS4_N_HC) != 0;
+                                           DS4_N_EMBD,
+                                           DS4_N_HC) != 0;
     }
 
     return ds4_gpu_hc_split_weighted_sum_tensor(out,
@@ -33822,6 +33826,11 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const bool batch_static_decode =
         static_decode_map && metal_graph_stream_decode_layer_batch_enabled(g);
     bool ok = true;
+    /* Multi-tier: the previous token may have left active_tier on the head
+     * tier; stage this token's map/windows on the embedding tier first. */
+    if (g->placement && !metal_graph_set_active_tier_decode(g, g->emb_tier)) {
+        return false;
+    }
     if (static_decode_map) {
         if (!static_map_state_cache || !g->streaming_static_decode_map_current) {
             ok = metal_graph_stream_map_decode_static_all(model, weights);

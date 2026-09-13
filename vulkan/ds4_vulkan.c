@@ -759,6 +759,14 @@ static struct ds4_vk_dev_ctx g_vk_ctx[DS4_MAX_GPUS];
 static int g_vk_ctx_count = 0;
 static int g_vk_ctx_active = -1;
 
+/* True once ds4_gpu_init_multi brought up more than one device.  The engine
+ * uses this to force the non-static per-layer window path (the shared expert
+ * pool is single-device) across the tiers. */
+static int g_vulkan_multi_tier = 0;
+extern "C" int ds4_vulkan_multi_tier_active(void) {
+    return g_vulkan_multi_tier;
+}
+
 static void vulkan_ctx_save(struct ds4_vk_dev_ctx *c) {
     memset(c, 0, sizeof(*c));
     c->phys = g_phys;
@@ -2059,6 +2067,7 @@ extern "C" int ds4_vulkan_init_multi(const ds4_gpu_config *cfg) {
     }
     g_vk_ctx_active = -1;
     if (ds4_vulkan_set_current_device(0) != 0) return 0;
+    g_vulkan_multi_tier = 1;
     return 1;
 }
 
