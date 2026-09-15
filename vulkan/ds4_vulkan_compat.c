@@ -48,6 +48,8 @@ extern "C" void ds4_vulkan_telemetry_snapshot(ds4_gpu_expert_telemetry *t);
 
 extern "C" int ds4_vulkan_set_current_device(int tier);
 extern "C" ds4_gpu_tensor *ds4_vulkan_tensor_alloc_ptr_on(int tier, uint64_t bytes);
+extern "C" ds4_gpu_tensor *ds4_vulkan_tensor_alloc_managed_on(int tier, uint64_t bytes);
+extern "C" ds4_gpu_tensor *ds4_vulkan_tensor_alloc_device_local_on(int tier, uint64_t bytes);
 
 static int vulkan_tier_valid(int tier) {
     return g_n_gpus > 0 && tier >= 0 && tier < g_n_gpus;
@@ -97,8 +99,13 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier,
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier,
                                                            uint64_t bytes) {
     if (!vulkan_tier_valid(tier)) return NULL;
-    if (ds4_vulkan_set_current_device(tier) != 0) return NULL;
-    return ds4_gpu_tensor_alloc_managed(bytes);
+    return ds4_vulkan_tensor_alloc_managed_on(tier, bytes);
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_device_local_on(int tier,
+                                                                uint64_t bytes) {
+    if (!vulkan_tier_valid(tier)) return NULL;
+    return ds4_vulkan_tensor_alloc_device_local_on(tier, bytes);
 }
 
 extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
@@ -108,7 +115,7 @@ extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
 }
 
 extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) {
-    return t ? 0 : -1;
+    return t ? t->device_id : -1;
 }
 
 extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst,

@@ -134,6 +134,12 @@ void ds4_gpu_enable_q8_dequant_gemm(void);
  * tier records the home tier for accounting + free. */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes);
 
+/* Heap-allocated DEVICE-LOCAL (VRAM) tensor on a specific logical tier.
+ * No host map: kernels read/write it on-chip and it is never host-visible.
+ * Cross-tier handoffs of such a tensor go through the explicit
+ * ds4_gpu_tensor_copy staging path. Returns NULL on failure. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_device_local_on(int tier, uint64_t bytes);
+
 /* Cross-device tensor copy. Same-device → cudaMemcpyAsync; peer-capable
  * cross-device → cudaMemcpyPeerAsync with event sync; non-peer → pinned
  * host bounce (per src→dst pair). Honors DS4_FORCE_HOST_BOUNCE=1. */

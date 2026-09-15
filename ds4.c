@@ -1512,6 +1512,23 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+/* Unified per-token trace (DS4_TRACE).  Same CLOCK_MONOTONIC second epoch as
+ * the Vulkan backend's vulkan_trace(), so both interleave in one timeline. */
+static void metal_graph_trace(const char *fmt, ...) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DS4_TRACE");
+        on = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (!on) return;
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "TRACE t=%.3f eng ", now_sec());
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
 /* =========================================================================
  * Metal Routed Expert Locality Profiler.
  * =========================================================================
@@ -8739,6 +8756,31 @@ static bool vulkan_streaming_pool_format(const ds4_layer_weights *l) {
 /* Defined in ds4_vulkan.c: true once ds4_gpu_init_multi brought up >1 device. */
 extern int ds4_vulkan_multi_tier_active(void);
 
+/* Defined in ds4_vulkan.c (Fase 8e): stages the per-tier weight caches in
+ * parallel, one worker thread per device (each tier owns an independent
+ * VkDevice/queue), so the four PCIe links are used concurrently instead of
+ * one after another. */
+extern int ds4_vulkan_device_cache_tensors_multi(
+        int n, const int *device_ids,
+        const ds4_tensor_range *const *ranges, const int *counts);
+
+/* Defined in ds4_vulkan.c: per-tier device-local VRAM accounting (env-gated
+ * DS4_VULKAN_DEBUG_MEM). */
+extern void ds4_vulkan_debug_mem_report(const char *tag);
+
+/* Defined in ds4_vulkan.c: drain EVERY tier's device.  The per-token logits
+ * readback only waits the head tier, so another tier's still-in-flight scope
+ * (the previous token's tail layers) can race the next token's embedding
+ * write on that tier's double-buffered cur_hc. */
+extern void ds4_vulkan_synchronize_all_tiers(void);
+
+/* Defined in ds4_vulkan.c: register the layer -> logical-tier ownership map so
+ * pool/seed operations resolve their target device from the LAYER they name
+ * (never from the mutable selected device).  Called once per engine install in
+ * multi-tier mode; immutable afterwards. */
+extern void ds4_vulkan_set_layer_placement(const int *layer_tier,
+                                           uint32_t n_layers);
+
 static bool vulkan_streaming_pool_active(const ds4_weights *w) {
     if (!w || DS4_N_LAYER == 0) return false;
     /* A distributed slice process only loads a contiguous layer range (the
@@ -8772,7 +8814,14 @@ static void model_map_span_vec_include_layer_decode(
      * pool is active the experts are served from the device-local pool, so the
      * full expert blobs must NOT be mapped here. */
 #if defined(DS4_VULKAN_BUILD)
-    if (!vulkan_streaming_pool_active(w) || ds4_vulkan_multi_tier_active()) {
+    /* Multi-tier (Fase 8e): the routed experts are served by the streaming
+     * expert pool on every tier where they are not resident in the persistent
+     * weight cache.  Do NOT force them into the per-layer windows just because
+     * multi-tier is active: the pool load (begin_selected_load) is per-tier and
+     * the MoE binds the pool when its layer is active.  (The static tiers, whose
+     * experts ARE in the persistent cache, suppress the pool load in the
+     * backend and bind the cache directly.) */
+    if (!vulkan_streaming_pool_active(w)) {
         model_map_span_vec_include_one(spans, l->ffn_gate_exps);
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
         model_map_span_vec_include_one(spans, l->ffn_down_exps);
@@ -18711,16 +18760,33 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     return bytes;
 }
 
+/* Placement of the per-layer KV cache (raw + compressed + indexer):
+ *   - default: device-local VRAM (fast, but consumes the per-tier budget);
+ *   - DS4_VULKAN_KV_IN_RAM=1: host-visible (GTT), i.e. system RAM over PCIe,
+ *     freeing VRAM for the weight cache / expert pool.  DS4_VULKAN_KV_IN_VRAM=1
+ *     forces VRAM back when both are set.  Vulkan-only; other backends keep
+ *     their previous behavior. */
+static bool metal_graph_kv_cache_in_ram(void) {
+#if defined(DS4_VULKAN_BUILD)
+    const char *vram = getenv("DS4_VULKAN_KV_IN_VRAM");
+    if (vram != NULL && vram[0] != '\0' && vram[0] != '0') return false;
+    const char *ram = getenv("DS4_VULKAN_KV_IN_RAM");
+    if (ram != NULL && ram[0] != '\0' && ram[0] != '0') return true;
+#endif
+    return false;
+}
+
 static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor_on(
         bool managed,
         int tier,
         uint64_t bytes) {
-    if (g_n_gpus <= 1) {
-        return managed ? ds4_gpu_tensor_alloc_managed(bytes)
-                       : ds4_gpu_tensor_alloc(bytes);
+    (void)managed;
+    if (metal_graph_kv_cache_in_ram()) {
+        ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
+        if (t != NULL) return t;
+        /* host allocation refused: fall back to VRAM rather than fail. */
     }
-    return managed ? ds4_gpu_tensor_alloc_managed_on(tier, bytes)
-                   : ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
+    return ds4_gpu_tensor_alloc_device_local_on(tier, bytes);
 }
 
 static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
@@ -18802,6 +18868,11 @@ static void metal_graph_debug_dump_tensor(
                 metal_graph_debug_wants(name, il, pos));
     if (!t || n_f32 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
 
+    /* Vulkan: an open command scope holds this layer's kernels recorded but
+     * unsubmitted; a bare synchronize would wait an empty queue and the read
+     * below would return the tensors' pre-layer (stale) contents.  Flush the
+     * scope first so the dump reflects every kernel launched so far. */
+    (void)ds4_gpu_flush_commands();
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
         return;
@@ -18832,6 +18903,7 @@ static void metal_graph_debug_dump_f16_tensor(
                                              "DS4_METAL_GRAPH_DUMP_PREFIX");
     if (!t || n_f16 == 0 || !metal_graph_debug_wants(name, il, pos)) return;
 
+    (void)ds4_gpu_flush_commands();
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
         return;
@@ -18865,6 +18937,7 @@ static void metal_graph_debug_dump_i32_tensor(
     const char *prefix = metal_graph_debug_prefix_for(name, il, pos);
     if (!prefix) return;
 
+    (void)ds4_gpu_flush_commands();
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u pos %u\n", name, il, pos);
         return;
@@ -19616,10 +19689,10 @@ static bool metal_graph_alloc_raw_cap(
     }
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         if (!used_tier[t]) continue;
-        g->cur_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, hc_dim * sizeof(float));
-        g->flat_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, hc_dim * sizeof(float));
-        g->hc_mix_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, mix_hc * sizeof(float));
-        g->hc_split_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, mix_hc * sizeof(float));
+        g->cur_hc_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, hc_dim * sizeof(float));
+        g->flat_hc_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, hc_dim * sizeof(float));
+        g->hc_mix_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, mix_hc * sizeof(float));
+        g->hc_split_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, mix_hc * sizeof(float));
         g->hc_pre_by_tier[t] = ds4_gpu_tensor_view(g->hc_split_by_tier[t],
                                                     0,
                                                     (uint64_t)DS4_N_HC * sizeof(float));
@@ -19629,13 +19702,13 @@ static bool metal_graph_alloc_raw_cap(
         g->hc_comb_by_tier[t] = ds4_gpu_tensor_view(g->hc_split_by_tier[t],
                                                      2ull * DS4_N_HC * sizeof(float),
                                                      (uint64_t)DS4_N_HC * DS4_N_HC * sizeof(float));
-        g->attn_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
-        g->attn_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
-        g->qr_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, q_rank * sizeof(float));
-        g->qr_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, q_rank * sizeof(float));
-        g->q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, q_dim * sizeof(float));
-        g->kv_raw_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-        g->kv_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        g->attn_cur_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->attn_norm_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->qr_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, q_rank * sizeof(float));
+        g->qr_norm_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, q_rank * sizeof(float));
+        g->q_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, q_dim * sizeof(float));
+        g->kv_raw_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+        g->kv_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     }
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -19679,21 +19752,21 @@ static bool metal_graph_alloc_raw_cap(
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
                         (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             }
-            g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
-            g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+            g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc_device_local_on(layer_tier, attn_width * attn_rows * sizeof(float));
+            g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc_device_local_on(layer_tier, attn_width * attn_rows * sizeof(float));
             if (enable_frontier_snapshot) {
                 g->spec_attn_state_kv[il] =
-                    ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+                    ds4_gpu_tensor_alloc_device_local_on(layer_tier, attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] =
-                    ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+                    ds4_gpu_tensor_alloc_device_local_on(layer_tier, attn_width * attn_rows * sizeof(float));
                 if (enable_prefix1_snapshot) {
                     g->spec_prefix1_attn_state_kv[il] =
-                        ds4_gpu_tensor_alloc_ptr_on(
+                        ds4_gpu_tensor_alloc_device_local_on(
                                 layer_tier,
                                 DS4_SPEC_PREFIX_SLOTS * attn_width * attn_rows *
                                     sizeof(float));
                     g->spec_prefix1_attn_state_score[il] =
-                        ds4_gpu_tensor_alloc_ptr_on(
+                        ds4_gpu_tensor_alloc_device_local_on(
                                 layer_tier,
                                 DS4_SPEC_PREFIX_SLOTS * attn_width * attn_rows *
                                     sizeof(float));
@@ -19715,21 +19788,21 @@ static bool metal_graph_alloc_raw_cap(
                         managed_kv_cache,
                         layer_tier,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-                g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
-                g->layer_index_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
+                g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc_device_local_on(layer_tier, index_width * index_rows * sizeof(float));
+                g->layer_index_state_score[il] = ds4_gpu_tensor_alloc_device_local_on(layer_tier, index_width * index_rows * sizeof(float));
                 if (enable_frontier_snapshot) {
                     g->spec_index_state_kv[il] =
-                        ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
+                        ds4_gpu_tensor_alloc_device_local_on(layer_tier, index_width * index_rows * sizeof(float));
                     g->spec_index_state_score[il] =
-                        ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
+                        ds4_gpu_tensor_alloc_device_local_on(layer_tier, index_width * index_rows * sizeof(float));
                     if (enable_prefix1_snapshot) {
                         g->spec_prefix1_index_state_kv[il] =
-                            ds4_gpu_tensor_alloc_ptr_on(
+                            ds4_gpu_tensor_alloc_device_local_on(
                                     layer_tier,
                                     DS4_SPEC_PREFIX_SLOTS * index_width * index_rows *
                                         sizeof(float));
                         g->spec_prefix1_index_state_score[il] =
-                            ds4_gpu_tensor_alloc_ptr_on(
+                            ds4_gpu_tensor_alloc_device_local_on(
                                     layer_tier,
                                     DS4_SPEC_PREFIX_SLOTS * index_width * index_rows *
                                         sizeof(float));
@@ -19751,53 +19824,55 @@ static bool metal_graph_alloc_raw_cap(
      * metal_graph_ensure_ffn_out (per-tier on first touch). */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         if (!used_tier[t]) continue;
-        g->comp_kv_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_width_max * sizeof(float));
-        g->comp_sc_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_width_max * sizeof(float));
+        g->comp_kv_cur_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, comp_width_max * sizeof(float));
+        g->comp_sc_cur_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, comp_width_max * sizeof(float));
         /* Decode-only scratch for the quad compressor projection: the indexer
          * pair outputs must not alias the attention compressor outputs inside
          * the single fused dispatch. */
-        g->index_comp_kv_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, 2ull * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-        g->index_comp_sc_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, 2ull * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        g->index_comp_kv_cur_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, 2ull * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        g->index_comp_sc_cur_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, 2ull * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
         if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             /* Upstream's F16-compressed attn staging buffer. Only allocated when
              * the F16-cache mode is enabled (the non-F16 path stages in-place). */
-            g->attn_comp_stage_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
+            g->attn_comp_stage_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t,
                     (uint64_t)g->attn_comp_stage_cap * DS4_N_HEAD_DIM * sizeof(float));
         }
-        g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
-        g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-        g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
-        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
-        g->comp_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
+        g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, indexer_q_dim * sizeof(float));
+        g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
+        g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
+        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
+        g->comp_selected_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t,
                 (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) * pc * sizeof(uint32_t));
-        g->heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, q_dim * sizeof(float));
-        g->attn_low_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, low_dim * sizeof(float));
-        g->attn_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
-        g->after_attn_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, hc_dim * sizeof(float));
-        g->ffn_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
-        g->ffn_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
-        g->shared_gate_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, shared_dim * sizeof(float));
-        g->shared_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, shared_dim * sizeof(float));
-        g->shared_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, shared_dim * sizeof(float));
-        g->shared_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
-        g->router_logits_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT * sizeof(float));
-        g->router_probs_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT * sizeof(float));
+        g->heads_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, q_dim * sizeof(float));
+        g->attn_low_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, low_dim * sizeof(float));
+        g->attn_out_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->after_attn_hc_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, hc_dim * sizeof(float));
+        g->ffn_cur_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->ffn_norm_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->shared_gate_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, shared_dim * sizeof(float));
+        g->shared_up_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, shared_dim * sizeof(float));
+        g->shared_mid_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, shared_dim * sizeof(float));
+        g->shared_out_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->router_logits_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, DS4_N_EXPERT * sizeof(float));
+        g->router_probs_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, DS4_N_EXPERT * sizeof(float));
+        /* The router readback (host) reads these mid-scope each layer to pick
+         * the experts to stage; they must stay host-visible. */
         g->router_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT_USED * sizeof(int));
         g->router_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, DS4_N_EXPERT_USED * sizeof(float));
-        g->routed_gate_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
+        g->routed_gate_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t,
                 (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-        g->routed_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
+        g->routed_up_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t,
                 (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-        g->routed_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
+        g->routed_mid_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t,
                 (uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-        g->routed_down_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
+        g->routed_down_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t,
                 (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
-        g->routed_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
+        g->routed_out_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, (uint64_t)DS4_N_EMBD * sizeof(float));
         if (g->cuda_tp_decode) {
             g->tp_peer_tmp_by_tier[t] =
                 ds4_gpu_tensor_alloc_ptr_on(t, DS4_CUDA_TP_PEER_TMP_BYTES);
         }
-        g->after_ffn_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, hc_dim * sizeof(float));
+        g->after_ffn_hc_by_tier[t] = ds4_gpu_tensor_alloc_device_local_on(t, hc_dim * sizeof(float));
     }
     /* Class H — head_tier captured from placement[DS4_N_LAYER + 1]
      * (or 0 in single-tier / diagnostic paths). Output-head tensors and the
@@ -19827,25 +19902,25 @@ static bool metal_graph_alloc_raw_cap(
         }
     }
     g->output_pre_by_tier[g->head_tier] =
-        ds4_gpu_tensor_alloc_ptr_on(g->head_tier, (uint64_t)DS4_N_HC * sizeof(float));
+        ds4_gpu_tensor_alloc_device_local_on(g->head_tier, (uint64_t)DS4_N_HC * sizeof(float));
     g->output_weights_by_tier[g->head_tier] =
-        ds4_gpu_tensor_alloc_ptr_on(g->head_tier, (uint64_t)DS4_N_HC * sizeof(float));
+        ds4_gpu_tensor_alloc_device_local_on(g->head_tier, (uint64_t)DS4_N_HC * sizeof(float));
     g->output_embd_by_tier[g->head_tier] =
-        ds4_gpu_tensor_alloc_ptr_on(g->head_tier, (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor_alloc_device_local_on(g->head_tier, (uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm_by_tier[g->head_tier] =
-        ds4_gpu_tensor_alloc_ptr_on(g->head_tier, (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor_alloc_device_local_on(g->head_tier, (uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits_by_tier[g->head_tier] =
-        ds4_gpu_tensor_alloc_ptr_on(g->head_tier,
-                                    output_logits_elems * sizeof(float));
+        ds4_gpu_tensor_alloc_device_local_on(g->head_tier,
+                                             output_logits_elems * sizeof(float));
     for (uint32_t i = 1; i < output_tp_ways; i++) {
         const int t = output_tp_tiers[i];
         if (t < 0 || t >= DS4_MAX_GPUS || t == g->head_tier) continue;
         g->output_norm_by_tier[t] =
-            ds4_gpu_tensor_alloc_ptr_on(t,
-                                        (uint64_t)DS4_N_EMBD * sizeof(float));
+            ds4_gpu_tensor_alloc_device_local_on(t,
+                                                 (uint64_t)DS4_N_EMBD * sizeof(float));
         g->logits_by_tier[t] =
-            ds4_gpu_tensor_alloc_ptr_on(t,
-                                        output_logits_elems * sizeof(float));
+            ds4_gpu_tensor_alloc_device_local_on(t,
+                                                 output_logits_elems * sizeof(float));
     }
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
@@ -20504,7 +20579,10 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
         const ds4_gpu_graph *g,
         const ds4_weights   *weights,
         uint32_t             n_tokens) {
-#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+/* Prefill batch selected-address helper: same shared CUDA/Vulkan-multi gate as
+ * the per-token streaming demand-fill. */
+#if defined(DS4_VULKAN_BUILD) || \
+    (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__))
     if (!g ||
         !g->ssd_streaming ||
         g->quality ||
@@ -23145,7 +23223,10 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
 static bool metal_graph_decode_cuda_selected_slots_expected(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
-#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+/* Selected-slot expectation is shared by CUDA and the multi-tier Vulkan plain
+ * path (the per-token streaming demand-fill); do not gate it out on Vulkan. */
+#if defined(DS4_VULKAN_BUILD) || \
+    (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__))
     if (!g ||
         !g->ssd_streaming ||
         g->quality ||
@@ -23439,10 +23520,19 @@ static bool metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
         return true;
     }
 
-    const ds4_layer_weights *layer = &weights->layer[il];
-    if (!metal_graph_streaming_expert_cache_seed_layer_expected(g, layer)) {
-        return true;
-    }
+        const ds4_layer_weights *layer = &weights->layer[il];
+        if (!metal_graph_streaming_expert_cache_seed_layer_expected(g, layer)) {
+            continue;
+        }
+        /* Multi-tier: only the layers that live on the active tier may be
+         * seeded into its expert pool.  Layers owned by another tier are
+         * seeded when that tier is active (or demand-loaded by the per-token
+         * MoE); pooling them here would allocate the whole model's hot experts
+         * on one GPU and fail. */
+        if (g->placement && il < DS4_MAX_LAYER &&
+            g->placement[il + 1] != g->active_tier) {
+            continue;
+        }
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     if (gate_row_bytes == 0 || down_row_bytes == 0 ||
@@ -23766,7 +23856,11 @@ static bool metal_graph_decode_cuda_selected_load(
         uint32_t                  il,
         uint64_t                  gate_expert_bytes,
         uint64_t                  down_expert_bytes) {
-#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+/* Per-token streaming demand-fill (read the selected ids, then seed the expert
+ * pool).  Shared by CUDA and the multi-tier Vulkan plain path: enabled on
+ * Vulkan -- it is what populates the dynamic tier's pool each token. */
+#if defined(DS4_VULKAN_BUILD) || \
+    (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__))
     if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
         !model ||
         !metal_graph_router_selected(g) ||
@@ -23839,7 +23933,10 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
         uint32_t                  n_tokens,
         uint64_t                  gate_expert_bytes,
         uint64_t                  down_expert_bytes) {
-#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+/* Prefill batch demand-fill: same shared CUDA/Vulkan-multi gate as the
+ * per-token path (see metal_graph_decode_cuda_selected_load). */
+#if defined(DS4_VULKAN_BUILD) || \
+    (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__))
     if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
         !model ||
         !metal_graph_batch_router_selected(g) ||
@@ -24591,6 +24688,11 @@ static bool metal_graph_encode_decode_layer_phase(
         const int this_tier = g->placement[il + 1];
         if (!metal_graph_set_active_tier_decode(g, this_tier)) return false;
     }
+#if defined(DS4_VULKAN_BUILD)
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+        fprintf(stderr, "ds4: DBG phase il=%u tier=%d pos=%u tok=%d\n",
+                il, g->active_tier, pos, token);
+#endif
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -24675,9 +24777,23 @@ static bool metal_graph_encode_decode_layer_phase(
         layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
         layer->ffn_gate_inp->dim[0] == DS4_N_EMBD &&
         layer->ffn_gate_inp->dim[1] == DS4_N_EXPERT;
+static unsigned metal_graph_vk_split_count = 0;
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
+        } \
+        if (ok && getenv("DS4_VULKAN_SPLIT_STAGES") != NULL) { \
+            const char *_spl = getenv("DS4_VULKAN_SPLIT_STAGE_NAME"); \
+            const char *_ev = getenv("DS4_VULKAN_SPLIT_EVERY"); \
+            if (_spl && _spl[0] && strstr((name), _spl) == NULL) { \
+                /* filter: split only at the named stage */ \
+            } else if (_ev && _ev[0] && (++metal_graph_vk_split_count % (unsigned)strtoul(_ev, NULL, 10)) != 0) { \
+                /* every-N: split on a periodic stage index */ \
+            } else { \
+                (void)ds4_gpu_end_commands(); \
+                if (getenv("DS4_VULKAN_SPLIT_NOWAIT") == NULL) (void)ds4_gpu_synchronize(); \
+                (void)ds4_gpu_begin_commands(); \
+            } \
         } \
     } while (0)
     const bool tp_ablate_hcpre = metal_graph_tp_ablate("hcpre");
@@ -24872,10 +24988,18 @@ static bool metal_graph_encode_decode_layer_phase(
                 ok = ds4_gpu_rms_norm_plain_tensor(
                         metal_graph_flat_hc(g), metal_graph_cur_hc(g),
                         (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+#if defined(DS4_VULKAN_BUILD)
+                if (!ok && getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+                    fprintf(stderr, "ds4: DBG fail step=hc_pre_rms il=%u\n", il);
+#endif
                 if (ok) {
                     ok = metal_graph_matmul_plain_tensor(
                             metal_graph_hc_mix(g), model, layer->hc_attn_fn,
                             hc_dim, mix_hc, metal_graph_flat_hc(g), 1);
+#if defined(DS4_VULKAN_BUILD)
+                    if (!ok && getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+                        fprintf(stderr, "ds4: DBG fail step=hc_pre_mix il=%u\n", il);
+#endif
                 }
             }
         }
@@ -24894,9 +25018,13 @@ static bool metal_graph_encode_decode_layer_phase(
                                                              layer->attn_norm->abs_offset,
                                                              DS4_N_EMBD,
                                                              DS4_N_HC,
-                                                             DS4_N_HC_SINKHORN_ITER,
-                                                             DS4_HC_EPS,
-                                                             DS4_RMS_EPS) != 0;
+                                                              DS4_N_HC_SINKHORN_ITER,
+                                                              DS4_HC_EPS,
+                                                              DS4_RMS_EPS) != 0;
+#if defined(DS4_VULKAN_BUILD)
+            if (!ok && getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+                fprintf(stderr, "ds4: DBG fail step=hc_split il=%u\n", il);
+#endif
         }
         if (ok) {
             ok = metal_graph_check_hc_norm_fusion("attn",
@@ -24919,6 +25047,10 @@ static bool metal_graph_encode_decode_layer_phase(
                                        model,
                                        layer->hc_attn_scale->abs_offset,
                                        layer->hc_attn_base->abs_offset);
+#if defined(DS4_VULKAN_BUILD)
+        if (!ok && getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+            fprintf(stderr, "ds4: DBG fail step=hc_pre_legacy il=%u\n", il);
+#endif
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_pre");
     if (ok) {
@@ -25482,6 +25614,21 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      metal_graph_attn_norm(g), 1) != 0;
         }
         DS4_METAL_PROFILE_DECODE_STAGE("compressor_proj");
+#if defined(DS4_VULKAN_BUILD)
+        /* Bisect: mirror the debug-dump sync sequence (flush the open scope,
+         * drain, reopen) to test whether the attention's read of the just
+         * computed comp_kv_cur / comp_sc_cur needs an explicit wait.  Env-only,
+         * no-op by default. */
+        if (getenv("DS4_VULKAN_SYNC_PHASE") != NULL) {
+            (void)ds4_gpu_flush_commands();
+            (void)ds4_gpu_synchronize();
+            (void)ds4_gpu_begin_commands();
+        }
+#endif
+        metal_graph_debug_dump_f16_tensor("comp_kv_cur", metal_graph_comp_kv_cur(g),
+                                          comp_width, il, pos);
+        metal_graph_debug_dump_f16_tensor("comp_sc_cur", metal_graph_comp_sc_cur(g),
+                                          comp_width, il, pos);
         const uint32_t comp_row = g->layer_n_comp[il];
         /* Eligible Metal decode emit-path fusion: the pooled attention and
          * indexer compressor rows each need norm + RoPE + quantize (+ F16
@@ -25531,6 +25678,11 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         true,
                                                         comp_finalize_fuse) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("compressor_update");
+        if (g->layer_attn_state_kv[il]) {
+            metal_graph_debug_dump_tensor(
+                    "comp_state_kv", g->layer_attn_state_kv[il],
+                    g->layer_attn_state_kv[il]->bytes / sizeof(float), il, pos);
+        }
         if (ok && emit && !comp_finalize_fuse) {
             ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
             if (!comp_row_view) {
@@ -25640,6 +25792,11 @@ static bool metal_graph_encode_decode_layer_phase(
                                                             true,
                                                             comp_finalize_fuse) != 0;
             DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_update");
+            if (g->layer_index_state_kv[il]) {
+                metal_graph_debug_dump_tensor(
+                        "index_state_kv", g->layer_index_state_kv[il],
+                        g->layer_index_state_kv[il]->bytes / sizeof(float), il, pos);
+            }
             if (ok && emit && comp_finalize_fuse) {
                 /* One dispatch finalizes both pooled compressor rows; the
                  * attention row lives at offset 0 of the staging tensor and
@@ -25764,6 +25921,20 @@ static bool metal_graph_encode_decode_layer_phase(
                                                            g->layer_n_index_comp[il],
                                                            1,
                                                            DS4_N_INDEXER_TOP_K) != 0;
+                if (ok) {
+                    metal_graph_debug_dump_tensor(
+                            "indexer_scores", metal_graph_indexer_scores(g),
+                            (uint64_t)DS4_N_INDEXER_HEAD *
+                                    g->layer_n_index_comp[il],
+                            il, pos);
+                    if (metal_graph_comp_selected(g)) {
+                        metal_graph_debug_dump_i32_tensor(
+                                "comp_selected", metal_graph_comp_selected(g),
+                                metal_graph_comp_selected(g)->bytes /
+                                        sizeof(int32_t),
+                                il, pos);
+                    }
+                }
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_topk",
                                                                     il,
@@ -25822,6 +25993,31 @@ static bool metal_graph_encode_decode_layer_phase(
     if (stop_before_attn) return ok;
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+        /* Correctness bisection: everything the attention reads that was
+         * written at EARLIER positions (raw rows, compressed rows, indexer
+         * query).  Dumping here does not mask a divergence in them: their
+         * content was fixed by previous tokens' submits. */
+        metal_graph_debug_dump_tensor("raw_cache_all", raw_cache,
+                                      raw_cache->bytes / sizeof(float), il, pos);
+        if (comp_cache) {
+            if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+                metal_graph_debug_dump_f16_tensor("comp_cache_all", comp_cache,
+                                                  comp_cache->bytes / 2, il, pos);
+            } else {
+                metal_graph_debug_dump_tensor("comp_cache_all", comp_cache,
+                                              comp_cache->bytes / sizeof(float),
+                                              il, pos);
+            }
+        }
+        if (g->layer_index_comp_cache[il]) {
+            metal_graph_debug_dump_tensor(
+                    "index_comp_all", g->layer_index_comp_cache[il],
+                    g->layer_index_comp_cache[il]->bytes / sizeof(float), il, pos);
+        }
+        metal_graph_debug_dump_tensor("indexer_q", metal_graph_indexer_q(g),
+                                      (uint64_t)DS4_N_INDEXER_HEAD *
+                                              DS4_N_INDEXER_HEAD_DIM,
+                                      il, pos);
         const bool indexed_attention = n_comp != 0 && comp_selected != NULL && n_selected != 0;
         const bool cuda_tp_attn_heads_requested = g->cuda_tp_attn_heads;
         const uint32_t cuda_tp_heads = DS4_N_HEAD / 2u;
@@ -27163,6 +27359,14 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool overlap_selected_shared =
         ok &&
         g->tp_world < 2 &&
+#if defined(DS4_VULKAN_BUILD)
+        /* Multi-tier: the overlap's readback signal + early-submit flush use
+         * backend-global fences/command-buffer state while the main thread
+         * switches tiers between layers — racy (non-deterministic output).
+         * Run the selected load and shared-expert compute sequentially until
+         * those paths are made per-tier. */
+        g->placement == NULL &&
+#endif
         !decode_stage_profile &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
@@ -27173,6 +27377,15 @@ static bool metal_graph_encode_decode_layer_phase(
          cuda_selected_shared_overlap);
     const bool async_selected_load =
         overlap_selected_shared &&
+#if defined(DS4_VULKAN_BUILD)
+        /* Multi-tier Vulkan: the async selected load runs on a helper thread
+         * that touches backend globals (active device, expert pool, staging
+         * windows) while the main thread may have switched to another tier —
+         * a racy mix that corrupts the loaded experts non-deterministically.
+         * Keep the selected+shared overlap but do the store synchronously on
+         * the main thread, which is on the layer's home tier. */
+        g->placement == NULL &&
+#endif
         ((iq2_selected_shared_overlap &&
           metal_graph_use_iq2_selected_async_load(g)) ||
          (mxfp4_selected_shared_overlap &&
@@ -30533,6 +30746,14 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
     metal_graph_dspark_capture_begin(g);
 
+#if defined(DS4_VULKAN_BUILD)
+    /* Multi-tier: the previous token's tail-layer scope on another tier can
+     * still be in flight (the logits readback only drained the head tier) and
+     * would race this token's embedding write into the same double-buffered
+     * cur_hc slot.  Drain every tier before touching cur_hc. */
+    if (g->placement) ds4_vulkan_synchronize_all_tiers();
+#endif
+
     /* write the embedded token on the embedding tier. Single-
      * tier: emb_tier == 0 == active_tier; no-op. Multi-tier: switch to
      * emb_tier (no cross-device copy needed — embed writes from scratch). */
@@ -33797,6 +34018,11 @@ static bool metal_graph_encode_layer_batch(
     return ok;
 }
 
+/* Vulkan multi-tier Fase 8e: tiers whose weights the backend keeps resident
+ * in its persistent per-device cache.  Decode skips the per-layer window
+ * restaging on these; zero on every other backend (and on single-tier). */
+static uint8_t g_tier_weights_resident[DS4_MAX_GPUS];
+
 static bool metal_graph_eval_token_raw_swa_streaming(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -33808,6 +34034,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
         return false;
     }
+    metal_graph_trace("token.begin pos=%u logits=%d", pos, logits != NULL);
 
     const bool profile =
         glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
@@ -33817,6 +34044,14 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
     metal_graph_dspark_capture_begin(g);
+
+#if defined(DS4_VULKAN_BUILD)
+    /* Multi-tier: the previous token's tail-layer scope on another tier can
+     * still be in flight (the logits readback only drained the head tier) and
+     * would race this token's embedding write into the same double-buffered
+     * cur_hc slot.  Drain every tier before touching cur_hc. */
+    if (g->placement) ds4_vulkan_synchronize_all_tiers();
+#endif
 
     const bool static_decode_map =
         metal_graph_stream_decode_static_map_enabled() &&
@@ -33838,9 +34073,15 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
     } else {
         g->streaming_static_decode_map_current = false;
-        ok = metal_graph_stream_map_token(model, weights);
+        const bool emb_resident =
+            g->placement && g->emb_tier >= 0 && g->emb_tier < DS4_MAX_GPUS &&
+            g_tier_weights_resident[g->emb_tier] != 0;
+        if (!emb_resident) ok = metal_graph_stream_map_token(model, weights);
     }
-    if (ok && !static_decode_map && DS4_N_LAYER > 0) {
+    const bool layer0_resident =
+        g->placement && g->placement[1] >= 0 && g->placement[1] < DS4_MAX_GPUS &&
+        g_tier_weights_resident[g->placement[1]] != 0;
+    if (ok && !static_decode_map && DS4_N_LAYER > 0 && !layer0_resident) {
         metal_graph_stream_readahead_layer_decode(model, weights, 0);
     }
     /* Seed the expert pool from the static hotlist once, AFTER the static
@@ -33854,7 +34095,11 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                                                                   model,
                                                                   weights);
     }
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+        fprintf(stderr, "ds4: DBG stream pos=%u pre seed-ok=%d\n", pos, ok);
     if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+        fprintf(stderr, "ds4: DBG stream pos=%u pre begin-ok=%d\n", pos, ok);
     if (ok) {
         ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(g),
                                            model->map,
@@ -33865,6 +34110,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                                            DS4_N_EMBD,
                                            DS4_N_HC) != 0;
     }
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+        fprintf(stderr, "ds4: DBG stream pos=%u pre embed-ok=%d\n", pos, ok);
     if (batch_static_decode) {
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_decode_layer(g,
@@ -33912,6 +34159,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                 fprintf(stderr, "ds4: Metal synchronize after batched SSD streaming graph eval failure also failed\n");
             }
         }
+        metal_graph_trace("token.end pos=%u ok=%d path=batched", pos, ok);
         return ok;
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -33920,27 +34168,38 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     double execute_s = 0.0;
     const bool layer_profile = getenv("DS4_METAL_GRAPH_LAYER_PROFILE") != NULL;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const double t_trace0 = now_sec();
         const double tl0 = (profile || layer_profile) ? now_sec() : 0.0;
         /* Multi-tier: switch to this layer's home tier BEFORE staging its
          * model spans, so the windows land on the device that will run it
          * (metal_graph_encode_decode_layer below would switch too late). */
+        bool this_tier_resident = false;
         if (g->placement) {
             const int this_tier = g->placement[il + 1];
             if (!metal_graph_set_active_tier_decode(g, this_tier)) {
                 ok = false;
                 break;
             }
+            this_tier_resident =
+                this_tier >= 0 && this_tier < DS4_MAX_GPUS &&
+                g_tier_weights_resident[this_tier] != 0;
         }
-        if (!static_decode_map && !metal_graph_stream_map_layer_decode(model, weights, il)) {
+        const double tl_stage = now_sec();
+        if (!static_decode_map && !this_tier_resident &&
+            !metal_graph_stream_map_layer_decode(model, weights, il)) {
             ok = false;
             break;
         }
-        if (!static_decode_map && il + 1 < DS4_N_LAYER) {
+        if (!static_decode_map && !this_tier_resident &&
+            il + 1 < DS4_N_LAYER) {
             metal_graph_stream_readahead_layer_decode(model, weights, il + 1);
-        } else if (!static_decode_map && logits) {
+        } else if (!static_decode_map && !this_tier_resident && logits) {
             metal_graph_stream_readahead_output(model, weights);
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
+        metal_graph_trace("layer.begin il=%u tier=%d resident=%d stage_ms=%.2f",
+                          il, g->active_tier, (int)this_tier_resident,
+                          (tl_stage - t_trace0) * 1000.0);
         bool encoded_layer = false;
         if (ok) {
             ok = metal_graph_encode_decode_layer(g,
@@ -33963,7 +34222,17 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
         const double tl_encoded = (profile || layer_profile) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
+#if defined(DS4_VULKAN_BUILD)
+        /* Bisect: drain every tier after each layer to localize a cross-scope
+         * dependency in the multi-tier decode path.  Env-only, no-op by default. */
+        if (ok && g->placement && getenv("DS4_VULKAN_SYNC_EACH_LAYER") != NULL) {
+            ds4_vulkan_synchronize_all_tiers();
+        }
+#endif
         const double tl_done = (profile || layer_profile) ? now_sec() : 0.0;
+        metal_graph_trace("layer.end il=%u tier=%d pos=%u total_ms=%.2f",
+                          il, g->active_tier, pos,
+                          (now_sec() - t_trace0) * 1000.0);
         if (profile) {
             encode_s += tl_encoded - tl0;
             execute_s += tl_done - tl_encoded;
@@ -33979,22 +34248,80 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
     }
 
+#if defined(DS4_VULKAN_BUILD)
+    /* DBG: per-pos checksum of the final hidden state (after the last layer,
+     * still on the last layer's tier) so a divergence across runs can be
+     * localized to the exact position it appears at. */
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL && ok && DS4_N_LAYER > 0) {
+        if (g->placement) {
+            const int last_tier = g->placement[DS4_N_LAYER];
+            if (last_tier >= 0 && last_tier < DS4_MAX_GPUS &&
+                !metal_graph_set_active_tier_decode(g, last_tier)) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            const uint64_t hc_n = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+            static float *hc_buf = NULL;
+            if (!hc_buf) hc_buf = xmalloc((size_t)hc_n * sizeof(float));
+            if (hc_buf &&
+                ds4_gpu_tensor_read(metal_graph_cur_hc(g), 0, hc_buf,
+                                    hc_n * sizeof(float)) != 0) {
+                unsigned long long h1 = 1469598103934665603ull;
+                double mag = 0.0;
+                for (uint64_t i = 0; i < hc_n; i++) {
+                    unsigned int b;
+                    memcpy(&b, &hc_buf[i], sizeof(b));
+                    h1 = (h1 ^ (unsigned long long)b) * 1099511628211ull;
+                    mag += (double)hc_buf[i] * (double)hc_buf[i];
+                }
+                fprintf(stderr, "ds4: DBG stream pos=%u hc-sum=%llx mag=%.6f\n",
+                        pos, h1, mag);
+            }
+        }
+    }
+#endif
+
     if (ok && logits && !static_decode_map) {
         /* Multi-tier: stage the output spans on the head tier. */
+        int head_tier = 0;
         if (g->placement) {
-            (void)metal_graph_set_active_tier_decode(
-                    g, g->placement[DS4_N_LAYER + 1]);
+            head_tier = g->placement[DS4_N_LAYER + 1];
+            (void)metal_graph_set_active_tier_decode(g, head_tier);
         }
-        ok = metal_graph_stream_map_output(model, weights);
+        const bool head_resident =
+            head_tier >= 0 && head_tier < DS4_MAX_GPUS &&
+            g_tier_weights_resident[head_tier] != 0;
+        if (!head_resident) ok = metal_graph_stream_map_output(model, weights);
+        if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+            fprintf(stderr, "ds4: DBG stream pos=%u output-map ok=%d head_tier=%d resident=%d\n",
+                    pos, ok, head_tier, (int)head_resident);
     }
     const double t_head0 = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+        fprintf(stderr, "ds4: DBG stream pos=%u head-begin ok=%d logits=%d\n",
+                pos, ok, logits != NULL);
     if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+        fprintf(stderr, "ds4: DBG stream pos=%u head-encode ok=%d\n", pos, ok);
     const double t_head_encoded = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_end_commands() != 0;
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+        fprintf(stderr, "ds4: DBG stream pos=%u head-end ok=%d\n", pos, ok);
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+        fprintf(stderr, "ds4: DBG stream pos=%u head-read ok=%d\n", pos, ok);
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL && ok && logits) {
+        uint32_t am = 0;
+        for (uint32_t vi = 1; vi < DS4_N_VOCAB; vi++) {
+            if (logits[vi] > logits[am]) am = vi;
+        }
+        fprintf(stderr, "ds4: DBG stream pos=%u argmax=%u top=%.4f l0=%.4f\n",
+                pos, am, logits[am], logits[0]);
     }
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
 
@@ -34018,6 +34345,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             fprintf(stderr, "ds4: Metal synchronize after SSD streaming graph eval failure also failed\n");
         }
     }
+    metal_graph_trace("token.end pos=%u ok=%d", pos, ok);
     return ok;
 }
 
@@ -34355,6 +34683,15 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         ds4_gpu_graph     *g,
         const ds4_model   *model,
         const ds4_weights *weights) {
+#if defined(DS4_VULKAN_BUILD)
+    /* Vulkan multi-tier: this single global seed runs with the embedding tier
+     * active (a static tier with no pool, and whose experts are already in the
+     * persistent cache).  Seeding every layer there is both meaningless and
+     * wrong.  The dynamic tier's pool demand-fills from the per-token MoE load
+     * (which honours hotness + recency pin); a proper per-tier hotlist seed is
+     * a follow-up. */
+    if (ds4_vulkan_multi_tier_active()) return true;
+#endif
     if (!metal_graph_streaming_expert_hotlist_enabled(g)) return true;
     if (!model || !weights) return false;
 
@@ -34385,6 +34722,9 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
     if (preload_count == 0) return true;
     const uint32_t current_count =
         ds4_gpu_stream_expert_cache_current_count();
+    if (getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
+        fprintf(stderr, "ds4: DBG hotlist cache_budget=%u preload=%u current=%u\n",
+                cache_budget, preload_count, current_count);
     const char *path = glm_graph_env_value("DS4_ROCM_STREAMING_EXPERT_HOTLIST",
                                            "DS4_METAL_STREAMING_EXPERT_HOTLIST");
     const bool from_file = path && path[0];
@@ -49539,6 +49879,12 @@ static bool glm_graph_encode_sparse_ffn_one(
 #else
             glm_graph_layer_uses_generic_routed_moe(l) &&
 #endif
+#if defined(DS4_VULKAN_BUILD)
+            /* Multi-tier: the async load helper thread races the main
+             * thread's tier switches on the backend globals (see the decode
+             * gate above). */
+            g->placement == NULL &&
+#endif
             glm_graph_use_streaming_selected_async_load(g);
         async_path_profiled = false;
         uint64_t selected_event = 0;
@@ -60366,6 +60712,18 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
                                                     : 4096;
     const uint32_t prefill_cap =
         engine_planner_prefill_cap(est_ctx, e ? e->prefill_chunk : 0);
+    /* Planner batch-scratch cap: the runtime sizes its chunked-prefill
+     * workspace from the ACTUAL prompt (min(prompt_len, 4096)), which for the
+     * common short-prompt / large-context case is far below the worst-case
+     * 4096.  Reserving the full 4096-based batch scratch (batch_*_by_tier +
+     * indexer_scores/comp_mask, which scale with pc) at a large ctx swamps the
+     * weight budget and makes the placement refuse contexts that would fit.
+     * Cap the planner's pc at 512 so the reservation tracks the runtime's
+     * per-prompt sizing; a caller that wants large chunked prefill sets
+     * --prefill-chunk explicitly, which engine_planner_prefill_cap honors
+     * verbatim (capped to 4096 here). */
+    const uint32_t planner_pc_cap =
+        (e && e->prefill_chunk != 0) ? prefill_cap : (prefill_cap > 512u ? 512u : prefill_cap);
 
     /* comp_cap and attn_comp_stage_cap: same formula as runtime line 10597.
      * If no layer has a compression ratio set (test path, where
@@ -60386,7 +60744,7 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
         attn_comp_stage_cap = prefill_cap / min_ratio + 2u;
         if (attn_comp_stage_cap < 2u) attn_comp_stage_cap = 2u;
     }
-    const uint64_t pc = (uint64_t)prefill_cap;
+    const uint64_t pc = (uint64_t)planner_pc_cap;
 
     size_t total = 0;
 
@@ -65596,6 +65954,9 @@ int ds4_engine_generate_argmax(
                 fprintf(stderr, "ds4: failed to create multi-tier graph session\n");
                 return 1;
             }
+#if defined(DS4_VULKAN_BUILD)
+            ds4_vulkan_debug_mem_report("after session create");
+#endif
             ds4_session_set_progress(s, progress, progress_ud);
             if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
                 ds4_session_set_progress(s, NULL, NULL);
@@ -69764,6 +70125,16 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     const uint32_t session_count =
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ?
         engine_placement_session_count(e) : 1u;
+    /* DS4_VULKAN_KV_IN_RAM: the per-layer KV cache lives in host-visible RAM
+     * (GTT), not VRAM, so it must NOT be charged to the per-tier VRAM budget:
+     * that budget goes to the persistent weight/expert cache instead.  No-op
+     * on backends/builds where the option is inactive (returns false).  The
+     * helper lives in the GPU-only section, hence the build guard here. */
+#if !defined(DS4_NO_GPU)
+    const bool kv_in_ram = metal_graph_kv_cache_in_ram();
+#else
+    const bool kv_in_ram = false;
+#endif
     ds4_context_memory mem =
         ds4_context_memory_estimate_with_prefill(DS4_BACKEND_CUDA,
                                                  est_ctx,
@@ -69772,22 +70143,26 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
         /* mem.total_bytes is used only as a sentinel; cache values are
          * re-derived per layer so placement follows the active model's
          * allocation geometry. */
-        for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
-            const size_t per_session =
-                DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ?
-                engine_glm_per_layer_kv_bytes_planner(il, est_ctx) :
-                engine_per_layer_kv_bytes_planner(il, est_ctx,
-                                                  e->prefill_chunk);
-            const size_t cache_bytes =
-                engine_size_mul_sat(per_session, session_count);
-            out[il + 1] = out[il + 1] > SIZE_MAX - cache_bytes ?
-                SIZE_MAX : out[il + 1] + cache_bytes;
+        if (!kv_in_ram) {
+            for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+                const size_t per_session =
+                    DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ?
+                    engine_glm_per_layer_kv_bytes_planner(il, est_ctx) :
+                    engine_per_layer_kv_bytes_planner(il, est_ctx,
+                                                      e->prefill_chunk);
+                const size_t cache_bytes =
+                    engine_size_mul_sat(per_session, session_count);
+                out[il + 1] = out[il + 1] > SIZE_MAX - cache_bytes ?
+                    SIZE_MAX : out[il + 1] + cache_bytes;
+            }
         }
     } else {
         /* Fallback: 128 MiB per layer as a static estimate. */
-        const size_t fallback_per_layer = engine_size_mul_sat(
-                (size_t)128ull * 1024ull * 1024ull, session_count);
-        for (uint32_t i = 1; i <= DS4_N_LAYER; i++) out[i] += fallback_per_layer;
+        if (!kv_in_ram) {
+            const size_t fallback_per_layer = engine_size_mul_sat(
+                    (size_t)128ull * 1024ull * 1024ull, session_count);
+            for (uint32_t i = 1; i <= DS4_N_LAYER; i++) out[i] += fallback_per_layer;
+        }
     }
     return 0;
 }
@@ -70106,6 +70481,10 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     ds4_layer_pack_config pcfg;
     memset(&pcfg, 0, sizeof(pcfg));
     pcfg.n_gpus = e->gpu_cfg.n_gpus;
+    int mgpu_dynamic = 0;
+    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+        if (e->gpu_cfg.dev_mode[d] == 1) { mgpu_dynamic = 1; break; }
+    }
     const size_t cublas_workspace_overhead = (size_t)64ull * 1024ull * 1024ull;
     for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
         /* Read post-subtract budgets from e->gpu_cfg (NOT the caller's
@@ -70113,16 +70492,37 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
          * the packer. */
         size_t budget = e->gpu_cfg.vram_bytes[d];
         size_t reserve = e->gpu_cfg.safety_margin_bytes + cublas_workspace_overhead;
+#if defined(DS4_VULKAN_BUILD)
+        if (mgpu_dynamic) {
+            /* Vulkan multi-tier keeps every weight of a static tier resident
+             * in the persistent device-local cache, so the runtime graph
+             * scratch (Class-P decode + the per-tier prefill/output
+             * workspaces) coexists with the full weight set.  The static
+             * planner estimate under-counts that scratch by ~2-4 GiB
+             * (measured: tier 0 filled to <50 MiB free, so the next
+             * allocation failed mid-decode).  Reserve an extra 3 GiB per tier
+             * so the packer leaves a real graph/scratch headroom. */
+            reserve += (size_t)1536ull * 1024ull * 1024ull;
+        }
+#endif
         pcfg.gpu_budget_bytes[d] = budget > reserve ? budget - reserve : 0;
+#if defined(DS4_VULKAN_BUILD)
+        if (getenv("DS4_VULKAN_DEBUG_BUDGET") != NULL) {
+            fprintf(stderr,
+                    "ds4: DBG budget tier=%d vram=%.2fGiB overhead=%.2fGiB "
+                    "reserve=%.2fGiB pack_budget=%.2fGiB\n",
+                    d,
+                    (double)budget / 1073741824.0,
+                    (double)per_tier_overhead / 1073741824.0,
+                    (double)reserve / 1073741824.0,
+                    (double)pcfg.gpu_budget_bytes[d] / 1073741824.0);
+        }
+#endif
     }
 
     const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
     if (cuda_tp_ep && engine_reserve_cuda_ep_output_shards(e, &pcfg) != 0) {
         return -1;
-    }
-    int mgpu_dynamic = 0;
-    for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
-        if (e->gpu_cfg.dev_mode[d] == 1) { mgpu_dynamic = 1; break; }
     }
     int placement_rc;
     if (!cuda_tp_ep && mgpu_dynamic) {
@@ -70229,6 +70629,44 @@ static int engine_append_device_cache_range(
                                            t->abs_offset, t->bytes);
 }
 
+/* Coalesce a tier's cache ranges so a weight bind spanning several adjacent
+ * tensors resolves against ONE cache window: the Vulkan model-window rule
+ * (vulkan_bind_model_span) requires a single buffer covering the whole bound
+ * span, and per-tensor windows cannot cover e.g. the HC base/mix/scale trio
+ * that some kernels bind as one region.  Only small gaps are merged so an
+ * intentionally excluded region (the multi-GB routed-expert blobs on a
+ * dynamic tier) can never be pulled into the cache as dead bytes, and the
+ * merged window is capped so the loader's per-range host staging buffer stays
+ * bounded (an uncapped merge coalesces a whole tier into one 12 GiB range
+ * and OOMs the host). */
+#define ENGINE_CACHE_MERGE_GAP  (64u * 1024u)
+#define ENGINE_CACHE_MERGE_MAX  (64u * 1024u * 1024u)
+
+static int engine_device_cache_range_cmp(const void *a, const void *b) {
+    const ds4_tensor_range *ra = (const ds4_tensor_range *)a;
+    const ds4_tensor_range *rb = (const ds4_tensor_range *)b;
+    if (ra->source_offset < rb->source_offset) return -1;
+    if (ra->source_offset > rb->source_offset) return 1;
+    return 0;
+}
+
+static int engine_coalesce_device_cache_ranges(ds4_tensor_range *r, int n) {
+    if (n <= 1) return n;
+    qsort(r, (size_t)n, sizeof(*r), engine_device_cache_range_cmp);
+    int m = 0;
+    for (int i = 1; i < n; i++) {
+        const uint64_t end = r[m].source_offset + r[m].bytes;
+        const uint64_t new_end = r[i].source_offset + r[i].bytes;
+        if (r[i].source_offset <= end + ENGINE_CACHE_MERGE_GAP &&
+            new_end - r[m].source_offset <= ENGINE_CACHE_MERGE_MAX) {
+            if (new_end > end) r[m].bytes = new_end - r[m].source_offset;
+        } else {
+            r[++m] = r[i];
+        }
+    }
+    return m + 1;
+}
+
 /* Install per-device selective caches for GPU-placed tensors. Skips any
  * tensor whose entry is placed on CPU — that case must be rejected at a
  * higher level for this PR (execution wiring not yet shipped). */
@@ -70331,6 +70769,15 @@ static int engine_install_per_device_caches(ds4_engine *e) {
             }
             continue;
         }
+#if defined(DS4_VULKAN_BUILD)
+        /* Vulkan multi-tier dynamic tier: its routed experts do not fit in
+         * VRAM, so the persistent weight cache holds only the dense tensors
+         * and the experts are streamed per layer from the model file. */
+        if (e->gpu_cfg.dev_mode[logical_tier] == 1 &&
+            engine_deepseek_routed_expert_tensor(e, t, entry, NULL)) {
+            continue;
+        }
+#endif
         uint64_t expert_bytes = 0;
         const bool shard_experts =
             cuda_tp_ep && engine_deepseek_routed_expert_tensor(
@@ -70388,6 +70835,8 @@ static int engine_install_per_device_caches(ds4_engine *e) {
 
     for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
         if (per_dev_n[d] == 0) continue;
+        per_dev_n[d] = engine_coalesce_device_cache_ranges(per_dev_ranges[d],
+                                                           per_dev_n[d]);
         const int physical_device = g_gpu[d].device_id;
         uint64_t cache_bytes = 0;
         for (int i = 0; i < per_dev_n[d]; i++) {
@@ -70402,6 +70851,7 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                 d, physical_device,
                 (double)cache_bytes / 1073741824.0,
                 per_dev_n[d]);
+#if !defined(DS4_VULKAN_BUILD)
         int cache_rc = ds4_gpu_device_cache_tensors(physical_device,
                                                      per_dev_ranges[d],
                                                      per_dev_n[d]);
@@ -70412,7 +70862,36 @@ static int engine_install_per_device_caches(ds4_engine *e) {
                     d, physical_device, per_dev_n[d], cache_rc);
             goto cleanup;
         }
+#else
+        (void)physical_device;
+#endif
     }
+#if defined(DS4_VULKAN_BUILD)
+    /* Stage all tiers in parallel: one worker thread per VkDevice/queue, so
+     * the slow x1 links are filled concurrently (Fase 8e). */
+    {
+        int multi_ids[DS4_MAX_GPUS];
+        const ds4_tensor_range *multi_ranges[DS4_MAX_GPUS];
+        int multi_counts[DS4_MAX_GPUS];
+        int multi_n = 0;
+        for (int d = 0; d < e->gpu_cfg.n_gpus && d < DS4_MAX_GPUS; d++) {
+            if (per_dev_n[d] == 0) continue;
+            multi_ids[multi_n] = g_gpu[d].device_id;
+            multi_ranges[multi_n] = per_dev_ranges[d];
+            multi_counts[multi_n] = per_dev_n[d];
+            multi_n++;
+        }
+        if (multi_n > 0 &&
+            ds4_vulkan_device_cache_tensors_multi(multi_n, multi_ids,
+                                                  multi_ranges,
+                                                  multi_counts) != 0) {
+            fprintf(stderr,
+                    "ds4: parallel device cache load failed (%d tiers)\n",
+                    multi_n);
+            goto cleanup;
+        }
+    }
+#endif
     rc = 0;
 
 cleanup:
@@ -71832,6 +72311,31 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
+#if defined(DS4_VULKAN_BUILD)
+            /* The backend just cached each tier's weights (static tiers own
+             * dense + experts, the dynamic tier dense only).  Record which
+             * tiers are fully resident so decode can skip the per-layer
+             * window restaging there. */
+            for (int t = 0; t < DS4_MAX_GPUS; t++) g_tier_weights_resident[t] = 0;
+            if (ds4_vulkan_multi_tier_active()) {
+                for (int t = 0; t < e->gpu_cfg.n_gpus && t < DS4_MAX_GPUS; t++) {
+                    g_tier_weights_resident[t] =
+                        (e->gpu_cfg.dev_mode[t] == 0);
+                }
+                /* Register layer -> logical-tier ownership once, so the pool
+                 * and seed operations resolve their target device from the
+                 * LAYER they name instead of the mutable selected device. */
+                {
+                    int layer_tier[DS4_MAX_LAYER];
+                    const uint32_t nl = DS4_N_LAYER < DS4_MAX_LAYER
+                                        ? (uint32_t)DS4_N_LAYER
+                                        : (uint32_t)DS4_MAX_LAYER;
+                    for (uint32_t il = 0; il < nl; il++)
+                        layer_tier[il] = e->placement[il + 1];
+                    ds4_vulkan_set_layer_placement(layer_tier, nl);
+                }
+            }
+#endif
             if (engine_install_dspark_support_cache(e) != 0) {
                 ds4_engine_close(e);
                 *out = NULL;
@@ -71843,6 +72347,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
              * non-expert decode spans (its experts stream through the pool). */
             if (e->ssd_streaming) ds4_gpu_set_ssd_streaming(1);
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+            /* Per-expert slab size for the streaming pool budget.  The pool is
+             * per-tier (its globals live in the per-device context), so this
+             * must be set AFTER each tier switch below, exactly like the pool
+             * budget and layer count -- otherwise the single-tier assignment
+             * (which sits after this branch's early return) never runs on the
+             * multi-tier path and the budget collapses to the minimum. */
+            uint64_t tier_slab_expert_bytes = 0;
+            (void)ds4_streaming_routed_expert_bytes(&e->weights,
+                                                    &tier_slab_expert_bytes);
             for (int t = 0; t < e->gpu_cfg.n_gpus; t++) {
                 int ls = -1, le = -1;
                 for (int il = 0; il < (int)DS4_N_LAYER; il++) {
@@ -71855,7 +72368,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 const bool inc_tok = (e->placement[0] == t);
                 const bool inc_out = (e->placement[DS4_N_LAYER + 1] == t);
                 if (ds4_gpu_set_current_device(t) != 0) continue;
-                ds4_gpu_set_streaming_expert_cache_layer_count(DS4_N_LAYER);
+                /* Only the layers this tier runs share its expert-pool budget:
+                 * the dynamic tier's dense slice leaves most of its VRAM free,
+                 * so dividing over its ~22 layers (not all 43) roughly doubles
+                 * the resident hot-expert slots per layer. */
+                ds4_gpu_set_streaming_expert_cache_layer_count(
+                        (uint32_t)(le - ls + 1));
+                if (tier_slab_expert_bytes != 0) {
+                    ds4_gpu_set_streaming_expert_cache_expert_bytes(
+                            tier_slab_expert_bytes);
+                }
                 if (e->ssd_streaming && e->ssd_streaming_cache_experts > 0) {
                     ds4_gpu_set_streaming_expert_cache_budget(
                             e->ssd_streaming_cache_experts);
