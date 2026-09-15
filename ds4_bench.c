@@ -700,8 +700,8 @@ int main(int argc, char **argv) {
         char layout[256];
         if (format_gpu_layout_line(&gpu_cfg, was_auto,
                                    layout, sizeof(layout)) > 0) {
-            fprintf(stdout, "%s\n", layout);
-            fflush(stdout);
+            fprintf(stderr, "%s\n", layout);
+            fflush(stderr);
         }
         if (ds4_engine_create_with_gpu_config(
                 &engine, &opt, &gpu_cfg) != 0) return 1;
