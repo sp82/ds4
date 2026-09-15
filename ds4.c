@@ -17951,6 +17951,17 @@ static inline ds4_gpu_tensor *metal_graph_prefill_tokens(const ds4_gpu_graph *g)
     return g->prefill_tokens_by_tier[g->emb_tier];
 }
 
+/* Token ids on the currently active tier.  The per-layer FFN batch binds the
+ * token tensor on the layer's home tier, so multi-tier needs the active tier's
+ * copy (all tiers are uploaded in lockstep).  Falls back to the embedding copy. */
+static inline ds4_gpu_tensor *metal_graph_prefill_tokens_active(const ds4_gpu_graph *g) {
+    if (g->placement && g->active_tier >= 0 && g->active_tier < DS4_MAX_GPUS &&
+        g->prefill_tokens_by_tier[g->active_tier] != NULL) {
+        return g->prefill_tokens_by_tier[g->active_tier];
+    }
+    return g->prefill_tokens_by_tier[g->emb_tier];
+}
+
 /* Class P accessors. Each Class P kernel-scratch buffer is
  * replicated across every tier the placement uses; the active_tier field
  * names the slot the current dispatch step reads/writes. Single-tier paths
@@ -19978,10 +19989,14 @@ static bool metal_graph_alloc_raw_cap(
                     g, shared_prefill_workspace);
         }
     } else {
-        g->prefill_tokens_by_tier[g->emb_tier] =
-            ds4_gpu_tensor_alloc_ptr_on(g->emb_tier, pc * sizeof(int32_t));
         for (int t = 0; t < DS4_MAX_GPUS; t++) {
             if (!used_tier[t]) continue;
+            /* Token ids must be resident on every tier that runs a batch
+             * router: the per-layer FFN batch binds the token tensor on the
+             * layer's home tier (hash routing / vision), not on the embedding
+             * tier.  One copy per used tier; uploaded in lockstep. */
+            g->prefill_tokens_by_tier[t] =
+                ds4_gpu_tensor_alloc_ptr_on(t, pc * sizeof(int32_t));
             g->batch_cur_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
             g->batch_next_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
             g->batch_flat_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
@@ -30950,6 +30965,40 @@ static bool metal_graph_upload_prompt_tokens(
     return ok;
 }
 
+/* Upload prompt token ids to every used tier's copy, so the per-layer batch
+ * router can bind them on each layer's home tier.  Without this the token
+ * tensor lived only on the embedding tier and a batch router on another tier
+ * raised a TIER MISMATCH / GPUVM fault.  Single-tier writes just tier 0. */
+static bool metal_graph_upload_prompt_tokens_all(
+        ds4_gpu_graph   *g,
+        const token_vec *prompt,
+        uint32_t         pos0,
+        uint32_t         n_tokens) {
+    ds4_gpu_tensor *emb = metal_graph_prefill_tokens(g);
+    if (!g->placement || !emb) {
+        return metal_graph_upload_prompt_tokens(emb, prompt, pos0, n_tokens);
+    }
+    /* Write the ids to each tier's copy, switching the active device first:
+     * the backend's upload checks that the target tensor lives on the selected
+     * tier, so uploading to another tier needs that tier selected. */
+    const int prev = g->active_tier;
+    bool ok = true;
+    for (int t = 0; t < DS4_MAX_GPUS && ok; t++) {
+        ds4_gpu_tensor *dst = g->prefill_tokens_by_tier[t];
+        if (!dst) continue;
+        if (t != g->active_tier) {
+            if (ds4_gpu_set_current_device(t) != 0) { ok = false; break; }
+            g->active_tier = t;
+        }
+        ok = metal_graph_upload_prompt_tokens(dst, prompt, pos0, n_tokens);
+    }
+    if (g->active_tier != prev) {
+        (void)ds4_gpu_set_current_device(prev);
+        g->active_tier = prev;
+    }
+    return ok;
+}
+
 /* Rebuild ratio-4 compressor state after chunked prefill so a following decode
  * token sees the same rolling compression window. */
 static bool metal_graph_refresh_ratio4_compressor_state(
@@ -33452,7 +33501,7 @@ static bool metal_graph_encode_layer_ffn_batch(
 
     ds4_gpu_tensor *router_tokens = NULL;
     if (ok) {
-        router_tokens = ds4_gpu_tensor_view(metal_graph_prefill_tokens(g),
+        router_tokens = ds4_gpu_tensor_view(metal_graph_prefill_tokens_active(g),
                                               (uint64_t)g->batch_token_offset * sizeof(int32_t),
                                               (uint64_t)n_tokens * sizeof(int32_t));
         ok = router_tokens != NULL;
@@ -38337,7 +38386,7 @@ static bool metal_graph_prefill_layer_major(
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
 
-    bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
+    bool ok = metal_graph_upload_prompt_tokens_all(g, prompt, start, n_tokens);
     if (!ok) return false;
 
 #ifdef DS4_ROCM_BUILD
@@ -39307,7 +39356,7 @@ static bool metal_graph_verify_suffix_tops_impl(
     if (top_rows && !row_tops) return false;
 
     const double upload_t0 = timing ? now_sec() : 0.0;
-    bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
+    bool ok = metal_graph_upload_prompt_tokens_all(g, prompt, start, n_tokens);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                          metal_graph_prefill_tokens(g),
                                                          model,
@@ -76120,7 +76169,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         g->streaming_static_decode_map_current = false;
         ok = metal_graph_stream_map_token(&e->model, &e->weights);
     }
-    if (ok) ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), &span, 0, n_tokens);
+    if (ok) ok = metal_graph_upload_prompt_tokens_all(g, &span, 0, n_tokens);
     if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(metal_graph_batch_cur_hc(g), 0, input_hc, hc_bytes) != 0;
     } else if (ok) {
