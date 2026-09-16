@@ -578,15 +578,18 @@ static void vulkan_store_time_report(void) {
     const uint64_t sub = g_dbg_store_submit_us.load();
     const uint64_t bytes = g_dbg_store_bytes.load();
     const uint64_t calls = g_dbg_store_calls.load();
+    const uint64_t wait = g_pool_tel_wait_us.load();
     const double copy_ms = (double)copy / 1000.0;
     const double sub_ms = (double)sub / 1000.0;
+    const double wait_ms = (double)wait / 1000.0;
     const double mib = (double)bytes / (1024.0 * 1024.0);
     fprintf(stderr,
             "ds4: vulkan store-time: calls=%llu bytes=%.1f MiB "
-            "copy=%.1f ms (%.1f MiB/s) submit=%.1f ms total=%.1f ms\n",
+            "copy=%.1f ms (%.1f MiB/s) submit=%.1f ms "
+            "gpu_fence=%.1f ms total=%.1f ms\n",
             (unsigned long long)calls, mib, copy_ms,
             copy_ms > 0.0 ? mib / (copy_ms / 1000.0) : 0.0,
-            sub_ms, copy_ms + sub_ms);
+            sub_ms, wait_ms, copy_ms + sub_ms + wait_ms);
 }
 
 /* Count the reloads among the experts being loaded now: an expert whose
@@ -7316,6 +7319,223 @@ static const uint8_t *vulkan_expert_src(const ds4_gpu_stream_expert_table *t,
     return (const uint8_t *)t->model_map;
 }
 
+/* -------------------------------------------------------------------------
+ * Parallel expert-slab store (SSD bandwidth on the Vulkan pool).
+ *
+ * A layer seed loads up to `n_missing` expert slabs (gate|up|down) that are
+ * not already resident.  The host memcpy from the model mmap is the
+ * disk-touching part: on a cold page fault the faulting thread blocks on a
+ * synchronous read, so a single-threaded loop keeps ~1 read in flight and the
+ * NVMe stays latency-bound.  A small persistent worker pool lets several slabs
+ * be faulted in concurrently, raising the device queue depth toward the SSD's
+ * peak bandwidth.  Each worker copies to disjoint per-expert offsets, so the
+ * data path needs no lock; the on-device copy below remains the single batched
+ * vkCmdCopyBuffer.  The pool is process-lifetime and created lazily; the job is
+ * dispatched under g_vk_pool_copy_dispatch_mutex so an async worker store and
+ * a sync store can never clobber the shared descriptor.
+ * ------------------------------------------------------------------------- */
+
+#define DS4_VK_POOL_COPY_MAX_THREADS 16u
+
+typedef struct {
+    const ds4_gpu_stream_expert_table *table;
+    struct ds4_vk_pool_layer         *l;
+    const int32_t                    *missing;
+    uint32_t                          n_missing;
+    struct ds4_vulkan_tensor         *ph;      /* pool tensor (dst bases)   */
+    struct ds4_vulkan_tensor         *sh;      /* staging tensor, or NULL   */
+    int                               staging; /* 1 => sh, 0 => ph->host_map */
+    VkBufferCopy                     *regions; /* [3*n_missing], or NULL    */
+} vulkan_pool_copy_work;
+
+static pthread_t       g_vk_pool_copy_threads[DS4_VK_POOL_COPY_MAX_THREADS];
+static pthread_mutex_t g_vk_pool_copy_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_vk_pool_copy_dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_vk_pool_copy_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_vk_pool_copy_done_cond = PTHREAD_COND_INITIALIZER;
+static int             g_vk_pool_copy_started = 0;
+static int             g_vk_pool_copy_shutdown = 0;
+static int             g_vk_pool_copy_has_job = 0;
+static int             g_vk_pool_copy_engaged = 0;
+static uint32_t        g_vk_pool_copy_active = 0;
+static uint32_t        g_vk_pool_copy_nthreads = 0;
+static vulkan_pool_copy_work g_vk_pool_copy_work;
+static std::atomic<uint32_t> g_vk_pool_copy_next(0);
+static std::atomic<int>      g_vk_pool_copy_ok(1);
+
+static uint32_t vulkan_pool_copy_thread_count(void) {
+    const char *env = getenv("DS4_VULKAN_POOL_COPY_THREADS");
+    if (env && env[0]) {
+        char *end = NULL;
+        const long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0) {
+            return (uint32_t)(v > (long)DS4_VK_POOL_COPY_MAX_THREADS ?
+                              (long)DS4_VK_POOL_COPY_MAX_THREADS : v);
+        }
+    }
+    return 8u;
+}
+
+/* Copy one expert's gate/up/down slabs and (on the staging path) record the
+ * three device->pool regions.  Work-stealing: disjoint per-expert offsets, so
+ * no two workers touch the same byte. */
+static int vulkan_pool_copy_one(vulkan_pool_copy_work *w, uint32_t i) {
+    const struct ds4_vk_pool_layer *l = w->l;
+    const int32_t e = w->missing[i];
+    if (e < 0 || (uint64_t)e >= DS4_VK_POOL_TABLE_ENTRIES) return 0;
+    const int slot = vulkan_pool_slot_for(l, e);
+    if (slot < 0) return 0;
+    const uint64_t eg = (uint64_t)e;
+    const uint8_t *gsrc = vulkan_expert_src(w->table, w->table->part_mask_gate, e);
+    const uint8_t *usrc = vulkan_expert_src(w->table, w->table->part_mask_up, e);
+    const uint8_t *dsrc = vulkan_expert_src(w->table, w->table->part_mask_down, e);
+    const size_t gate_bytes = (size_t)l->gate_expert_bytes;
+    const size_t down_bytes = (size_t)l->down_expert_bytes;
+    const uint64_t g_e = eg * l->gate_expert_bytes;
+    const uint64_t d_e = eg * l->down_expert_bytes;
+    if (w->staging) {
+        const uint64_t per = 2ull * l->gate_expert_bytes + l->down_expert_bytes;
+        const uint64_t s_off = (uint64_t)i * per;
+        char *dst = (char *)w->sh->host_map + w->sh->offset + s_off;
+        memcpy(dst, gsrc + w->table->gate_offset + g_e, gate_bytes);
+        memcpy(dst + gate_bytes, usrc + w->table->up_offset + g_e, gate_bytes);
+        memcpy(dst + 2u * gate_bytes, dsrc + w->table->down_offset + d_e, down_bytes);
+        if (w->regions) {
+            VkBufferCopy *r = &w->regions[i * 3u];
+            r[0].srcOffset = w->sh->offset + s_off;
+            r[0].dstOffset = w->ph->offset + vulkan_pool_gate_base(l) +
+                             (uint64_t)slot * l->gate_expert_bytes;
+            r[0].size = gate_bytes;
+            r[1].srcOffset = w->sh->offset + s_off + gate_bytes;
+            r[1].dstOffset = w->ph->offset + vulkan_pool_up_base(l) +
+                             (uint64_t)slot * l->gate_expert_bytes;
+            r[1].size = gate_bytes;
+            r[2].srcOffset = w->sh->offset + s_off + 2u * gate_bytes;
+            r[2].dstOffset = w->ph->offset + vulkan_pool_down_base(l) +
+                             (uint64_t)slot * l->down_expert_bytes;
+            r[2].size = down_bytes;
+        }
+    } else {
+        char *dst = (char *)w->ph->host_map + w->ph->offset;
+        memcpy(dst + vulkan_pool_gate_base(l) + (uint64_t)slot * l->gate_expert_bytes,
+               gsrc + w->table->gate_offset + g_e, gate_bytes);
+        memcpy(dst + vulkan_pool_up_base(l) + (uint64_t)slot * l->gate_expert_bytes,
+               usrc + w->table->up_offset + g_e, gate_bytes);
+        memcpy(dst + vulkan_pool_down_base(l) + (uint64_t)slot * l->down_expert_bytes,
+               dsrc + w->table->down_offset + d_e, down_bytes);
+    }
+    return 1;
+}
+
+static void *vulkan_pool_copy_worker_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_vk_pool_copy_mutex);
+        while (!g_vk_pool_copy_has_job && !g_vk_pool_copy_shutdown) {
+            pthread_cond_wait(&g_vk_pool_copy_cond, &g_vk_pool_copy_mutex);
+        }
+        if (g_vk_pool_copy_shutdown && !g_vk_pool_copy_has_job) {
+            pthread_mutex_unlock(&g_vk_pool_copy_mutex);
+            return NULL;
+        }
+        g_vk_pool_copy_active++;
+        g_vk_pool_copy_engaged++;
+        if (g_vk_pool_copy_engaged == 1) {
+            pthread_cond_signal(&g_vk_pool_copy_done_cond);
+        }
+        pthread_mutex_unlock(&g_vk_pool_copy_mutex);
+
+        for (;;) {
+            const uint32_t i =
+                g_vk_pool_copy_next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= g_vk_pool_copy_work.n_missing) break;
+            if (!vulkan_pool_copy_one(&g_vk_pool_copy_work, i)) {
+                g_vk_pool_copy_ok.store(0, std::memory_order_relaxed);
+            }
+        }
+
+        pthread_mutex_lock(&g_vk_pool_copy_mutex);
+        g_vk_pool_copy_active--;
+        if (g_vk_pool_copy_active == 0) {
+            g_vk_pool_copy_has_job = 0;
+            pthread_cond_broadcast(&g_vk_pool_copy_done_cond);
+        }
+        pthread_mutex_unlock(&g_vk_pool_copy_mutex);
+    }
+}
+
+static int vulkan_pool_copy_start(uint32_t max_threads) {
+    pthread_mutex_lock(&g_vk_pool_copy_mutex);
+    if (g_vk_pool_copy_started) {
+        pthread_mutex_unlock(&g_vk_pool_copy_mutex);
+        return (int)g_vk_pool_copy_nthreads;
+    }
+    uint32_t n = max_threads;
+    if (n > DS4_VK_POOL_COPY_MAX_THREADS) n = DS4_VK_POOL_COPY_MAX_THREADS;
+    if (n < 2) {
+        /* A single worker gives no overlap; keep started=0 so the caller falls
+         * back to the serial loop (DS4_VULKAN_POOL_COPY_THREADS=1 disables the
+         * parallel store for A/B testing). */
+        pthread_mutex_unlock(&g_vk_pool_copy_mutex);
+        return 0;
+    }
+    uint32_t created = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (pthread_create(&g_vk_pool_copy_threads[i], NULL,
+                           vulkan_pool_copy_worker_main,
+                           (void *)(uintptr_t)i) != 0) {
+            break;
+        }
+        created++;
+    }
+    g_vk_pool_copy_nthreads = created;
+    g_vk_pool_copy_started = 1;
+    pthread_mutex_unlock(&g_vk_pool_copy_mutex);
+    return (int)created;
+}
+
+/* Copy all missing slabs, in parallel when the pool has >= 2 workers and there
+ * are >= 2 slabs, else serial.  Returns 1 on success. */
+static int vulkan_pool_copy_run(vulkan_pool_copy_work *w) {
+    if (w->n_missing < 2) {
+        for (uint32_t i = 0; i < w->n_missing; i++) {
+            if (!vulkan_pool_copy_one(w, i)) return 0;
+        }
+        return 1;
+    }
+    if (g_vk_pool_copy_nthreads < 2) {
+        if (vulkan_pool_copy_start(vulkan_pool_copy_thread_count()) < 2) {
+            for (uint32_t i = 0; i < w->n_missing; i++) {
+                if (!vulkan_pool_copy_one(w, i)) return 0;
+            }
+            return 1;
+        }
+    }
+    pthread_mutex_lock(&g_vk_pool_copy_dispatch_mutex);
+    g_vk_pool_copy_work = *w;
+    g_vk_pool_copy_next.store(0, std::memory_order_relaxed);
+    g_vk_pool_copy_ok.store(1, std::memory_order_relaxed);
+    pthread_mutex_lock(&g_vk_pool_copy_mutex);
+    g_vk_pool_copy_active = 0;
+    g_vk_pool_copy_engaged = 0;
+    g_vk_pool_copy_has_job = 1;
+    pthread_cond_broadcast(&g_vk_pool_copy_cond);
+    /* Wait until at least one worker has engaged (active==0 both before the
+     * freshly-created pool threads start and after they finish, so without
+     * this the main thread would race ahead of them on the first store) and
+     * then until every engaged worker has drained. */
+    while (g_vk_pool_copy_engaged == 0) {
+        pthread_cond_wait(&g_vk_pool_copy_done_cond, &g_vk_pool_copy_mutex);
+    }
+    while (g_vk_pool_copy_active != 0) {
+        pthread_cond_wait(&g_vk_pool_copy_done_cond, &g_vk_pool_copy_mutex);
+    }
+    const int ok = g_vk_pool_copy_ok.load(std::memory_order_relaxed);
+    pthread_mutex_unlock(&g_vk_pool_copy_mutex);
+    pthread_mutex_unlock(&g_vk_pool_copy_dispatch_mutex);
+    return ok ? 1 : 0;
+}
+
 /* Upload the weights of the given (already reserved) experts into their pool
  * slots in ONE staging copy + ONE submit/wait.  Each expert occupies a
  * contiguous per-expert slab (gate|up|down), so the whole batch is one
@@ -7345,32 +7565,22 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
     struct ds4_vulkan_tensor *ph = vulkan_tensor_handle(l->tensor);
     if (!ph) return 0;
     if (ph->host_map) {
-        for (uint32_t i = 0; i < n_missing; i++) {
-            const int32_t e = missing[i];
-            const int slot = vulkan_pool_slot_for(l, e);
-            if (slot < 0 || e < 0) return 0;
-            const uint64_t eg = (uint64_t)e;
-            const uint8_t *gsrc = vulkan_expert_src(table, table->part_mask_gate, e);
-            const uint8_t *usrc = vulkan_expert_src(table, table->part_mask_up, e);
-            const uint8_t *dsrc = vulkan_expert_src(table, table->part_mask_down, e);
-            memcpy(ph->host_map + ph->offset + vulkan_pool_gate_base(l) +
-                       (uint64_t)slot * l->gate_expert_bytes,
-                   gsrc + table->gate_offset + eg * l->gate_expert_bytes,
-                   (size_t)l->gate_expert_bytes);
-            memcpy(ph->host_map + ph->offset + vulkan_pool_up_base(l) +
-                       (uint64_t)slot * l->gate_expert_bytes,
-                   usrc + table->up_offset + eg * l->gate_expert_bytes,
-                   (size_t)l->gate_expert_bytes);
-            memcpy(ph->host_map + ph->offset + vulkan_pool_down_base(l) +
-                       (uint64_t)slot * l->down_expert_bytes,
-                   dsrc + table->down_offset + eg * l->down_expert_bytes,
-                   (size_t)l->down_expert_bytes);
-        }
+        vulkan_pool_copy_work w;
+        memset(&w, 0, sizeof(w));
+        w.table = table;
+        w.l = l;
+        w.missing = missing;
+        w.n_missing = n_missing;
+        w.ph = ph;
+        w.sh = NULL;
+        w.staging = 0;
+        w.regions = NULL;
+        const int copy_ok = vulkan_pool_copy_run(&w);
         if (dbg_time)
             g_dbg_store_copy_us.fetch_add(
                 (uint64_t)((vulkan_now_ms() - dbg_copy0) * 1000.0),
                 std::memory_order_relaxed);
-        return 1;
+        return copy_ok;
     }
 
     if (g_pool_staging && g_pool_staging->bytes < total) {
@@ -7386,56 +7596,42 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
     if (!sh || !sh->host_map) return 0;
 
     VkBufferCopy regions[3 * DS4_VK_POOL_MAX_SLOTS];
-    uint32_t nr = 0;
-    uint64_t s_off = 0;
     if (dbg_time) dbg_copy0 = vulkan_now_ms();
-    for (uint32_t i = 0; i < n_missing; i++) {
-        const int32_t e = missing[i];
-        const int slot = vulkan_pool_slot_for(l, e);
-        if (slot < 0 || e < 0 || nr + 3 > 3 * DS4_VK_POOL_MAX_SLOTS) return 0;
-        const uint64_t eg = (uint64_t)e;
-        const uint8_t *gsrc = vulkan_expert_src(table, table->part_mask_gate, e);
-        const uint8_t *usrc = vulkan_expert_src(table, table->part_mask_up, e);
-        const uint8_t *dsrc = vulkan_expert_src(table, table->part_mask_down, e);
-        /* gate */
-        memcpy(sh->host_map + sh->offset + s_off,
-               gsrc + table->gate_offset + eg * l->gate_expert_bytes,
-               (size_t)l->gate_expert_bytes);
-        regions[nr].srcOffset = sh->offset + s_off;
-        regions[nr].dstOffset = ph->offset + vulkan_pool_gate_base(l) +
-                                (uint64_t)slot * l->gate_expert_bytes;
-        regions[nr].size = l->gate_expert_bytes;
-        nr++;
-        s_off += l->gate_expert_bytes;
-        /* up */
-        memcpy(sh->host_map + sh->offset + s_off,
-               usrc + table->up_offset + eg * l->gate_expert_bytes,
-               (size_t)l->gate_expert_bytes);
-        regions[nr].srcOffset = sh->offset + s_off;
-        regions[nr].dstOffset = ph->offset + vulkan_pool_up_base(l) +
-                                (uint64_t)slot * l->gate_expert_bytes;
-        regions[nr].size = l->gate_expert_bytes;
-        nr++;
-        s_off += l->gate_expert_bytes;
-        /* down */
-        memcpy(sh->host_map + sh->offset + s_off,
-               dsrc + table->down_offset + eg * l->down_expert_bytes,
-               (size_t)l->down_expert_bytes);
-        regions[nr].srcOffset = sh->offset + s_off;
-        regions[nr].dstOffset = ph->offset + vulkan_pool_down_base(l) +
-                                (uint64_t)slot * l->down_expert_bytes;
-        regions[nr].size = l->down_expert_bytes;
-        nr++;
-        s_off += l->down_expert_bytes;
-    }
+    vulkan_pool_copy_work w;
+    memset(&w, 0, sizeof(w));
+    w.table = table;
+    w.l = l;
+    w.missing = missing;
+    w.n_missing = n_missing;
+    w.ph = ph;
+    w.sh = sh;
+    w.staging = 1;
+    w.regions = regions;
+    const int copy_ok = vulkan_pool_copy_run(&w);
     if (dbg_time) {
         g_dbg_store_copy_us.fetch_add(
             (uint64_t)((vulkan_now_ms() - dbg_copy0) * 1000.0),
             std::memory_order_relaxed);
         dbg_sub0 = vulkan_now_ms();
     }
+    if (!copy_ok) return 0;
+    const uint32_t nr = n_missing * 3u;
     if (!vulkan_compute_init()) return 0;
+    const int per_expert =
+        getenv("DS4_VULKAN_POOL_COPY_PER_EXPERT") != NULL;
     if (async) {
+        if (per_expert) {
+            int src_ok = 1;
+            for (uint32_t i = 0; i < n_missing && src_ok; i++) {
+                src_ok = vulkan_worker_copy_submit_multi(
+                        sh->buffer, ph->buffer, &regions[i * 3u], 3);
+            }
+            if (dbg_time)
+                g_dbg_store_submit_us.fetch_add(
+                    (uint64_t)((vulkan_now_ms() - dbg_sub0) * 1000.0),
+                    std::memory_order_relaxed);
+            return src_ok ? 1 : 0;
+        }
         const int src_ok = vulkan_worker_copy_submit_multi(sh->buffer,
                                                            ph->buffer, regions,
                                                            nr);
@@ -7447,7 +7643,13 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
     }
     VkCommandBuffer cb = vulkan_dispatch_begin();
     if (!cb) return 0;
-    vkCmdCopyBuffer(cb, sh->buffer, ph->buffer, nr, regions);
+    if (per_expert) {
+        for (uint32_t i = 0; i < n_missing; i++) {
+            vkCmdCopyBuffer(cb, sh->buffer, ph->buffer, 3, &regions[i * 3u]);
+        }
+    } else {
+        vkCmdCopyBuffer(cb, sh->buffer, ph->buffer, nr, regions);
+    }
     VkMemoryBarrier mb = {};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
