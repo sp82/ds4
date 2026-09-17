@@ -316,7 +316,7 @@ cuda:
 
 vulkan:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent vkbench \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o ds4_layer_pack.o" \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_engram.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) -DDS4_VULKAN_BUILD" \
 		DS4_LINK="g++ -std=c++17 -pthread -rdynamic" \
 		DS4_LINK_LIBS="-lm -lvulkan"

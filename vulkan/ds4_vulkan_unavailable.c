@@ -38,6 +38,10 @@ struct VulkanUnavailableRegistrar {
     namespace { VulkanUnavailableRegistrar vulkan_unavail_reg_##name(#name); } \
     extern "C" void name(...) {}
 
+#define VULKAN_UNAVAILABLE_UINT64(name) \
+    namespace { VulkanUnavailableRegistrar vulkan_unavail_reg_##name(#name); } \
+    extern "C" uint64_t name(...) { return 0; }
+
 VULKAN_UNAVAILABLE_INT(ds4_gpu_attention_prefill_raw_heads_range_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_device_cache_support_tensors)
@@ -175,6 +179,79 @@ VULKAN_UNAVAILABLE_INT(ds4_gpu_glm53_expand_pool_selection_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_glm53_indexer_pool_update_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_glm53_indexer_scores_batch_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_glm_attention_dense_compact_lora_causal_tensor)
+
+/* Upstream DeepSeek v4.1 Flash surface (ds4_deepseek41_gpu.h).  All are
+ * unreachable on the Vulkan runtime for the DS4 Flash/Pro families (the
+ * engine gates them behind backend==CUDA/Metal or a loaded v4.1 model), so
+ * they stay loud stubs.  indexer_packed_bytes returns a byte count (0). */
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_quantize)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_shared_start)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_shared_join)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_attention_output_batch)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_attention_output_tp_batch)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_rope)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_rope_stride)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_engram_add)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_pool2)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_candidate_blocks)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_candidate_filter)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_indexer_scores_batch)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_tensor_ops_available)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_indexer_pack)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_indexer_scores_packed)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_indexer_topk_batch)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_carry_copy)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_projection_rows)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_gather_kv)
+VULKAN_UNAVAILABLE_UINT64(ds4_gpu_dsv41_indexer_packed_bytes)
+
+/* Upstream Qwen3.8 Flash Next surface.  Unreachable on the Vulkan runtime
+ * (Qwen family is out of scope; the engine gates Qwen paths behind a loaded
+ * Qwen model).  attn_part_floats returns a byte count (0), set_rope /
+ * set_verify_rows_exact are void. */
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_argmax_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_attn_decode_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_attn_prep_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_conv_stream_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_decode_fusions_enabled)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_dense_mm_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_gdn_front_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_gdn_out_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_gdn_prep_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_gdn_scan_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_combine_norm_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_combine_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_gate_mix_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_lo_act_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_mix_rows_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_norm_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_idx_block_key_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_idx_expand_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_idx_score_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_idx_select_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_matmul_q8_0_weights_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_moe_build_lists_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_moe_down_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_moe_mid_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_moe_mm_down_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_moe_mm_mid_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_moe_reduce_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_mtp_combine_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_mtp_stage_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_multi_gemv_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_ple_conv_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_ple_gate_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_q8_pair_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_router_topk_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_vision_encode)
+VULKAN_UNAVAILABLE_VOID(ds4_gpu_qwen4_set_rope)
+VULKAN_UNAVAILABLE_VOID(ds4_gpu_qwen4_set_verify_rows_exact)
+VULKAN_UNAVAILABLE_UINT64(ds4_gpu_qwen4_attn_part_floats)
+
+/* Streaming expert cache prefetch (upstream CUDA/Metal overlap helper).  The
+ * Vulkan pool is store-on-demand; prefetch is a no-op. */
+VULKAN_UNAVAILABLE_INT(ds4_gpu_stream_expert_cache_prefetch)
+VULKAN_UNAVAILABLE_VOID(ds4_gpu_stream_expert_cache_prefetch_finish)
 
 /* Print, once at backend init, a categorized summary of the ds4_gpu_* entry
  * points that are silent stubs (not implemented / out of scope).  The total is
