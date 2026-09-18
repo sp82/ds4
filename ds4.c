@@ -18777,22 +18777,37 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
  *     freeing VRAM for the weight cache / expert pool.  DS4_VULKAN_KV_IN_VRAM=1
  *     forces VRAM back when both are set.  Vulkan-only; other backends keep
  *     their previous behavior. */
-static bool metal_graph_kv_cache_in_ram(void) {
+/* Per-tier KV cache placement policy (Vulkan multi-GPU).
+ *
+ * DS4_VULKAN_KV_IN_VRAM=1 forces VRAM on every tier; DS4_VULKAN_KV_IN_RAM=1
+ * forces host-visible (RAM) on every tier.  With no override, a multi-GPU
+ * layout puts the KV of a DYNAMIC tier (the one that owns the resident expert
+ * pool and the prefill reserve) in RAM to free its VRAM for the pool, and keeps
+ * the KV of a STATIC tier (fixed weights, no expert pool, VRAM headroom) in
+ * VRAM (faster, no PCIe/GTT round-trip).  Single-GPU (or no multi-tier config)
+ * defaults to VRAM, matching the legacy behavior. */
+static bool metal_graph_kv_cache_in_ram_for_tier(
+        const ds4_gpu_config *gpu_cfg, int tier) {
 #if defined(DS4_VULKAN_BUILD)
     const char *vram = getenv("DS4_VULKAN_KV_IN_VRAM");
     if (vram != NULL && vram[0] != '\0' && vram[0] != '0') return false;
     const char *ram = getenv("DS4_VULKAN_KV_IN_RAM");
     if (ram != NULL && ram[0] != '\0' && ram[0] != '0') return true;
+    if (gpu_cfg && gpu_cfg->n_gpus > 1 && tier >= 0 &&
+        tier < gpu_cfg->n_gpus) {
+        return gpu_cfg->dev_mode[tier] == 1;   /* dynamic tier -> RAM */
+    }
 #endif
     return false;
 }
 
 static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor_on(
+        const ds4_gpu_config *gpu_cfg,
         bool managed,
         int tier,
         uint64_t bytes) {
     (void)managed;
-    if (metal_graph_kv_cache_in_ram()) {
+    if (metal_graph_kv_cache_in_ram_for_tier(gpu_cfg, tier)) {
         ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
         if (t != NULL) return t;
         /* host allocation refused: fall back to VRAM rather than fail. */
@@ -18800,8 +18815,9 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor_on(
     return ds4_gpu_tensor_alloc_device_local_on(tier, bytes);
 }
 
-static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t bytes) {
-    return metal_graph_alloc_kv_cache_tensor_on(managed, 0, bytes);
+static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(
+        const ds4_gpu_config *gpu_cfg, bool managed, uint64_t bytes) {
+    return metal_graph_alloc_kv_cache_tensor_on(gpu_cfg, managed, 0, bytes);
 }
 
 /* =========================================================================
@@ -19506,6 +19522,7 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp,
         const int              *placement,
         bool                    cuda_tensor_parallel,
+        const ds4_gpu_config   *gpu_cfg,
         const ds4_gpu_graph    *shared_prefill_workspace) {
     const int saved_dspark_exec_tier = g->dspark_exec_tier;
     memset(g, 0, sizeof(*g));
@@ -19735,6 +19752,7 @@ static bool metal_graph_alloc_raw_cap(
          * and ds4_gpu_tensor_alloc_ptr_on. */
         const int layer_tier = placement ? placement[il + 1] : 0;
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
+                gpu_cfg,
                 managed_kv_cache,
                 layer_tier,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
@@ -19742,6 +19760,7 @@ static bool metal_graph_alloc_raw_cap(
             ? metal_graph_cuda_tp_partner_tier(layer_tier) : -1;
         if (layer_tp_partner >= 0) {
             g->layer_raw_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
+                    gpu_cfg,
                     managed_kv_cache,
                     layer_tp_partner,
                     (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
@@ -19752,12 +19771,14 @@ static bool metal_graph_alloc_raw_cap(
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
             g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
+                    gpu_cfg,
                     managed_kv_cache,
                     layer_tier,
                     (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             if (layer_tp_partner >= 0) {
                 g->layer_attn_comp_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
+                        gpu_cfg,
                         managed_kv_cache,
                         layer_tp_partner,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
@@ -19796,6 +19817,7 @@ static bool metal_graph_alloc_raw_cap(
                 const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
                 const uint64_t index_rows = (uint64_t)coff * ratio;
                 g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
+                        gpu_cfg,
                         managed_kv_cache,
                         layer_tier,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
@@ -19950,6 +19972,7 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
+                gpu_cfg,
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         g->mtp_n_raw = 0;
@@ -20155,7 +20178,7 @@ static bool metal_graph_alloc(
     /* single-tier convenience wrapper; placement=NULL routes
      * all per-layer allocations to tier 0. */
     return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA,
-                                     1, false, NULL, false, NULL);
+                                      1, false, NULL, false, NULL, NULL);
 }
 
 static bool metal_graph_install_model_spans(
@@ -40721,7 +40744,7 @@ static int metal_graph_prompt_logits_test(
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        (uint32_t)n_test, false, NULL, false, NULL);
+                                        (uint32_t)n_test, false, NULL, false, NULL, NULL);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -60296,7 +60319,7 @@ static int generate_metal_graph_raw_swa(
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        prefill_cap, false, NULL, false, NULL);
+                                        prefill_cap, false, NULL, false, NULL, NULL);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -65194,7 +65217,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        prefill_cap, false, NULL, false, NULL);
+                                        prefill_cap, false, NULL, false, NULL, NULL);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -70174,16 +70197,11 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     const uint32_t session_count =
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ?
         engine_placement_session_count(e) : 1u;
-    /* DS4_VULKAN_KV_IN_RAM: the per-layer KV cache lives in host-visible RAM
-     * (GTT), not VRAM, so it must NOT be charged to the per-tier VRAM budget:
-     * that budget goes to the persistent weight/expert cache instead.  No-op
-     * on backends/builds where the option is inactive (returns false).  The
-     * helper lives in the GPU-only section, hence the build guard here. */
-#if !defined(DS4_NO_GPU)
-    const bool kv_in_ram = metal_graph_kv_cache_in_ram();
-#else
-    const bool kv_in_ram = false;
-#endif
+    /* KV cache placement is per-tier (metal_graph_kv_cache_in_ram_for_tier):
+     * a DYNAMIC tier keeps its KV in host-visible RAM (freeing VRAM for the
+     * expert pool), a STATIC tier keeps it in VRAM.  Only the KV that lives in
+     * VRAM is charged to the per-tier VRAM budget; RAM-resident KV is not.
+     * Single-GPU / non-Vulkan builds return false (KV in VRAM, legacy). */
     ds4_context_memory mem =
         ds4_context_memory_estimate_with_prefill(DS4_BACKEND_CUDA,
                                                  est_ctx,
@@ -70192,25 +70210,31 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
         /* mem.total_bytes is used only as a sentinel; cache values are
          * re-derived per layer so placement follows the active model's
          * allocation geometry. */
-        if (!kv_in_ram) {
-            for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
-                const size_t per_session =
-                    DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ?
-                    engine_glm_per_layer_kv_bytes_planner(il, est_ctx) :
-                    engine_per_layer_kv_bytes_planner(il, est_ctx,
-                                                      e->prefill_chunk);
-                const size_t cache_bytes =
-                    engine_size_mul_sat(per_session, session_count);
-                out[il + 1] = out[il + 1] > SIZE_MAX - cache_bytes ?
-                    SIZE_MAX : out[il + 1] + cache_bytes;
-            }
+        for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+            const int lt = e->multi_tier ? e->placement[il + 1] : 0;
+#if !defined(DS4_NO_GPU)
+            if (metal_graph_kv_cache_in_ram_for_tier(&e->gpu_cfg, lt)) continue;
+#endif
+            const size_t per_session =
+                DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ?
+                engine_glm_per_layer_kv_bytes_planner(il, est_ctx) :
+                engine_per_layer_kv_bytes_planner(il, est_ctx,
+                                                  e->prefill_chunk);
+            const size_t cache_bytes =
+                engine_size_mul_sat(per_session, session_count);
+            out[il + 1] = out[il + 1] > SIZE_MAX - cache_bytes ?
+                SIZE_MAX : out[il + 1] + cache_bytes;
         }
     } else {
         /* Fallback: 128 MiB per layer as a static estimate. */
-        if (!kv_in_ram) {
-            const size_t fallback_per_layer = engine_size_mul_sat(
-                    (size_t)128ull * 1024ull * 1024ull, session_count);
-            for (uint32_t i = 1; i <= DS4_N_LAYER; i++) out[i] += fallback_per_layer;
+        const size_t fallback_per_layer = engine_size_mul_sat(
+                (size_t)128ull * 1024ull * 1024ull, session_count);
+        for (uint32_t i = 1; i <= DS4_N_LAYER; i++) {
+            const int lt = e->multi_tier ? e->placement[i] : 0;
+#if !defined(DS4_NO_GPU)
+            if (metal_graph_kv_cache_in_ram_for_tier(&e->gpu_cfg, lt)) continue;
+#endif
+            out[i] += fallback_per_layer;
         }
     }
     return 0;
@@ -74479,6 +74503,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                    need_spec_verifier,
                                    placement,
                                    e->cuda_tensor_parallel,
+                                   &e->gpu_cfg,
                                    shared_prefill_workspace))
     {
         free(s);

@@ -3075,6 +3075,22 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return t;
 }
 
+/* Device-local (VRAM) tensor on a specific logical tier.  Mirrors the
+ * Vulkan ds4_gpu_tensor_alloc_device_local_on ABI (per-tier device-local
+ * allocation) used by the multi-GPU engine (ds4.c).  On CUDA this is a
+ * plain cudaMalloc on the tier's device; single-tier callers pass tier 0. */
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_device_local_on(int tier,
+                                                                uint64_t bytes) {
+    if (tier < 0 || tier >= g_n_gpus) return NULL;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    if (ds4_gpu_tensor_alloc_on(t, tier, bytes) != 0) {
+        free(t);
+        return NULL;
+    }
+    return t;
+}
+
 /* Heap-allocated tensor on a specific logical tier.
  *
  * Mirrors the legacy ds4_gpu_tensor_alloc ABI (returns ds4_gpu_tensor *)
