@@ -87,6 +87,7 @@ __pycache__/
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
 /vulkan/AGENTS.md
+/vulkan/docs/*.md
 /vulkan/shaders/ds4_vulkan_shaders.inc
 /vkbench
 /kbench
@@ -96,4 +97,3 @@ __pycache__/
 /vulkan/tools/vkbench/vkbench.o
 /.clangd
 /compile_commands.json
-/vulkan/*.md

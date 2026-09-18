@@ -150,7 +150,7 @@ void ds4_layer_pack_print(FILE *out,
 
 /* -------------------------------------------------------------------------
  * Multi-GPU config (JSON) + asymmetric placement planner.
- * See ds4_layer_pack.h and vulkan/SPECS_MGPU.md.
+ * See ds4_layer_pack.h and vulkan/docs/SPECS_MGPU.md.
  * ------------------------------------------------------------------------- */
 
 static void mgpu_err(char *err, size_t errlen, const char *msg) {

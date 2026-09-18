@@ -1,5 +1,5 @@
 /* test_mgpu_config — M2 unit tests: JSON config loader + asymmetric planner.
- * Pure C99, no GPU.  See vulkan/SPECS_MGPU.md. */
+ * Pure C99, no GPU.  See vulkan/docs/SPECS_MGPU.md. */
 #include "../ds4_layer_pack.h"
 
 #include <stdio.h>

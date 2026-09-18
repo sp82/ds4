@@ -461,7 +461,7 @@ static bool ds4_backend_supports_glm_streaming_full_layers(ds4_backend backend) 
 #if defined(DS4_ROCM_BUILD)
     if (backend == DS4_BACKEND_CUDA) return true;
 #endif
-    /* GLM is out of scope for the Vulkan backend (see vulkan/SPEC.md). */
+    /* GLM is out of scope for the Vulkan backend (see vulkan/docs/SPEC.md). */
     (void)backend;
     return false;
 }
