@@ -10,11 +10,25 @@
  * P2P-vs-host-bounce decision are made on measured facts.
  *
  * Build:  make mgpu-probe
- * Run:    ./mgpu-probe [--mb N] [--devices 0,1,2,3] [--iters N]
+ * Run:    ./mgpu-probe [--mb N] [--devices 0,1,2,3] [--iters N] [--warmup N]
  * Env:    DS4_VULKAN_DEVICE_INDEX is ignored (this tool wants every device).
  *
- * Output: one block per device + a P2P matrix (ordered pairs).  Any
- * unsupported step is reported, never fatal.
+ * Output: one block per device + a P2P matrix (ordered pairs) + a host-bounce
+ * matrix (A->host->B, the fallback path when direct P2P is unavailable, e.g.
+ * cross-vendor).  Host-bounce is derived as the harmonic mean of the two
+ * measured one-way host<->device rates.  Any unsupported step is reported,
+ * never fatal.
+ *
+ * --warmup N runs N untimed copies (submitted and waited) before each timed
+ * measurement so freshly-ramped devices (e.g. AMD after runtime-suspend)
+ * report a stable value instead of a different one every run.  AMD cards need
+ * a fairly large warmup (~40+ copies) to boost the memory clock; the default
+ * is 50 so the device-local number is stable out of the box.
+ *
+ * Defaults: --mb 256, --iters 5, --warmup 50.  mb must be large enough that the
+ * copy working set exceeds the L3/Infinity Cache (128 MiB on Navi 21): a buffer
+ * that fits in cache (e.g. 64 MiB) measures cache bandwidth (~1.7 TB/s), not
+ * the real DRAM bandwidth (~450 GB/s r+w on a 6900 XT).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +65,7 @@ typedef struct {
     int dma_buf;
     int mem_budget;
     uint64_t vram_bytes;
+    uint32_t pci_dom, pci_bus, pci_dev, pci_fn;
     int ok;
 } Dev;
 
@@ -213,10 +228,15 @@ static int import_buf2(Dev *d, int fd, uint64_t bytes, VkBuffer *buf_out,
     return 1;
 }
 
-/* Run iters copies src->dst on the device and return total ms. */
+/* Run iters copies src->dst on the device and return total ms.
+ * `warmup` copies are actually submitted and waited before the timed loop so
+ * the GPU clocks/power state settle first: otherwise a freshly-ramped device
+ * (e.g. AMD after runtime-suspend) reports a different value each run.
+ * Returns -1 if any submit fails (so a failed P2P/copy is reported, instead of
+ * silently producing an absurd bandwidth from a broken queue). */
 static double copy_bench(const Dev *d, VkBuffer src, VkBuffer dst, uint64_t bytes,
-                         int iters) {
-    for (int i = 0; i < iters; i++) {
+                         int iters, int warmup) {
+    for (int i = 0; i < warmup; i++) {
         vkResetCommandBuffer(d->cb, 0);
         VkCommandBufferBeginInfo bi;
         memset(&bi, 0, sizeof(bi));
@@ -226,6 +246,12 @@ static double copy_bench(const Dev *d, VkBuffer src, VkBuffer dst, uint64_t byte
         VkBufferCopy region = {0, 0, bytes};
         vkCmdCopyBuffer(d->cb, src, dst, 1, &region);
         vkEndCommandBuffer(d->cb);
+        VkSubmitInfo si;
+        memset(&si, 0, sizeof(si));
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &d->cb;
+        if (vkQueueSubmit(d->queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) return -1;
     }
     vkQueueWaitIdle(d->queue);
     double t0 = now_ms();
@@ -244,7 +270,7 @@ static double copy_bench(const Dev *d, VkBuffer src, VkBuffer dst, uint64_t byte
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &d->cb;
-        vkQueueSubmit(d->queue, 1, &si, VK_NULL_HANDLE);
+        if (vkQueueSubmit(d->queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) return -1;
     }
     vkQueueWaitIdle(d->queue);
     return now_ms() - t0;
@@ -271,8 +297,21 @@ static void fill_buf(const Dev *d, VkBuffer buf, uint64_t bytes) {
 
 /* Copy src (possibly imported / on another device) into dst, on d's queue. */
 static double xcopy_bench(const Dev *d, VkBuffer src, VkBuffer dst,
-                          uint64_t bytes, int iters) {
-    return copy_bench(d, src, dst, bytes, iters);
+                          uint64_t bytes, int iters, int warmup) {
+    return copy_bench(d, src, dst, bytes, iters, warmup);
+}
+
+/* Effective "host-bounce" throughput A -> host -> B, derived from the two
+ * measured one-way host<->device rates: A reads its device memory and writes
+ * host (device->host), then B reads host and writes its device memory
+ * (host->device).  The two PCIe legs are serial, so the combined rate is the
+ * harmonic mean 1/(1/rA + 1/rB).  This is what ds4 falls back to when
+ * cross-vendor P2P is unavailable.  A direct cross-device measurement is
+ * avoided because a P2P failure can leave the device queue in a bad state
+ * (silently yielding ~0ms legs). */
+static double host_bounce_gbs(double d2h_rate, double h2d_rate) {
+    if (d2h_rate <= 0 || h2d_rate <= 0) return -1;
+    return 1.0 / (1.0 / d2h_rate + 1.0 / h2d_rate);
 }
 
 static void print_mem_heaps(const Dev *d) {
@@ -385,10 +424,12 @@ static void query_pci(VkPhysicalDevice phys, uint32_t *dom, uint32_t *bus,
 int main(int argc, char **argv) {
     uint64_t mb = 256;
     int iters = 5;
+    int warmup = 50;
     const char *devfilter = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--mb") && i + 1 < argc) mb = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--iters") && i + 1 < argc) iters = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--warmup") && i + 1 < argc) warmup = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--devices") && i + 1 < argc) devfilter = argv[++i];
     }
 
@@ -441,6 +482,10 @@ int main(int argc, char **argv) {
 
     Dev devs[16];
     memset(devs, 0, sizeof(devs));
+    double dev_local_gbs[16] = {0};     /* device-local copy (r+w) GB/s */
+    double host_d2h[16] = {0};          /* device->host one-way GB/s */
+    double host_h2d[16] = {0};          /* host->device one-way GB/s */
+    double p2p_gbs[16][16];             /* >0 measured; -1 n/a/fail; 0 same */
     int nd = 0;
     const int include_cpu = getenv("DS4_MGPU_PROBE_CPU") != NULL;
     for (uint32_t i = 0; i < np && nd < 16; i++) {
@@ -474,6 +519,7 @@ int main(int argc, char **argv) {
         free(q);
         uint32_t pd = 0, pb = 0, pdev = 0, pfn = 0;
         query_pci(d->phys, &pd, &pb, &pdev, &pfn);
+        d->pci_dom = pd; d->pci_bus = pb; d->pci_dev = pdev; d->pci_fn = pfn;
         printf("\n" LOG "device[%d] (plat=%u) bdf=%04x:%02x:%02x.%x: %s\n", nd, i,
                pd, pb, pdev, pfn, d->props.deviceName);
         printf(LOG "  type=%d api=%u.%u.%u vram=%.2f GiB\n", d->props.deviceType,
@@ -499,16 +545,20 @@ int main(int argc, char **argv) {
             printf("\n" LOG "device[%d]: device-local alloc failed\n", i);
             continue;
         }
-        double ms = copy_bench(d, a, b, bytes, iters);
-        double gbs = (double)bytes * 2.0 * iters / (ms * 1.0e6);
-        printf("\n" LOG "device[%d] %s: VRAM %.2f GiB, copy (r+w) %.1f GB/s (%llu MiB x%d)\n",
+        double ms = copy_bench(d, a, b, bytes, iters, warmup);
+        double gbs = ms < 0 ? 0 : (double)bytes * 2.0 * iters / (ms * 1.0e6);
+        dev_local_gbs[i] = gbs;
+        printf("\n" LOG "device[%d] %s: VRAM %.2f GiB, copy r=%.1f GB/s w=%.1f GB/s (r+w %.1f, %llu MiB x%d)\n",
                i, d->props.deviceName,
-               (double)d->vram_bytes / (1024.0 * 1024.0 * 1024.0), gbs,
-               (unsigned long long)mb, iters);
+               (double)d->vram_bytes / (1024.0 * 1024.0 * 1024.0),
+               gbs / 2.0, gbs / 2.0, gbs, (unsigned long long)mb, iters);
         if (alloc_buf(d, bytes, 0, 1, &ha, &mha)) {
-            double hms = copy_bench(d, a, ha, bytes, iters);
-            double hgbs = (double)bytes * 2.0 * iters / (hms * 1.0e6);
-            printf(LOG "  host<->device copy (r+w) %.1f GB/s\n", hgbs);
+            double t1 = copy_bench(d, a, ha, bytes, iters, warmup);   /* device -> host */
+            double t2 = copy_bench(d, ha, a, bytes, iters, warmup);   /* host -> device */
+            host_d2h[i] = t1 < 0 ? 0 : (double)bytes * iters / (t1 * 1.0e6);
+            host_h2d[i] = t2 < 0 ? 0 : (double)bytes * iters / (t2 * 1.0e6);
+            printf(LOG "  host<->device: device->host %.1f GB/s, host->device %.1f GB/s\n",
+                   host_d2h[i], host_h2d[i]);
             vkDestroyBuffer(d->dev, ha, NULL);
             vkFreeMemory(d->dev, mha, NULL);
         }
@@ -519,6 +569,8 @@ int main(int argc, char **argv) {
     }
 
     /* P2P matrix. */
+    for (int i = 0; i < nd; i++)
+        for (int j = 0; j < nd; j++) p2p_gbs[i][j] = (i == j) ? 0 : -1;
     printf("\n" LOG "=== P2P transfer matrix (rows=source, cols=dest, GB/s) ===\n");
     printf(LOG "     ");
     for (int j = 0; j < nd; j++) printf("%7d", j);
@@ -557,9 +609,15 @@ int main(int argc, char **argv) {
             VkDeviceMemory mImpB = VK_NULL_HANDLE;
             if (alloc_buf(B, bytes, 0, 0, &dstB, &mDstB) &&
                 import_buf2(B, fd, bytes, &impB, &mImpB)) {
-                double ms = xcopy_bench(B, impB, dstB, bytes, iters);
-                double gbs = (double)bytes * iters / (ms * 1.0e6);
-                printf("%7.1f", gbs);
+                double ms = xcopy_bench(B, impB, dstB, bytes, iters, warmup);
+                if (ms < 0) {
+                    p2p_gbs[i][j] = -1;
+                    printf("  fail ");
+                } else {
+                    double gbs = (double)bytes * iters / (ms * 1.0e6);
+                    p2p_gbs[i][j] = gbs;
+                    printf("%7.1f", gbs);
+                }
             } else {
                 printf("  fail ");
             }
@@ -572,6 +630,60 @@ int main(int argc, char **argv) {
     }
     printf(LOG "n/a = external memory dma-buf unsupported; fail = import/copy failed; "
            "- = same/absent device\n");
+
+    /* Host-bounce matrix: the path used when direct P2P is unavailable (e.g.
+     * cross-vendor).  Reports the effective A->host->B throughput, derived from
+     * the measured one-way host<->device rates (harmonic mean of the two legs). */
+    if (nd > 1) {
+        printf("\n" LOG "=== Host-bounce matrix (A->host->B, rows=source, cols=dest, GB/s) ===\n");
+        printf(LOG "     ");
+        for (int j = 0; j < nd; j++) printf("%7d", j);
+        printf("\n");
+        for (int i = 0; i < nd; i++) {
+            printf(LOG "%3d: ", i);
+            for (int j = 0; j < nd; j++) {
+                if (i == j || !devs[i].ok || !devs[j].ok) { printf("      -"); continue; }
+                double gbs = host_bounce_gbs(host_d2h[i], host_h2d[j]);
+                if (gbs < 0) { printf("  n/a "); continue; }
+                printf("%7.1f", gbs);
+            }
+            printf("\n");
+        }
+        printf(LOG "n/a = no host<->device measurement; - = same/absent device\n");
+    }
+
+    /* ---- Final, human-readable summary of what was discovered ---- */
+    printf("\n" LOG "==========================================================\n");
+    printf(LOG "SUMMARY\n");
+    printf(LOG "==========================================================\n");
+    for (int i = 0; i < nd; i++) {
+        const Dev *d = &devs[i];
+        printf(LOG "  device[%d] %s (bdf=%04x:%02x:%02x.%x)\n", i, d->props.deviceName,
+               d->pci_dom, d->pci_bus, d->pci_dev, d->pci_fn);
+        printf(LOG "     vram=%.2f GiB  device-local r=%.1f w=%.1f GB/s (r+w %.1f)\n",
+               (double)d->vram_bytes / (1024.0 * 1024.0 * 1024.0),
+               dev_local_gbs[i] / 2.0, dev_local_gbs[i] / 2.0, dev_local_gbs[i]);
+        printf(LOG "     host<->device: device->host %.1f GB/s, host->device %.1f GB/s\n",
+               host_d2h[i], host_h2d[i]);
+    }
+    if (nd > 1) {
+        printf(LOG "  device-to-device (P2P) and host-bounce fallback:\n");
+        for (int i = 0; i < nd; i++) {
+            for (int j = 0; j < nd; j++) {
+                if (i == j) continue;
+                printf(LOG "    device[%d] -> device[%d]: ", i, j);
+                if (p2p_gbs[i][j] > 0) {
+                    printf("P2P OK %.1f GB/s\n", p2p_gbs[i][j]);
+                } else {
+                    double hb = host_bounce_gbs(host_d2h[i], host_h2d[j]);
+                    printf("P2P FAILED/unavailable");
+                    if (hb > 0) printf("  => host-bounce used: %.1f GB/s", hb);
+                    printf("\n");
+                }
+            }
+        }
+    }
+    printf(LOG "==========================================================\n");
 
     for (int i = 0; i < nd; i++) {
         if (devs[i].ok) vkDestroyDevice(devs[i].dev, NULL);
