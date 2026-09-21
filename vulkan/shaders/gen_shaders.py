@@ -123,7 +123,11 @@ def find_dxc():
 
 
 def compile_spv(dxc, src_path, entry, out_path, profile):
-    cmd = [dxc, "-E", entry] + profile + DXC_FLAGS
+    # DXC_FLAGS (the common --spirv / binding-shift / default target-env) are
+    # applied first, so a per-shader override in `profile` (e.g. a custom
+    # -fspv-target-env for a subgroup kernel) is the LAST occurrence and
+    # therefore wins over the default vulkan1.0 target.
+    cmd = [dxc, "-E", entry] + DXC_FLAGS + profile
     cmd += ["-Fo", out_path, src_path]
     subprocess.check_call(cmd, stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL)

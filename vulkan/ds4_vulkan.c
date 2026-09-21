@@ -151,6 +151,9 @@ static VkFence           g_worker_fence = VK_NULL_HANDLE;
 static int               g_worker_fence_pending = 0;
 /* VK_KHR_shader_integer_dot_product available (hardware packed int8 dot). */
 static int               g_has_int_dot = 0;
+/* VK_EXT_descriptor_indexing available (VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
+ * on every descriptor-set binding is only legal with this extension enabled). */
+static int               g_has_desc_indexing = 0;
 /* attn_output_low variant chosen by the init autotuner: -1 = not yet, 0/1/2 =
  * v1/v2/v3.  See vulkan_autotune_attn_out. */
 static int               g_attn_out_autotuned = -1;
@@ -264,7 +267,7 @@ static void vulkan_device_wait_impl(int reset_pool) {
  * worker uses vulkan_device_wait_impl(0) to drain without touching the pool. */
 static void vulkan_device_wait(void) { vulkan_device_wait_impl(1); }
 
-#define DS4_VK_PIPE_COUNT 74
+#define DS4_VK_PIPE_COUNT 73
 static VkPipeline     g_pipes[DS4_VK_PIPE_COUNT];
 static VkShaderModule g_mods[DS4_VK_PIPE_COUNT];
 
@@ -1474,6 +1477,11 @@ static VkResult vulkan_create_device(void) {
                     } else if (want_bda &&
                                strcmp(dexts[i].extensionName, bda_ext) == 0) {
                         dev_exts[n_dev_exts++] = bda_ext;
+                    } else if (strcmp(dexts[i].extensionName,
+                                      VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) == 0) {
+                        dev_exts[n_dev_exts++] =
+                            VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME;
+                        g_has_desc_indexing = 1;
                     } else if (want_chkpt &&
                                strcmp(dexts[i].extensionName, chkpt_ext) == 0) {
                         dev_exts[n_dev_exts++] = chkpt_ext;
@@ -1504,9 +1512,6 @@ static VkResult vulkan_create_device(void) {
      * (NVIDIA in particular) ignores it and a dispatch with an unwritten
      * descriptor faults the GPU (device lost).  Chain: desc_index -> intdot
      * -> bda. */
-    desc_index.sType =
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
-    desc_index.descriptorBindingPartiallyBound = VK_TRUE;
     void *chain = NULL;
     if (have_bda) {
         bda_feat.pNext = chain;
@@ -1516,10 +1521,16 @@ static VkResult vulkan_create_device(void) {
         intdot_feat.pNext = chain;
         chain = &intdot_feat;
     }
-    desc_index.pNext = chain;
+    if (g_has_desc_indexing) {
+        desc_index.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+        desc_index.descriptorBindingPartiallyBound = VK_TRUE;
+        desc_index.pNext = chain;
+        chain = &desc_index;
+    }
     feat2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     feat2.features = dev_feats;
-    feat2.pNext = &desc_index;
+    feat2.pNext = chain;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci = {};
@@ -1669,7 +1680,9 @@ static int vulkan_compute_init(void) {
     };
     VkDescriptorSetLayoutCreateInfo dslci = {};
     dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.pNext = &flags_info;
+    if (g_has_desc_indexing) {
+        dslci.pNext = &flags_info;
+    }
     dslci.bindingCount = sizeof(bindings) / sizeof(bindings[0]);
     dslci.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(g_device, &dslci, NULL,
@@ -1928,7 +1941,7 @@ int ds4_gpu_init(void) {
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "ds4";
     app.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
-    app.apiVersion = VK_API_VERSION_1_0;
+    app.apiVersion = VK_API_VERSION_1_1;
 
     /* Instance extensions: VK_KHR_get_physical_device_properties2 (when
      * present) lets the startup log report the PCI BDF via
@@ -2045,7 +2058,7 @@ static int vulkan_instance_init(void) {
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "ds4";
     app.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
-    app.apiVersion = VK_API_VERSION_1_0;
+    app.apiVersion = VK_API_VERSION_1_1;
 
     const char *inst_exts[1];
     uint32_t n_inst_exts = 0;
@@ -3632,10 +3645,17 @@ static int vulkan_dispatch(VkPipeline pipeline,
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                              1, &fmb, 0, NULL, 0, NULL);
     } else {
+        /* Default: order SHADER writes -> SHADER reads between compute stages.
+         * On host-visible (GTT) memory the SHADER_* masks are insufficient on
+         * some drivers (RADV): the compute->compute barrier then fails to order
+         * a prior kernel's write against the next kernel's read, so a fast
+         * kernel reads stale GTT data and the output is non-deterministic.
+         * Widen the masks to MEMORY_READ|MEMORY_WRITE so host-visible memory is
+         * ordered too (DS4_VULKAN_FULL_BARRIER tests the all-commands variant). */
         VkMemoryBarrier mb = {};
         mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                              1, &mb, 0, NULL, 0, NULL);
@@ -6028,11 +6048,20 @@ int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
 
 /* --- Fase 3: attention decode / prefill ---------------------------------- */
 
+/* Select the attention-decode pipeline.  Only the bit-identical serial kernel
+ * (attn_decode, DS4_PIPE_ATTN_DECODE) remains; the v2 (lane-parallel, fast but
+ * non-bit-identical) and v3 (bit-identical copy) variants were removed (the
+ * bit-identical requirement is incompatible with the coalesced lane-parallel
+ * order, so there is no fast bit-identical kernel). */
+static VkPipeline vulkan_attn_decode_pipe(void) {
+    return g_pipes[DS4_PIPE_ATTN_DECODE];
+}
+
 /* Shared attention decode launcher.  Computes per (token, head) block the
  * attention over a raw ring-buffer span plus optional compressed rows, using
  * a global score scratch (binding OUT3) so large contexts never exceed the
  * groupshared limit.  raw_cap may be 0 when raw_kv is a plain (non-ring)
- * buffer (prefill), where n_raw rows are read from rows [raw_start, ...). */
+ * buffer (prefill), where n_raw rows are read from rows [raw_start, ...]. */
 static int vulkan_attn_decode_common(VkPipeline pipe, ds4_gpu_tensor *heads,
                                      const void *model_map,
                                      uint64_t model_size,
@@ -6046,8 +6075,9 @@ static int vulkan_attn_decode_common(VkPipeline pipe, ds4_gpu_tensor *heads,
                                      const ds4_gpu_tensor *comp_mask,
                                      uint32_t use_mask, uint32_t n_tokens,
                                      uint32_t pos0, uint32_t window,
-                                     uint32_t ratio, uint32_t n_head,
-                                     uint32_t head_dim) {
+                                      uint32_t ratio, uint32_t n_head,
+                                      uint32_t head_dim) {
+    pipe = vulkan_attn_decode_pipe();
     if (!heads || !q || !raw_kv || !model_map || n_head == 0 ||
         head_dim == 0 || n_tokens == 0 || n_raw == 0 ||
         (raw_cap != 0 && raw_cap < n_raw) ||

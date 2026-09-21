@@ -862,6 +862,17 @@ tests/test_vulkan_smoke: tests/test_vulkan_smoke.o ds4_vulkan.o ds4_vulkan_compa
 test-vulkan-smoke: tests/test_vulkan_smoke
 	./tests/test_vulkan_smoke
 
+# --- attn_det: standalone attention-decode determinism/correctness test -----
+# Runs the attn_decode kernel on synthetic data (no model).
+ATNNDET_DIR = vulkan/tools/attn_det
+$(ATNNDET_DIR)/attn_det.o: $(ATNNDET_DIR)/attn_det.c ds4_gpu.h
+	gcc $(CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $(ATNNDET_DIR)/attn_det.c
+
+attn_det: $(ATNNDET_DIR)/attn_det.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
+	g++ -std=c++17 -pthread -o $@ $^ -lvulkan -lm
+
+.PHONY: attn_det
+
 # --- vkbench GPU benchmark (vulkan/tools/vkbench) ---------------------------
 VKBENCH_DIR = vulkan/tools/vkbench
 VKBENCH_HDRS = $(VKBENCH_DIR)/saxpy_spv.h $(VKBENCH_DIR)/madloop_spv.h
