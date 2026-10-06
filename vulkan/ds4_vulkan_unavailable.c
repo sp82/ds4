@@ -205,10 +205,10 @@ VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_projection_rows)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_dsv41_gather_kv)
 VULKAN_UNAVAILABLE_UINT64(ds4_gpu_dsv41_indexer_packed_bytes)
 
-/* Upstream Qwen3.8 Flash Next surface.  Unreachable on the Vulkan runtime
- * (Qwen family is out of scope; the engine gates Qwen paths behind a loaded
- * Qwen model).  attn_part_floats returns a byte count (0), set_rope /
- * set_verify_rows_exact are void. */
+/* Upstream Qwen3.8 Flash Next surface.  Port in progress (P0 harness):
+ * single-session kernels are being implemented in ds4_vulkan.c; until each
+ * one lands it stays a mute stub here so the backend links.  attn_part_floats
+ * returns a byte count (0), set_rope / set_verify_rows_exact are void. */
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_argmax_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_attn_decode_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_attn_prep_tensor)
@@ -229,6 +229,7 @@ VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_idx_block_key_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_idx_expand_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_idx_score_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_idx_select_tensor)
+VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_matmul_q8_0_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_matmul_q8_0_weights_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_moe_build_lists_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_moe_down_tensor)

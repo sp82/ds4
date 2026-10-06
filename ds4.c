@@ -71742,6 +71742,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
             e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA ||
+#ifdef DS4_VULKAN_BUILD
+            e->backend == DS4_BACKEND_VULKAN ||
+#endif
 #endif
             (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
@@ -71749,7 +71752,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
             e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
             (opt->mtp_path && opt->mtp_path[0])) {
-            fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA (or --cpu --first-token-test); "
+            fprintf(stderr, "ds4: Qwen3.8 requires Metal, CUDA or Vulkan (or --cpu --first-token-test); "
                             "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
                             "external MTP models and power throttling are not supported\n");
             ds4_engine_close(e);
