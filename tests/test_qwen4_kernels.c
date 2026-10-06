@@ -3611,6 +3611,26 @@ int main(void) {
         printf("all qwen4 MoE decode tests passed\n");
         return 0;
     }
+    if (getenv("DS4_TEST_QWEN4_HC_ONLY")) {
+        test_decode_fusions(&arena);
+        test_hc_pair_groups(&arena);
+        test_mv_ext_groups(&arena);
+        test_hc_mix_prefetch(&arena);
+        test_hc(&arena, 2560, 320, 3, 1u);
+        test_hc(&arena, 2560, 320, 2, 1u);
+        test_hc(&arena, 2560, 320, 2, 0u);
+        test_hc(&arena, 2560, 320, 1, 0u);
+        test_hc(&arena, 2560, 320, 2, 8u);
+        test_hc(&arena, 2560, 320, 1, 8u);
+        test_hc(&arena, 64, 8, 5, 1u);
+        test_hc(&arena, 64, 8, 2, 0u);
+        test_hc(&arena, 64, 8, 1, 8u);
+        test_hc(&arena, 64, 8, 3, 8u);
+        test_ple(&arena, 2560, 3);
+        test_ple(&arena, 64, 12);
+        printf("all qwen4 HC + PLE tests passed\n");
+        return 0;
+    }
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {

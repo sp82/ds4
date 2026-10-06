@@ -187,8 +187,15 @@ enum ds4_vk_pipe {
     DS4_PIPE_QWEN4_MOE_BUILD_LISTS,
     DS4_PIPE_QWEN4_MOE_MM_MID,
     DS4_PIPE_QWEN4_MOE_MM_DOWN,
+    DS4_PIPE_QWEN4_HC_NORM,
+    DS4_PIPE_QWEN4_HC_GATE_MIX,
+    DS4_PIPE_QWEN4_HC_COMBINE,
+    DS4_PIPE_QWEN4_HC_LO,
+    DS4_PIPE_QWEN4_HC_MIX_ROWS,
+    DS4_PIPE_QWEN4_PLE_GATE,
+    DS4_PIPE_QWEN4_PLE_CONV,
 };
-#define DS4_VK_PIPE_COUNT 95
+#define DS4_VK_PIPE_COUNT 102
 
 /* Active pipeline table (swapped per logical device tier by the context
  * save/load path). */

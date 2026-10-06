@@ -75,9 +75,9 @@ static int               g_ts_verbose = 0;
 static uint32_t          g_ts_valid_bits = 0;
 /* Verbose mode (DS4_VULKAN_DEBUG_GPU_TS_VERBOSE): timestamp every dispatch of
  * a scope and report the per-dispatch GPU time with the pipe name. */
-static uint32_t          g_ts_pipe[96];
+static uint32_t          g_ts_pipe[DS4_VK_PIPE_COUNT];
 static uint32_t          g_ts_n = 0;
-static char              g_pipe_names[96][24];
+static char              g_pipe_names[DS4_VK_PIPE_COUNT][24];
 static VkCommandPool     g_cmd_pool  = VK_NULL_HANDLE;
 /* Compute-scope command buffers, double-buffered (Fase 7 flush early-submit):
  * a scope can be submitted while the sibling CB records the next one, so the
@@ -2180,6 +2180,16 @@ static int vulkan_compute_init(void) {
           "moe_mm_mid" },
         { ds4_spv_qwen4_moe_mm_down, ds4_spv_qwen4_moe_mm_down_len,
           "moe_mm_down" },
+        { ds4_spv_qwen4_hc_norm, ds4_spv_qwen4_hc_norm_len, "hc_norm" },
+        { ds4_spv_qwen4_hc_gate_mix, ds4_spv_qwen4_hc_gate_mix_len,
+          "hc_gate_mix" },
+        { ds4_spv_qwen4_hc_combine, ds4_spv_qwen4_hc_combine_len,
+          "hc_combine" },
+        { ds4_spv_qwen4_hc_lo, ds4_spv_qwen4_hc_lo_len, "hc_lo" },
+        { ds4_spv_qwen4_hc_mix_rows, ds4_spv_qwen4_hc_mix_rows_len,
+          "hc_mix_rows" },
+        { ds4_spv_qwen4_ple_gate, ds4_spv_qwen4_ple_gate_len, "ple_gate" },
+        { ds4_spv_qwen4_ple_conv, ds4_spv_qwen4_ple_conv_len, "ple_conv" },
     };
     for (uint32_t i = 0; i < DS4_VK_PIPE_COUNT; i++) {
         snprintf(g_pipe_names[i], sizeof(g_pipe_names[i]), "%s",

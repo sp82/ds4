@@ -210,17 +210,8 @@ VULKAN_UNAVAILABLE_UINT64(ds4_gpu_dsv41_indexer_packed_bytes)
  * one lands it stays a mute stub here so the backend links.  attn_part_floats
  * returns a byte count (0), set_rope / set_verify_rows_exact are void. */
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_argmax_tensor)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_decode_fusions_enabled)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_combine_norm_tensor)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_combine_tensor)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_gate_mix_tensor)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_lo_act_tensor)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_mix_rows_tensor)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_hc_norm_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_mtp_combine_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_mtp_stage_tensor)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_ple_conv_tensor)
-VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_ple_gate_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_qwen4_vision_encode)
 VULKAN_UNAVAILABLE_VOID(ds4_gpu_qwen4_set_verify_rows_exact)
 
