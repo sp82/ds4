@@ -1,0 +1,788 @@
+/* vulkan/ds4_vulkan_qwen.c -- Qwen3.8-Flash-Next (qwen4exp) Vulkan backend.
+ *
+ * Per-family TU: the Qwen4 single-session ds4_gpu_qwen4_* entry points.  It
+ * records dispatches through the shared core surface exposed by
+ * ds4_vulkan_internal.h (bindings, push-constant mirror, pipe table, launcher
+ * and bind/scratch helpers); everything else stays private to ds4_vulkan.c.
+ *
+ * P1 milestone 1 is single-session (CUDA parity): decode T=1, prefill, MTP.
+ * The batch surface (_rows/_rows2/_grouped/batch_mm_q8) is Metal-only and out
+ * of scope.  Numeric target: f32 activations, deterministic groupshared
+ * reductions, parity with tests/test_qwen4_kernels.c.
+ *
+ * This file is compiled as C++17 with C linkage (ds4_gpu.h wraps the API in
+ * extern "C"), matching ds4_vulkan.c. */
+
+#include <vulkan/vulkan.h>
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "ds4_gpu.h"
+#include "ds4_gpu_mgpu.h"
+#include "ds4_vulkan_internal.h"
+
+/* GGUF type ids (ds4.c): 0 F32, 1 F16, 2 Q4_0, 8 Q8_0, 12 Q4_K, 30 BF16. */
+
+/* Qwen rope table (ds4_gpu_qwen4_set_rope).  Kept host-side and uploaded
+ * lazily to a small tensor that attn_prep / block_key bind.  When no table is
+ * set the shaders derive frequencies from `base` (plain rope). */
+static float g_qwen4_rope_freq[32];
+static uint32_t g_qwen4_rope_pairs = 0;
+static float g_qwen4_rope_scale = 1.0f;
+static int g_qwen4_rope_set = 0;
+static ds4_gpu_tensor *g_qwen4_rope_tensor = NULL;
+
+void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n_pairs, float mscale) {
+    g_qwen4_rope_set = freq != NULL;
+    g_qwen4_rope_scale = freq ? mscale : 1.0f;
+    memset(g_qwen4_rope_freq, 0, sizeof(g_qwen4_rope_freq));
+    g_qwen4_rope_pairs = freq ? (n_pairs < 32u ? n_pairs : 32u) : 0u;
+    if (freq) memcpy(g_qwen4_rope_freq, freq, g_qwen4_rope_pairs * sizeof(float));
+    if (g_qwen4_rope_tensor) {
+        ds4_gpu_tensor_free(g_qwen4_rope_tensor);
+        g_qwen4_rope_tensor = NULL;
+    }
+}
+
+static const ds4_gpu_tensor *qwen4_rope_table(void) {
+    if (!g_qwen4_rope_set) return NULL;
+    if (!g_qwen4_rope_tensor) {
+        g_qwen4_rope_tensor = ds4_gpu_tensor_alloc(32u * sizeof(float));
+        if (g_qwen4_rope_tensor) {
+            (void)ds4_gpu_tensor_write(g_qwen4_rope_tensor, 0,
+                                       g_qwen4_rope_freq,
+                                       32u * sizeof(float));
+        }
+    }
+    return g_qwen4_rope_tensor;
+}
+
+/* Model range check: in-window and inside the registered map. */
+static int qwen4_range_ok(uint64_t off, uint64_t bytes, uint64_t model_size) {
+    if (off > model_size || bytes > model_size - off) return 0;
+    return vulkan_model_range_ok(off, bytes);
+}
+
+/* Exact byte length of one weight row for a dense type, or 0 when the type is
+ * not handled by the dense path. */
+static uint64_t qwen4_dense_row_bytes(uint32_t type, uint32_t in_dim) {
+    switch (type) {
+    case 0u:  /* F32 */
+        return (uint64_t)in_dim * 4u;
+    case 1u:  /* F16 */
+    case 30u: /* BF16 */
+        return (uint64_t)in_dim * 2u;
+    case 8u:  /* Q8_0: 34-byte block / 32 values */
+        if (in_dim % 32u != 0u) return 0;
+        return ((uint64_t)in_dim / 32u) * 34u;
+    case 2u:  /* Q4_0: 18-byte block / 32 values */
+        if (in_dim % 32u != 0u) return 0;
+        return ((uint64_t)in_dim / 32u) * 18u;
+    case 12u: /* Q4_K: 144-byte block / 256 values */
+        if (in_dim % 256u != 0u) return 0;
+        return ((uint64_t)in_dim / 256u) * 144u;
+    default:
+        return 0;
+    }
+}
+
+/* Pipeline + push-constant block count for a dense type. */
+static VkPipeline qwen4_dense_pipe(uint32_t type, uint32_t in_dim,
+                                   uint32_t *blocks) {
+    switch (type) {
+    case 0u:
+        *blocks = (in_dim + 31u) / 32u;
+        return g_pipes[DS4_PIPE_MATMUL_F32];
+    case 1u:
+        *blocks = (in_dim + 31u) / 32u;
+        return g_pipes[DS4_PIPE_MATMUL_F16];
+    case 30u:
+        *blocks = (in_dim + 31u) / 32u;
+        return g_pipes[DS4_PIPE_MATMUL_BF16];
+    case 8u:
+        *blocks = in_dim / 32u;
+        return g_pipes[DS4_PIPE_MATMUL_Q8_0_F32];
+    case 2u:
+        *blocks = in_dim / 32u;
+        return g_pipes[DS4_PIPE_MATMUL_Q4_0];
+    case 12u:
+        *blocks = in_dim / 256u;
+        return g_pipes[DS4_PIPE_MATMUL_Q4K];
+    default:
+        *blocks = 0u;
+        return VK_NULL_HANDLE;
+    }
+}
+
+/* out[tok][row] = dot(w[row], x[tok]) with raw f32 activations.  `wbind` is
+ * the already-resolved weight bind (model window or GPU tensor). */
+static int qwen4_dense_bind(ds4_gpu_tensor *out, struct ds4_vk_bind wbind,
+                            uint32_t type, uint32_t n_tokens, uint32_t in_dim,
+                            uint32_t out_rows, const ds4_gpu_tensor *x) {
+    if (!out || !x || wbind.buffer == VK_NULL_HANDLE) return 0;
+    if (n_tokens == 0u || in_dim == 0u || out_rows == 0u) return 0;
+    if (x->bytes < (uint64_t)n_tokens * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_rows * sizeof(float)) {
+        return 0;
+    }
+    uint32_t blocks = 0u;
+    VkPipeline pipe = qwen4_dense_pipe(type, in_dim, &blocks);
+    if (pipe == VK_NULL_HANDLE) return 0;
+
+    struct ds4_vk_params p = {};
+    p.in_dim = in_dim;
+    p.out_dim = out_rows;
+    p.rows = n_tokens;
+    p.blocks = blocks;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, x);
+    binds[nb++] = wbind;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out);
+    return vulkan_dispatch(pipe, &p, sizeof(p), binds, nb, out_rows, n_tokens,
+                           1u);
+}
+
+int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+                                  const void *model_map, uint64_t model_size,
+                                  uint64_t weight_offset, uint32_t weight_type,
+                                  uint32_t n_tokens, uint32_t in_dim,
+                                  uint32_t out_rows) {
+    if (!out || !x || !model_map) return 0;
+    if (n_tokens == 0u || in_dim == 0u || out_rows == 0u) return 0;
+    const uint64_t row = qwen4_dense_row_bytes(weight_type, in_dim);
+    if (row == 0u || out_rows > UINT64_MAX / row) return 0;
+    const uint64_t weight_bytes = (uint64_t)out_rows * row;
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset) {
+        return 0;
+    }
+    if (!vulkan_model_range_ok(weight_offset, weight_bytes)) return 0;
+    const struct ds4_vk_bind wbind =
+        vulkan_bind_model(DS4_VK_BINDING_W, weight_offset, weight_bytes);
+    return qwen4_dense_bind(out, wbind, weight_type, n_tokens, in_dim, out_rows,
+                            x);
+}
+
+int ds4_gpu_qwen4_matmul_q8_0_tensor(ds4_gpu_tensor *out,
+                                     const void *model_map,
+                                     uint64_t model_size,
+                                     uint64_t weight_offset, uint64_t in_dim,
+                                     uint64_t out_dim,
+                                     const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+    return ds4_gpu_qwen4_dense_mm_tensor(
+        out, x, model_map, model_size, weight_offset, 8u, (uint32_t)n_tok,
+        (uint32_t)in_dim, (uint32_t)out_dim);
+}
+
+/* Single-token Q8_0 matvec whose weight rows live in a GPU tensor (the
+ * gathered MTP draft head); same math as the model-range path. */
+int ds4_gpu_qwen4_matmul_q8_0_weights_tensor(ds4_gpu_tensor *out,
+                                             const ds4_gpu_tensor *w,
+                                             uint32_t in_dim, uint32_t out_dim,
+                                             const ds4_gpu_tensor *x) {
+    if (!out || !w || !x) return 0;
+    if (in_dim == 0u || out_dim == 0u || in_dim % 32u != 0u) return 0;
+    const uint64_t row = ((uint64_t)in_dim / 32u) * 34u;
+    if (out_dim > UINT64_MAX / row) return 0;
+    if (w->bytes < (uint64_t)out_dim * row) return 0;
+    const struct ds4_vk_bind wbind =
+        vulkan_bind_tensor(DS4_VK_BINDING_W, w);
+    return qwen4_dense_bind(out, wbind, 8u, 1u, in_dim, out_dim, x);
+}
+
+/* Up to four projections of x in one entry point; weight types 0 f32, 1 f16,
+ * 2 q4_0, 8 q8_0, 12 q4_K, 30 bf16. */
+int ds4_gpu_qwen4_multi_gemv_tensor(const ds4_gpu_tensor *x, uint32_t n_tokens,
+                                    uint32_t in_dim, uint32_t n_out,
+                                    ds4_gpu_tensor *const *outs,
+                                    const void *model_map, uint64_t model_size,
+                                    const uint64_t *offsets,
+                                    const uint32_t *types,
+                                    const uint32_t *out_rows) {
+    if (!x || !outs || !offsets || !types || !out_rows) return 0;
+    if (n_out == 0u || n_out > 4u) return 0;
+    for (uint32_t i = 0; i < n_out; i++) {
+        if (!ds4_gpu_qwen4_dense_mm_tensor(outs[i], x, model_map, model_size,
+                                           offsets[i], types[i], n_tokens,
+                                           in_dim, out_rows[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Concatenated Q8_0 projection: two matvecs sharing x.  CUDA parity requires
+ * even output widths. */
+int ds4_gpu_qwen4_q8_pair_tensor(ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+                                 const void *model_map, uint64_t model_size,
+                                 uint64_t weight0_offset,
+                                 uint64_t weight1_offset, uint64_t in_dim,
+                                 uint64_t out0_dim, uint64_t out1_dim,
+                                 const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if ((out0_dim & 1u) != 0u || (out1_dim & 1u) != 0u) return 0;
+    if (!ds4_gpu_qwen4_matmul_q8_0_tensor(out0, model_map, model_size,
+                                          weight0_offset, in_dim, out0_dim, x,
+                                          n_tok)) {
+        return 0;
+    }
+    return ds4_gpu_qwen4_matmul_q8_0_tensor(out1, model_map, model_size,
+                                            weight1_offset, in_dim, out1_dim, x,
+                                            n_tok);
+}
+
+/* --- P2: gated delta-net (GDN) -------------------------------------------
+ *
+ * Single-session parity with the CUDA reference (ds4_qwen4_cuda.cuh):
+ * conv_stream, gdn_prep, gdn_scan, gdn_out, and gdn_front (conv + alpha/beta
+ * dense projections + prep).  All activations are f32.  The scan is
+ * sequential over tokens (parallel over state rows) and its groupshared
+ * reduction is independent of the chunk length, so split/batched prefill is
+ * byte-exact. */
+
+/* Depthwise causal conv (K in 2..4) over `history`, optionally SiLU, writing
+ * back into x and, at token snap_t/snap2_t, into the snapshot tensors. */
+static int qwen4_conv_dispatch(ds4_gpu_tensor *x, ds4_gpu_tensor *history,
+                               uint64_t model_size, uint64_t conv_off,
+                               uint32_t T, uint32_t C, uint32_t K,
+                               bool activate, ds4_gpu_tensor *snap,
+                               uint32_t snap_t, ds4_gpu_tensor *snap2,
+                               uint32_t snap2_t) {
+    if (!x || !history) return 0;
+    if (T == 0u || C == 0u || K < 2u || K > 4u) return 0;
+    if (x->bytes < (uint64_t)T * C * sizeof(float) ||
+        history->bytes < (uint64_t)(K - 1u) * C * sizeof(float)) {
+        return 0;
+    }
+    const uint64_t wbytes = (uint64_t)C * K * sizeof(float);
+    if (conv_off > model_size || wbytes > model_size - conv_off) return 0;
+    if (!vulkan_model_range_ok(conv_off, wbytes)) return 0;
+    const uint64_t hbytes = (uint64_t)(K - 1u) * C * sizeof(float);
+    if (snap && snap->bytes < hbytes) return 0;
+    if (snap2 && snap2->bytes < hbytes) return 0;
+
+    struct ds4_vk_params p = {};
+    p.n = C;
+    p.rows = T;
+    p.in_dim = K;
+    p.flags = activate ? 1u : 0u;
+    p.index = snap ? snap_t : 0xffffffffu;
+    p.aux = snap2 ? snap2_t : 0xffffffffu;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, x);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT2, history);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_W, conv_off, wbytes);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT3,
+                                     snap ? snap : history);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT4,
+                                     snap2 ? snap2 : history);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_CONV_STREAM], &p, sizeof(p), binds,
+                           nb, (C + 255u) / 256u, 1u, 1u);
+}
+
+int ds4_gpu_qwen4_conv_stream_tensor(ds4_gpu_tensor *x, ds4_gpu_tensor *state,
+                                     const void *model_map, uint64_t model_size,
+                                     uint64_t weight_offset, uint32_t n_tokens,
+                                     uint32_t n_channels, uint32_t conv_kernel,
+                                     bool apply_silu) {
+    if (!model_map) return 0;
+    return qwen4_conv_dispatch(x, state, model_size, weight_offset, n_tokens,
+                               n_channels, conv_kernel, apply_silu, NULL, 0u,
+                               NULL, 0u);
+}
+
+int ds4_gpu_qwen4_gdn_prep_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tensor *a,
+                                  ds4_gpu_tensor *b, const void *model_map,
+                                  uint64_t model_size, uint64_t ssm_a_offset,
+                                  uint64_t dt_bias_offset, uint32_t n_tokens,
+                                  uint32_t n_k_head, uint32_t n_v_head,
+                                  uint32_t head_dim) {
+    if (!qkv || !a || !b || !model_map) return 0;
+    if (n_tokens == 0u || n_k_head == 0u || n_v_head == 0u) return 0;
+    if (head_dim < 32u || head_dim > 128u || (head_dim & 31u) != 0u) return 0;
+    const uint64_t qkv_bytes = (uint64_t)n_tokens *
+                               (2u * n_k_head + n_v_head) * head_dim *
+                               sizeof(float);
+    const uint64_t ab_bytes = (uint64_t)n_tokens * n_v_head * sizeof(float);
+    if (qkv->bytes < qkv_bytes || a->bytes < ab_bytes || b->bytes < ab_bytes) {
+        return 0;
+    }
+    const uint64_t wbytes = (uint64_t)n_v_head * sizeof(float);
+    if (ssm_a_offset > model_size || wbytes > model_size - ssm_a_offset) {
+        return 0;
+    }
+    if (dt_bias_offset > model_size || wbytes > model_size - dt_bias_offset) {
+        return 0;
+    }
+    if (!vulkan_model_range_ok(ssm_a_offset, wbytes) ||
+        !vulkan_model_range_ok(dt_bias_offset, wbytes)) {
+        return 0;
+    }
+
+    struct ds4_vk_params p = {};
+    p.n = head_dim;
+    p.rows = n_tokens;
+    p.in_dim = n_k_head;
+    p.out_dim = n_v_head;
+    p.eps = 1e-6f;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, qkv);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT2, a);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT3, b);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_W, ssm_a_offset, wbytes);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_C, dt_bias_offset, wbytes);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_GDN_PREP], &p, sizeof(p), binds, nb,
+                           n_k_head, n_tokens, 1u);
+}
+
+int ds4_gpu_qwen4_gdn_scan_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *state,
+                                  const ds4_gpu_tensor *qkv,
+                                  const ds4_gpu_tensor *a,
+                                  const ds4_gpu_tensor *b, uint32_t n_tokens,
+                                  uint32_t n_k_head, uint32_t n_v_head,
+                                  uint32_t head_dim,
+                                  ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+                                  ds4_gpu_tensor *snap2_state,
+                                  uint32_t snap2_tok) {
+    if (!out || !state || !qkv || !a || !b) return 0;
+    if (n_tokens == 0u || n_k_head == 0u || n_v_head == 0u) return 0;
+    if (n_v_head % n_k_head != 0u) return 0;
+    if (head_dim < 32u || head_dim > 128u || (head_dim & 31u) != 0u) return 0;
+    const uint32_t rows = n_tokens > 8u ? 4u : 1u;
+    if (head_dim % (4u * rows) != 0u) return 0;
+    const uint64_t state_bytes = (uint64_t)n_v_head * head_dim * head_dim * 4u;
+    const uint64_t out_bytes = (uint64_t)n_tokens * n_v_head * head_dim * 4u;
+    const uint64_t qkv_bytes = (uint64_t)n_tokens *
+                               (2u * n_k_head + n_v_head) * head_dim * 4u;
+    const uint64_t ab_bytes = (uint64_t)n_tokens * n_v_head * 4u;
+    if (out->bytes < out_bytes || state->bytes < state_bytes ||
+        qkv->bytes < qkv_bytes || a->bytes < ab_bytes || b->bytes < ab_bytes) {
+        return 0;
+    }
+    if (snap_state && snap_state->bytes < state_bytes) return 0;
+    if (snap2_state && snap2_state->bytes < state_bytes) return 0;
+
+    struct ds4_vk_params p = {};
+    p.n = head_dim;
+    p.rows = n_tokens;
+    p.in_dim = n_k_head;
+    p.out_dim = n_v_head;
+    p.index = snap_state ? snap_tok : 0xffffffffu;
+    p.aux = snap2_state ? snap2_tok : 0xffffffffu;
+    p.rsvd2 = rows;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT2, state);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, qkv);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_B, a);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_C, b);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT3,
+                                     snap_state ? snap_state : state);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT4,
+                                     snap2_state ? snap2_state : state);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_GDN_SCAN], &p, sizeof(p), binds, nb,
+                           head_dim / (4u * rows), n_v_head, 1u);
+}
+
+int ds4_gpu_qwen4_gdn_out_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
+                                 const void *model_map, uint64_t model_size,
+                                 uint64_t weight_offset, uint32_t n_tokens,
+                                 uint32_t n_head, uint32_t head_dim, float eps) {
+    if (!o || !z || !model_map) return 0;
+    if (n_tokens == 0u || n_head == 0u) return 0;
+    if (head_dim < 32u || head_dim > 128u || (head_dim & 31u) != 0u) return 0;
+    const uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
+    if (o->bytes < n * 4u || z->bytes < n * 4u) return 0;
+    const uint64_t wbytes = (uint64_t)head_dim * sizeof(float);
+    if (weight_offset > model_size || wbytes > model_size - weight_offset) {
+        return 0;
+    }
+    if (!vulkan_model_range_ok(weight_offset, wbytes)) return 0;
+
+    struct ds4_vk_params p = {};
+    p.n = head_dim;
+    p.rows = n_tokens;
+    p.in_dim = n_head;
+    p.eps = eps;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, o);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_B, z);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_W, weight_offset, wbytes);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_GDN_OUT], &p, sizeof(p), binds, nb,
+                           n_head, n_tokens, 1u);
+}
+
+int ds4_gpu_qwen4_gdn_front_tensor(
+    ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
+    ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, const void *model_map,
+    uint64_t model_size, uint64_t conv_offset, uint64_t alpha_offset,
+    uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
+    uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head,
+    uint32_t n_v_head, uint32_t head_dim, uint32_t conv_kernel,
+    uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+    ds4_gpu_tensor *snap2_state, uint32_t snap2_tok) {
+    if (!qkv || !state || !mixed || !ga || !gb || !model_map) return 0;
+    if (n_tokens == 0u || n_k_head == 0u || n_v_head == 0u || in_dim == 0u) {
+        return 0;
+    }
+    if (head_dim < 32u || head_dim > 128u || (head_dim & 31u) != 0u) return 0;
+    if (conv_kernel < 2u || conv_kernel > 4u) return 0;
+    const uint64_t C = (uint64_t)(2u * n_k_head + n_v_head) * head_dim;
+    if (C > UINT32_MAX) return 0;
+
+    if (!ds4_gpu_qwen4_dense_mm_tensor(ga, mixed, model_map, model_size,
+                                       alpha_offset, weight_type, n_tokens,
+                                       in_dim, n_v_head)) {
+        return 0;
+    }
+    if (!ds4_gpu_qwen4_dense_mm_tensor(gb, mixed, model_map, model_size,
+                                       beta_offset, weight_type, n_tokens,
+                                       in_dim, n_v_head)) {
+        return 0;
+    }
+    if (!qwen4_conv_dispatch(qkv, state, model_size, conv_offset, n_tokens,
+                             (uint32_t)C, conv_kernel, true, snap_state, snap_tok,
+                             snap2_state, snap2_tok)) {
+        return 0;
+    }
+    return ds4_gpu_qwen4_gdn_prep_tensor(qkv, ga, gb, model_map, model_size,
+                                         ssm_a_offset, dt_bias_offset, n_tokens,
+                                         n_k_head, n_v_head, head_dim);
+}
+
+/* --- P3: QSA indexer ------------------------------------------------------
+ *
+ * score[t][b] = sum_h relu(q_h . key_b) over the indexer heads, with the
+ * incomplete/future blocks scored -3e38; the optional tile_max scratch holds
+ * per-8-block maxima as uint keys; the exact 4-pass radix select and the token
+ * expansion match the CUDA reference (ds4_qwen4_cuda.cuh). */
+
+int ds4_gpu_qwen4_idx_score_tensor(ds4_gpu_tensor *score,
+                                   ds4_gpu_tensor *tile_max,
+                                   const ds4_gpu_tensor *iq,
+                                   const ds4_gpu_tensor *block_key,
+                                   uint32_t n_tokens, uint32_t n_blocks,
+                                   uint32_t n_idx_head, uint32_t idx_dim,
+                                   uint32_t pos0, uint32_t ratio) {
+    if (!score || !iq || !block_key) return 0;
+    if (n_tokens == 0u || n_blocks == 0u || n_idx_head == 0u ||
+        idx_dim == 0u || ratio == 0u) {
+        return 0;
+    }
+    if (score->bytes < (uint64_t)n_tokens * n_blocks * 4u ||
+        iq->bytes < (uint64_t)n_tokens * n_idx_head * idx_dim * 4u ||
+        block_key->bytes < (uint64_t)n_blocks * idx_dim * 2u) {
+        return 0;
+    }
+    const uint32_t nt = (n_blocks + 7u) / 8u;
+    if (tile_max && tile_max->bytes < (uint64_t)n_tokens * nt * 4u) return 0;
+
+    struct ds4_vk_params p = {};
+    p.n = n_blocks;
+    p.rows = n_tokens;
+    p.in_dim = n_idx_head;
+    p.out_dim = idx_dim;
+    p.pos0 = pos0;
+    p.ratio = ratio;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, score);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, iq);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_B, block_key);
+    if (!vulkan_dispatch(g_pipes[DS4_PIPE_IDX_SCORE], &p, sizeof(p), binds, nb,
+                         n_blocks, n_tokens, 1u)) {
+        return 0;
+    }
+    if (tile_max) {
+        struct ds4_vk_params pt = {};
+        pt.n = n_blocks;
+        pt.rows = n_tokens;
+        pt.blocks = nt;
+        struct ds4_vk_bind tb[DS4_VK_MAX_BINDS];
+        uint32_t tnb = 0;
+        tb[tnb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, tile_max);
+        tb[tnb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, score);
+        if (!vulkan_dispatch(g_pipes[DS4_PIPE_IDX_TILE_MAX], &pt, sizeof(pt),
+                             tb, tnb, (nt + 255u) / 256u, n_tokens, 1u)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int ds4_gpu_qwen4_idx_select_tensor(ds4_gpu_tensor *sel,
+                                    const ds4_gpu_tensor *score,
+                                    const ds4_gpu_tensor *tile_max,
+                                    uint32_t n_blocks, uint32_t n_tokens,
+                                    uint32_t top_k) {
+    (void)tile_max; /* CUDA/Vulkan select is always the exact full-row radix */
+    if (!sel || !score) return 0;
+    if (n_tokens == 0u || top_k == 0u || top_k > n_blocks) return 0;
+    if (sel->bytes < (uint64_t)n_tokens * top_k * 4u ||
+        score->bytes < (uint64_t)n_tokens * n_blocks * 4u) {
+        return 0;
+    }
+    struct ds4_vk_params p = {};
+    p.n = n_blocks;
+    p.out_dim = top_k;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, sel);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, score);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_IDX_SELECT], &p, sizeof(p), binds,
+                           nb, n_tokens, 1u, 1u);
+}
+
+int ds4_gpu_qwen4_idx_expand_tensor(ds4_gpu_tensor *sel_tokens,
+                                    ds4_gpu_tensor *n_sel,
+                                    const ds4_gpu_tensor *sel_blocks,
+                                    uint32_t n_tokens, uint32_t n_sel_blocks,
+                                    uint32_t ratio, uint32_t pos0,
+                                    uint32_t sel_stride) {
+    if (!sel_tokens || !n_sel || !sel_blocks) return 0;
+    if (n_tokens == 0u || n_sel_blocks == 0u || ratio == 0u) return 0;
+    if ((uint64_t)n_sel_blocks * ratio + ratio - 1u > sel_stride) return 0;
+    if (sel_tokens->bytes < (uint64_t)n_tokens * sel_stride * 4u ||
+        n_sel->bytes < (uint64_t)n_tokens * 4u ||
+        sel_blocks->bytes < (uint64_t)n_tokens * n_sel_blocks * 4u) {
+        return 0;
+    }
+    struct ds4_vk_params p = {};
+    p.n = n_sel_blocks;
+    p.in_dim = sel_stride;
+    p.ratio = ratio;
+    p.pos0 = pos0;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, sel_tokens);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT2, n_sel);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, sel_blocks);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_IDX_EXPAND], &p, sizeof(p), binds,
+                           nb, n_tokens, 1u, 1u);
+}
+
+/* --- P3: full attention --------------------------------------------------
+ *
+ * attn_prep normalises q/k (rope + per-head gamma), copies the attention gate
+ * and fills the f16 k/v caches, the indexer q, the raw indexer key; block_key
+ * builds the per-block indexer keys; attn_decode is the scalar online-softmax
+ * attention (with optional split-KV partials) and attn_merge reconnects them.
+ * The batch (_rows) surface is Metal-only. */
+
+int ds4_gpu_qwen4_attn_prep_tensor(
+    ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *k_cache,
+    ds4_gpu_tensor *v_cache, ds4_gpu_tensor *iq_out, ds4_gpu_tensor *ik_cache,
+    const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj,
+    const ds4_gpu_tensor *vproj, const ds4_gpu_tensor *iq,
+    const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3, const void *model_map,
+    uint64_t model_size, uint64_t g_q_offset, uint64_t g_k_offset,
+    uint64_t g_iq_offset, uint32_t n_tokens, uint32_t n_head,
+    uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot, uint32_t n_idx_head,
+    uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap, float rope_base,
+    float eps) {
+    if (!q_out || !gate_out || !k_cache || !v_cache || !iq_out || !ik_cache ||
+        !qg || !kproj || !vproj || !iq || !ik || !pos3 || !model_map) {
+        return 0;
+    }
+    if (n_tokens == 0u || n_head == 0u || n_head_kv == 0u || n_head % n_head_kv ||
+        n_idx_head == 0u) {
+        return 0;
+    }
+    if (head_dim < 32u || head_dim > 256u || (head_dim & 31u) != 0u) return 0;
+    if (idx_dim < 32u || idx_dim > 128u || (idx_dim & 31u) != 0u) return 0;
+    if (n_rot > 64u || n_rot > head_dim || n_rot > idx_dim || (n_rot & 1u) != 0u) {
+        return 0;
+    }
+    if ((uint64_t)pos0 + n_tokens > cache_cap) return 0;
+    const uint64_t qb = (uint64_t)n_tokens * n_head * head_dim * 4u;
+    const uint64_t kb = (uint64_t)n_tokens * n_head_kv * head_dim * 4u;
+    const uint64_t ib = (uint64_t)n_tokens * n_idx_head * idx_dim * 4u;
+    if (q_out->bytes < qb || gate_out->bytes < qb || qg->bytes < qb * 2u ||
+        kproj->bytes < kb || vproj->bytes < kb || iq->bytes < ib ||
+        iq_out->bytes < ib || ik->bytes < (uint64_t)n_tokens * idx_dim * 4u ||
+        ik_cache->bytes < (uint64_t)cache_cap * idx_dim * 4u ||
+        k_cache->bytes < (uint64_t)cache_cap * n_head_kv * head_dim * 2u ||
+        v_cache->bytes < (uint64_t)cache_cap * n_head_kv * head_dim * 2u ||
+        pos3->bytes < (uint64_t)cache_cap * 16u) {
+        return 0;
+    }
+    const uint64_t gqb = (uint64_t)head_dim * 4u, gib = (uint64_t)idx_dim * 4u;
+    if (!qwen4_range_ok(g_q_offset, gqb, model_size) ||
+        !qwen4_range_ok(g_k_offset, gqb, model_size) ||
+        !qwen4_range_ok(g_iq_offset, gib, model_size)) {
+        return 0;
+    }
+    const ds4_gpu_tensor *rope = qwen4_rope_table();
+
+    struct ds4_vk_params p = {};
+    p.n = head_dim;
+    p.rows = n_tokens;
+    p.in_dim = n_head;
+    p.out_dim = n_head_kv;
+    p.aux = n_idx_head;
+    p.ratio = idx_dim;
+    p.pos0 = pos0;
+    p.eps = eps;
+    p.n_rot = n_rot;
+    p.freq_base = rope_base;
+    p.freq_scale = g_qwen4_rope_scale;
+    p.flags = g_qwen4_rope_set ? 2u : 0u;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, q_out);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT2, gate_out);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT3, k_cache);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT4, v_cache);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT5, iq_out);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_TBL, ik_cache);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, qg);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_B, kproj);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_C, vproj);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_W, iq);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X0, ik);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X1, pos3);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_X2, g_q_offset, gqb);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_X3, g_k_offset, gqb);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_X4, g_iq_offset, gib);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X5, rope ? rope : pos3);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_ATTN_PREP], &p, sizeof(p),
+                           binds, nb, n_head + n_head_kv + n_idx_head + 1u,
+                           n_tokens, 1u);
+}
+
+int ds4_gpu_qwen4_idx_block_key_tensor(
+    ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache,
+    const ds4_gpu_tensor *pos3, const void *model_map, uint64_t model_size,
+    uint64_t g_ik_offset, uint32_t block0, uint32_t n_blocks, uint32_t ratio,
+    uint32_t idx_dim, uint32_t n_rot, float rope_base, float eps) {
+    if (!block_key || !ik_cache || !pos3 || !model_map) return 0;
+    if (n_blocks == 0u || ratio == 0u) return 0;
+    if (idx_dim < 32u || idx_dim > 128u || (idx_dim & 31u) != 0u) return 0;
+    if (n_rot > idx_dim || n_rot > 64u || (n_rot & 1u) != 0u) return 0;
+    const uint64_t rows = (uint64_t)block0 + n_blocks;
+    if (block_key->bytes < rows * idx_dim * 2u ||
+        ik_cache->bytes < rows * ratio * idx_dim * 4u ||
+        pos3->bytes < rows * ratio * 16u) {
+        return 0;
+    }
+    const uint64_t wb = (uint64_t)idx_dim * 4u;
+    if (!qwen4_range_ok(g_ik_offset, wb, model_size)) return 0;
+    const ds4_gpu_tensor *rope = qwen4_rope_table();
+
+    struct ds4_vk_params p = {};
+    p.n = idx_dim;
+    p.rows = n_blocks;
+    p.in_dim = block0;
+    p.ratio = ratio;
+    p.eps = eps;
+    p.n_rot = n_rot;
+    p.freq_base = rope_base;
+    p.freq_scale = g_qwen4_rope_scale;
+    p.flags = g_qwen4_rope_set ? 2u : 0u;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, block_key);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, ik_cache);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_B, pos3);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_C, g_ik_offset, wb);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_W, rope ? rope : pos3);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_BLOCK_KEY], &p, sizeof(p),
+                           binds, nb, n_blocks, 1u, 1u);
+}
+
+int ds4_gpu_qwen4_attn_decode_tensor(
+    ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+    const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+    const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel,
+    ds4_gpu_tensor *part, uint32_t n_tokens, uint32_t n_head,
+    uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, bool use_sel,
+    uint32_t sel_stride, float scale) {
+    if (!out || !q || !gate || !k_cache || !v_cache) return 0;
+    if (n_tokens == 0u || n_head == 0u || n_head_kv == 0u || n_head % n_head_kv) {
+        return 0;
+    }
+    if (head_dim != 32u && head_dim != 128u && head_dim != 256u) return 0;
+    const uint64_t n = (uint64_t)n_tokens * n_head * head_dim * 4u;
+    const uint64_t cb = ((uint64_t)pos0 + n_tokens) * n_head_kv * head_dim * 2u;
+    if (out->bytes < n || q->bytes < n || gate->bytes < n ||
+        k_cache->bytes < cb || v_cache->bytes < cb) {
+        return 0;
+    }
+    if (use_sel) {
+        if (!sel_stride || !sel_tokens || !n_sel) return 0;
+        if (sel_tokens->bytes < (uint64_t)n_tokens * sel_stride * 4u ||
+            n_sel->bytes < (uint64_t)n_tokens * 4u) {
+            return 0;
+        }
+    }
+    const uint32_t keys = use_sel ? sel_stride : pos0 + n_tokens;
+    uint32_t splits = 1u;
+    if (part) {
+        splits = (keys + 31u) / 32u;
+        if (splits > 64u) splits = 64u;
+        if (splits == 0u) splits = 1u;
+        if (part->bytes <
+            (uint64_t)n_tokens * n_head * splits * (head_dim + 2u) * 4u) {
+            return 0;
+        }
+    }
+
+    struct ds4_vk_params p = {};
+    p.n = head_dim;
+    p.rows = n_tokens;
+    p.in_dim = n_head;
+    p.out_dim = n_head_kv;
+    p.pos0 = pos0;
+    p.ratio = sel_stride;
+    p.blocks = splits;
+    p.weight = scale;
+    p.flags = use_sel ? 1u : 0u;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT2,
+                                     part ? part : k_cache);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, q);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_B, gate);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_C, k_cache);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_W, v_cache);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X0,
+                                     use_sel ? sel_tokens : k_cache);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X1,
+                                     use_sel ? n_sel : k_cache);
+    if (!vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_ATTN_DECODE], &p, sizeof(p),
+                         binds, nb, n_head, n_tokens, splits)) {
+        return 0;
+    }
+    if (splits > 1u) {
+        struct ds4_vk_params pm = {};
+        pm.n = head_dim;
+        pm.in_dim = n_head;
+        pm.blocks = splits;
+        struct ds4_vk_bind mb[DS4_VK_MAX_BINDS];
+        uint32_t mnb = 0;
+        mb[mnb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out);
+        mb[mnb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, part);
+        mb[mnb++] = vulkan_bind_tensor(DS4_VK_BINDING_B, gate);
+        if (!vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_ATTN_MERGE], &pm,
+                             sizeof(pm), mb, mnb, n_head, n_tokens, 1u)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t n_tokens, uint32_t n_head,
+                                        uint32_t head_dim) {
+    return (uint64_t)n_tokens * n_head * 64u * (head_dim + 2u);
+}

@@ -101,6 +101,20 @@ SHADERS = [
     ("moe_group", "moe_group.hlsl", "moe_group"),
     ("matmul_q4k", "matmul_quant.hlsl", "matmul_q4k"),
     ("matmul_q4_0", "matmul_quant.hlsl", "matmul_q4_0"),
+    ("matmul_q8_0_f32", "matmul_quant.hlsl", "matmul_q8_0_f32"),
+    ("matmul_bf16", "matmul_quant.hlsl", "matmul_bf16"),
+    ("conv_stream", "gdn.hlsl", "conv_stream"),
+    ("gdn_prep", "gdn.hlsl", "gdn_prep"),
+    ("gdn_scan", "gdn.hlsl", "gdn_scan"),
+    ("gdn_out", "gdn.hlsl", "gdn_out"),
+    ("idx_score", "qwen4_idx.hlsl", "idx_score"),
+    ("idx_tile_max", "qwen4_idx.hlsl", "idx_tile_max"),
+    ("idx_select", "qwen4_idx.hlsl", "idx_select"),
+    ("idx_expand", "qwen4_idx.hlsl", "idx_expand"),
+    ("qwen4_attn_prep", "qwen4_attn.hlsl", "attn_prep"),
+    ("qwen4_block_key", "qwen4_attn.hlsl", "block_key"),
+    ("qwen4_attn_decode", "qwen4_attn.hlsl", "attn_decode"),
+    ("qwen4_attn_merge", "qwen4_attn.hlsl", "attn_merge"),
 ]
 
 # Binding shifts must match common.hlsl and the descriptor layout in

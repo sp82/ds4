@@ -150,6 +150,13 @@ float f16_at(ByteAddressBuffer w, uint off) {
     return f16tof32(bits);
 }
 
+/* Read an unaligned uint16 as a bfloat16 (GGUF type 30) and widen to f32:
+ * bf16 is the top 16 bits of an f32. */
+float bf16_at(ByteAddressBuffer w, uint off) {
+    uint bits = (w.Load(off & ~3u) >> ((off & 3u) * 8u)) & 0xffffu;
+    return asfloat(bits << 16u);
+}
+
 /* f32 -> f16 bit pattern, round-to-nearest-even, parity with CUDA
  * __float2half and the host f32_to_f16_rne reference.  Do NOT use HLSL
  * f32tof16 here: dxc lowers it to GLSL.std.450 PackHalf2x16, which is not

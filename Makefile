@@ -316,7 +316,7 @@ cuda:
 
 vulkan:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent vkbench \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_engram.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o ds4_layer_pack.o" \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_engram.o ds4_vulkan.o ds4_vulkan_qwen.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) -DDS4_VULKAN_BUILD" \
 		DS4_LINK="g++ -std=c++17 -pthread -rdynamic" \
 		DS4_LINK_LIBS="-lm -lvulkan"
@@ -847,11 +847,14 @@ VULKAN_SHADER_INC = vulkan/shaders/ds4_vulkan_shaders.inc
 vulkan/shaders/iq2_tables.hlsl vulkan/shaders/iq2_tables_host.h: vulkan/shaders/gen_iq2_tables.py cuda/mmq/ggml-common.h
 	python3 vulkan/shaders/gen_iq2_tables.py
 
-$(VULKAN_SHADER_INC): vulkan/shaders/gen_shaders.py vulkan/shaders/common.hlsl vulkan/shaders/iq2_tables.hlsl vulkan/shaders/unary.hlsl vulkan/shaders/argmax.hlsl vulkan/shaders/sort.hlsl vulkan/shaders/rmsnorm.hlsl vulkan/shaders/rope.hlsl vulkan/shaders/matmul_q8.hlsl vulkan/shaders/matmul_q8_preq.hlsl vulkan/shaders/matmul_q8_kslice.hlsl vulkan/shaders/quantize_q8.hlsl vulkan/shaders/top1.hlsl vulkan/shaders/f16_conv.hlsl vulkan/shaders/matmul_f16.hlsl vulkan/shaders/matmul_f32.hlsl vulkan/shaders/embed.hlsl vulkan/shaders/kv.hlsl vulkan/shaders/attention.hlsl vulkan/shaders/router.hlsl vulkan/shaders/moe.hlsl vulkan/shaders/moe_iq2.hlsl vulkan/shaders/moe_q4k.hlsl vulkan/shaders/moe_mxfp4.hlsl vulkan/shaders/matmul_quant.hlsl
+$(VULKAN_SHADER_INC): vulkan/shaders/gen_shaders.py vulkan/shaders/common.hlsl vulkan/shaders/iq2_tables.hlsl vulkan/shaders/unary.hlsl vulkan/shaders/argmax.hlsl vulkan/shaders/sort.hlsl vulkan/shaders/rmsnorm.hlsl vulkan/shaders/rope.hlsl vulkan/shaders/matmul_q8.hlsl vulkan/shaders/matmul_q8_preq.hlsl vulkan/shaders/matmul_q8_kslice.hlsl vulkan/shaders/quantize_q8.hlsl vulkan/shaders/top1.hlsl vulkan/shaders/f16_conv.hlsl vulkan/shaders/matmul_f16.hlsl vulkan/shaders/matmul_f32.hlsl vulkan/shaders/embed.hlsl vulkan/shaders/kv.hlsl vulkan/shaders/attention.hlsl vulkan/shaders/router.hlsl vulkan/shaders/moe.hlsl vulkan/shaders/moe_iq2.hlsl vulkan/shaders/moe_q4k.hlsl vulkan/shaders/moe_mxfp4.hlsl vulkan/shaders/matmul_quant.hlsl vulkan/shaders/gdn.hlsl vulkan/shaders/qwen4_idx.hlsl vulkan/shaders/qwen4_attn.hlsl
 	python3 vulkan/shaders/gen_shaders.py
 
-ds4_vulkan.o: vulkan/ds4_vulkan.c ds4_gpu.h ds4_gpu_mgpu.h $(VULKAN_SHADER_INC)
+ds4_vulkan.o: vulkan/ds4_vulkan.c ds4_gpu.h ds4_gpu_mgpu.h vulkan/ds4_vulkan_internal.h $(VULKAN_SHADER_INC)
 	g++ -std=c++17 -fno-finite-math-only -g $(NATIVE_CPU_FLAG) -Wall -Wextra -D_GNU_SOURCE -DDS4_VULKAN_BUILD -I. -Ivulkan -I/usr/include/vulkan -c -o $@ vulkan/ds4_vulkan.c
+
+ds4_vulkan_qwen.o: vulkan/ds4_vulkan_qwen.c ds4_gpu.h ds4_gpu_mgpu.h vulkan/ds4_vulkan_internal.h $(VULKAN_SHADER_INC)
+	g++ -std=c++17 -fno-finite-math-only -g $(NATIVE_CPU_FLAG) -Wall -Wextra -D_GNU_SOURCE -DDS4_VULKAN_BUILD -I. -Ivulkan -I/usr/include/vulkan -c -o $@ vulkan/ds4_vulkan_qwen.c
 
 ds4_vulkan_compat.o: vulkan/ds4_vulkan_compat.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 	g++ -std=c++17 -fno-finite-math-only -g $(NATIVE_CPU_FLAG) -Wall -Wextra -D_GNU_SOURCE -DDS4_VULKAN_BUILD -I. -I/usr/include/vulkan -c -o $@ vulkan/ds4_vulkan_compat.c
@@ -862,7 +865,7 @@ ds4_vulkan_unavailable.o: vulkan/ds4_vulkan_unavailable.c
 tests/test_vulkan_smoke.o: tests/test_vulkan_smoke.c ds4_gpu.h vulkan/shaders/iq2_tables_host.h
 	gcc $(CFLAGS) -I. -c -o $@ tests/test_vulkan_smoke.c
 
-tests/test_vulkan_smoke: tests/test_vulkan_smoke.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
+tests/test_vulkan_smoke: tests/test_vulkan_smoke.o ds4_vulkan.o ds4_vulkan_qwen.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
 	g++ -std=c++17 -pthread -o $@ $^ -lvulkan -lm
 
 test-vulkan-smoke: tests/test_vulkan_smoke
@@ -876,7 +879,7 @@ test-vulkan-smoke: tests/test_vulkan_smoke
 tests/test_qwen4_vulkan.o: tests/test_qwen4_kernels.c ds4_gpu.h ds4.h
 	gcc $(CFLAGS) -fno-fast-math -I. -c -o $@ tests/test_qwen4_kernels.c
 
-tests/test_qwen4_vulkan: tests/test_qwen4_vulkan.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
+tests/test_qwen4_vulkan: tests/test_qwen4_vulkan.o ds4_vulkan.o ds4_vulkan_qwen.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
 	g++ -std=c++17 -pthread -o $@ $^ -lvulkan -lm
 
 .PHONY: test-qwen4-vulkan
@@ -889,7 +892,7 @@ ATNNDET_DIR = vulkan/tools/attn_det
 $(ATNNDET_DIR)/attn_det.o: $(ATNNDET_DIR)/attn_det.c ds4_gpu.h
 	gcc $(CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $(ATNNDET_DIR)/attn_det.c
 
-attn_det: $(ATNNDET_DIR)/attn_det.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
+attn_det: $(ATNNDET_DIR)/attn_det.o ds4_vulkan.o ds4_vulkan_qwen.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
 	g++ -std=c++17 -pthread -o $@ $^ -lvulkan -lm
 
 .PHONY: attn_det
@@ -937,7 +940,7 @@ KBENCH_DIR = vulkan/tools/kbench
 $(KBENCH_DIR)/kbench.o: $(KBENCH_DIR)/kbench.c ds4_gpu.h
 	gcc $(CFLAGS) -I. -c -o $@ $(KBENCH_DIR)/kbench.c
 
-kbench: $(KBENCH_DIR)/kbench.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
+kbench: $(KBENCH_DIR)/kbench.o ds4_vulkan.o ds4_vulkan_qwen.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
 	g++ -std=c++17 -pthread -o $@ $^ -lvulkan -lm
 
 .PHONY: kbench
@@ -957,7 +960,7 @@ kbench-cuda: $(KBENCH_DIR)/kbench_cuda.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 $(KBENCH_DIR)/moebench.o: $(KBENCH_DIR)/moebench.c ds4_gpu.h
 	gcc $(CFLAGS) -I. -c -o $@ $(KBENCH_DIR)/moebench.c
 
-moebench: $(KBENCH_DIR)/moebench.o ds4_vulkan.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
+moebench: $(KBENCH_DIR)/moebench.o ds4_vulkan.o ds4_vulkan_qwen.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
 	g++ -std=c++17 -pthread -o $@ $^ -lvulkan -lm
 
 .PHONY: moebench

@@ -37,6 +37,7 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 #include "ds4_vulkan_mgpu.h"
+#include "ds4_vulkan_internal.h"
 
 #include "shaders/ds4_vulkan_shaders.inc"
 
@@ -46,48 +47,9 @@ extern "C" void ds4_vulkan_report_unavailable(void);
 
 #define DS4_VULKAN_LOG_PREFIX "ds4: Vulkan "
 
-/* Descriptor bindings shared with the HLSL (see common.hlsl): SRVs on
- * bindings 0..3 (t0..t3), the UAVs on bindings 4..7 (u0..u3). */
-#define DS4_VK_BINDING_A 0u
-#define DS4_VK_BINDING_B 1u
-#define DS4_VK_BINDING_C 2u
-#define DS4_VK_BINDING_W 3u   /* model weight buffer (ByteAddressBuffer) */
-#define DS4_VK_BINDING_OUT 4u
-#define DS4_VK_BINDING_OUT2 5u
-#define DS4_VK_BINDING_OUT3 6u
-#define DS4_VK_BINDING_OUT4 7u
-#define DS4_VK_BINDING_OUT5 8u
-#define DS4_VK_BINDING_TBL 9u  /* on-device expert->slot table (MoE pool) */
-#define DS4_VK_MAX_BINDS 10u
-
-/* Fixed push constant block.  Layout must match DS4Params in
- * shaders/common.hlsl (24 x uint32 = 96 bytes). */
-struct ds4_vk_params {
-    uint32_t n;         /* element count / head_dim / n_embd / row_width */
-    uint32_t rows;      /* n_tok / n_rows / n_heads * n_tok */
-    uint32_t in_dim;
-    uint32_t out_dim;
-    uint32_t n_rot;
-    uint32_t pos0;
-    uint32_t n_ctx_orig;
-    int32_t  inverse;
-    float    eps;
-    float    clamp;
-    float    weight;
-    float    freq_base;
-    float    freq_scale;
-    float    ext_factor;
-    float    attn_factor;
-    float    beta_fast;
-    float    beta_slow;
-    uint32_t blocks;
-    uint32_t index;
-    uint32_t aux;
-    uint32_t ratio;
-    uint32_t flags;
-    uint32_t rsvd2;
-    uint32_t rsvd3;
-};
+/* Bindings, push-constant mirror, pipe enum and the shared dispatch/bind
+ * helpers live in ds4_vulkan_internal.h (included above) so the per-family
+ * TUs (ds4_vulkan_qwen.c) can record dispatches without touching the core. */
 
 /* --- runtime state ----------------------------------------------------- */
 
@@ -268,86 +230,8 @@ static void vulkan_device_wait_impl(int reset_pool) {
  * worker uses vulkan_device_wait_impl(0) to drain without touching the pool. */
 static void vulkan_device_wait(void) { vulkan_device_wait_impl(1); }
 
-#define DS4_VK_PIPE_COUNT 73
-static VkPipeline     g_pipes[DS4_VK_PIPE_COUNT];
+VkPipeline g_pipes[DS4_VK_PIPE_COUNT];
 static VkShaderModule g_mods[DS4_VK_PIPE_COUNT];
-
-enum ds4_vk_pipe {
-    DS4_PIPE_ADD = 0,
-    DS4_PIPE_ADD3,
-    DS4_PIPE_SWIGLU,
-    DS4_PIPE_ARGMAX,
-    DS4_PIPE_SORT_I32_ROWS_ASC,
-    DS4_PIPE_RMS_NORM_PLAIN,
-    DS4_PIPE_RMS_NORM_WEIGHT,
-    DS4_PIPE_ROPE_TAIL,
-    DS4_PIPE_MATMUL_Q8_0,
-    DS4_PIPE_MATMUL_Q8_0_PREQ,
-    DS4_PIPE_MATMUL_Q8_0_KSLICE,
-    DS4_PIPE_QUANTIZE_Q8_0,
-    DS4_PIPE_MATMUL_Q8_0_TOP1,
-    DS4_PIPE_F32_TO_F16,
-    DS4_PIPE_MATMUL_F16,
-    DS4_PIPE_MATMUL_F16_PAIR_COMPRESSOR_STORE,
-    DS4_PIPE_MATMUL_F32,
-    DS4_PIPE_EMBED_TOKEN_Q8_0,
-    DS4_PIPE_EMBED_TOKENS_Q8_0,
-    DS4_PIPE_EMBED_TOKEN_HC,
-    DS4_PIPE_EMBED_TOKENS_HC,
-    DS4_PIPE_FP8_KV_QUANTIZE,
-    DS4_PIPE_STORE_RAW_KV,
-    DS4_PIPE_KV_FP8_STORE_RAW,
-    DS4_PIPE_ATTN_DECODE,
-    DS4_PIPE_ATTN_DECODE_INDEXED,
-    DS4_PIPE_ATTN_PREFILL,
-    DS4_PIPE_ATTN_OUTPUT_LOW_Q8,
-    DS4_PIPE_ROUTER_SELECT,
-    DS4_PIPE_MOE_GATE_UP_MID_Q8,
-    DS4_PIPE_MOE_DOWN_Q8,
-    DS4_PIPE_MOE_SUM,
-    DS4_PIPE_MOE_GATE_UP_MID_IQ2XXS,
-    DS4_PIPE_MOE_DOWN_Q2K,
-    DS4_PIPE_FILL_F32,
-    DS4_PIPE_HEAD_RMS_NORM,
-    DS4_PIPE_HEAD_RMS_NORM_ROPE_TAIL,
-    DS4_PIPE_HC_SPLIT_SINKHORN,
-    DS4_PIPE_HC_WEIGHTED_SUM,
-    DS4_PIPE_HC_EXPAND,
-    DS4_PIPE_HC_EXPAND4,
-    DS4_PIPE_HC_SPLIT_WEIGHTED_SUM_FUSED,
-    DS4_PIPE_OUTPUT_HC_WEIGHTS,
-    DS4_PIPE_REPEAT_HC,
-    DS4_PIPE_HC_EXPAND4_HALF,
-    DS4_PIPE_HC_EXPAND4_ADD_HALF,
-    DS4_PIPE_INDEXER_SCORES,
-    DS4_PIPE_DSV4_INDEXER_QAT,
-    DS4_PIPE_INDEXER_TOPK,
-    DS4_PIPE_INDEXER_TOP1_VALUE,
-    DS4_PIPE_TOPK_MASK,
-    DS4_PIPE_DSPARK_MARKOV_ARGMAX,
-    DS4_PIPE_COMPRESSOR_STORE,
-    DS4_PIPE_COMPRESSOR_SET_ROWS,
-    DS4_PIPE_COMPRESSOR_PREFILL_POOL,
-    DS4_PIPE_COMPRESSOR_UPDATE_POOL,
-    DS4_PIPE_COMPRESSOR_SHIFT_RATIO4,
-    DS4_PIPE_DIRECTIONAL_STEERING_PROJECT,
-    DS4_PIPE_MATMUL_Q8_0_PREQ_V2,
-    DS4_PIPE_MATMUL_Q8_0_PREQ_V3,
-    DS4_PIPE_MOE_GATE_UP_MID_IQ2XXS_V2,
-    DS4_PIPE_MOE_DOWN_Q2K_V2,
-    DS4_PIPE_MOE_GATE_UP_MID_Q4K,
-    DS4_PIPE_MOE_DOWN_Q4K,
-    DS4_PIPE_ATTN_OUTPUT_LOW_Q4K,
-    DS4_PIPE_MOE_GATE_UP_MID_MXFP4,
-    DS4_PIPE_MOE_DOWN_MXFP4,
-    DS4_PIPE_MOE_GATE_UP_MID_MXFP4_V2,
-    DS4_PIPE_MOE_DOWN_MXFP4_V2,
-    DS4_PIPE_MOE_GROUP,
-    DS4_PIPE_MATMUL_Q4K,
-    DS4_PIPE_MATMUL_Q4_0,
-    DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V2,
-    DS4_PIPE_ATTN_OUTPUT_LOW_Q8_V3,
-};
 
 /* Whole-model wrapper (Fase 6 step 2 staging pool).  The windows requested by
  * ds4_gpu_set_model_map / set_model_map_range / set_model_map_spans are copied
@@ -402,6 +286,16 @@ static uint32_t g_model_window_count = 0;
 static struct ds4_vk_model_window g_weight_cache[DS4_VK_MAX_MODEL_WINDOWS];
 static uint32_t g_weight_cache_count = 0;
 static int      g_weight_cache_ready = 0;
+
+/* Registered host model map.  Production maps are file-backed (an fd is set
+ * first) and staged eagerly by set_model_map / set_model_map_spans.  A map
+ * registered WITHOUT an fd (tools and the kernel parity harness) may still be
+ * written by the host after registration, so it is marked "live" and its
+ * ranges are staged on demand at bind time (vulkan_model_window_for). */
+static const void *g_vulkan_model_map = NULL;
+static uint64_t g_vulkan_model_size = 0;
+static int g_vulkan_model_fd = -1;
+static int g_model_map_live = 0;
 
 /* Fase 6 step 3: device-local (persistent host-visible) expert pool.
  *
@@ -2056,6 +1950,18 @@ static int vulkan_compute_init(void) {
           VK_SHADER_STAGE_COMPUTE_BIT, NULL },
         { DS4_VK_BINDING_TBL, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
           VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { DS4_VK_BINDING_X0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+          VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { DS4_VK_BINDING_X1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+          VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { DS4_VK_BINDING_X2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+          VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { DS4_VK_BINDING_X3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+          VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { DS4_VK_BINDING_X4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+          VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { DS4_VK_BINDING_X5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+          VK_SHADER_STAGE_COMPUTE_BIT, NULL },
     };
     const uint32_t n_bindings =
         (uint32_t)(sizeof(bindings) / sizeof(bindings[0]));
@@ -2102,7 +2008,7 @@ static int vulkan_compute_init(void) {
      * scope (a full 43-layer prefill pass records thousands of dispatches)
      * fits without exhausting.  Reset on drains and at ds4_gpu_synchronize. */
     VkDescriptorPoolSize pool_size = {
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128u * 1024u };
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256u * 1024u };
     VkDescriptorPoolCreateInfo dpci = {};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.maxSets = 8192;
@@ -2243,6 +2149,25 @@ static int vulkan_compute_init(void) {
           "attn_output_low_q8_v2" },
         { ds4_spv_attn_output_low_q8_v3, ds4_spv_attn_output_low_q8_v3_len,
           "attn_output_low_q8_v3" },
+        { ds4_spv_matmul_q8_0_f32, ds4_spv_matmul_q8_0_f32_len,
+          "matmul_q8_0_f32" },
+        { ds4_spv_matmul_bf16, ds4_spv_matmul_bf16_len, "matmul_bf16" },
+        { ds4_spv_conv_stream, ds4_spv_conv_stream_len, "conv_stream" },
+        { ds4_spv_gdn_prep, ds4_spv_gdn_prep_len, "gdn_prep" },
+        { ds4_spv_gdn_scan, ds4_spv_gdn_scan_len, "gdn_scan" },
+        { ds4_spv_gdn_out, ds4_spv_gdn_out_len, "gdn_out" },
+        { ds4_spv_idx_score, ds4_spv_idx_score_len, "idx_score" },
+        { ds4_spv_idx_tile_max, ds4_spv_idx_tile_max_len, "idx_tile_max" },
+        { ds4_spv_idx_select, ds4_spv_idx_select_len, "idx_select" },
+        { ds4_spv_idx_expand, ds4_spv_idx_expand_len, "idx_expand" },
+        { ds4_spv_qwen4_attn_prep, ds4_spv_qwen4_attn_prep_len,
+          "attn_prep" },
+        { ds4_spv_qwen4_block_key, ds4_spv_qwen4_block_key_len,
+          "block_key" },
+        { ds4_spv_qwen4_attn_decode, ds4_spv_qwen4_attn_decode_len,
+          "attn_decode" },
+        { ds4_spv_qwen4_attn_merge, ds4_spv_qwen4_attn_merge_len,
+          "attn_merge" },
     };
     for (uint32_t i = 0; i < DS4_VK_PIPE_COUNT; i++) {
         snprintf(g_pipe_names[i], sizeof(g_pipe_names[i]), "%s",
@@ -3685,14 +3610,6 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(
     return vulkan_worker_download(tensor, offset, data, bytes);
 }
 
-/* One descriptor write: a storage-buffer range on a binding. */
-struct ds4_vk_bind {
-    uint32_t     binding;
-    VkBuffer     buffer;
-    VkDeviceSize offset;
-    VkDeviceSize range;
-};
-
 /* Tier-ownership invariant: a VkBuffer belongs to one VkDevice, so binding a
  * tensor whose tier differs from the selected device is undefined.  Report it
  * loudly (rate-limited) — a silent mismatch is exactly the multi-GPU
@@ -3709,7 +3626,7 @@ static void vulkan_check_tensor_device(const char *op,
     }
 }
 
-static struct ds4_vk_bind vulkan_bind_tensor(uint32_t binding,
+struct ds4_vk_bind vulkan_bind_tensor(uint32_t binding,
                                              const ds4_gpu_tensor *t) {
     struct ds4_vk_bind b = {};
     struct ds4_vulkan_tensor *h = vulkan_tensor_handle(t);
@@ -3725,7 +3642,7 @@ static struct ds4_vk_bind vulkan_bind_tensor(uint32_t binding,
 
 /* Bind a byte sub-range [off, off+bytes) of a tensor (used for the per-layer
  * expert pool regions, which share one tensor). */
-static struct ds4_vk_bind vulkan_bind_tensor_at(uint32_t binding,
+struct ds4_vk_bind vulkan_bind_tensor_at(uint32_t binding,
                                                 const ds4_gpu_tensor *t,
                                                 uint64_t off, uint64_t bytes) {
     struct ds4_vk_bind b = {};
@@ -3755,11 +3672,22 @@ static struct ds4_vk_model_window *vulkan_weight_cache_for(
     return NULL;
 }
 
+/* Stage one model window [host_ptr + base, host_ptr + base + size) into a
+ * device-local tensor.  Defined with the model wrapper below; forward-declared
+ * for the on-demand staging of live (fd-less) model maps. */
+static int vulkan_add_model_window(const void *host_ptr, uint64_t base,
+                                   uint64_t size);
+
 /* Find the staged window covering [offset, offset+bytes).  NULL when no
  * window covers the whole range.  Uses offset - base (never base+size -
  * offset) so an offset beyond the window end cannot underflow.  The
  * persistent per-device weight cache is consulted first: a cached range is
- * resident for the whole session and never needs a transient window. */
+ * resident for the whole session and never needs a transient window.
+ *
+ * A live model map (registered without a model fd: tools and the kernel
+ * parity harness) may be written by the host after registration, so an
+ * uncovered range is staged here, on demand, from the current host contents
+ * (the eager whole-map copy at set_model_map time would be stale). */
 static struct ds4_vk_model_window *vulkan_model_window_for(
         uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return NULL;
@@ -3773,10 +3701,28 @@ static struct ds4_vk_model_window *vulkan_model_window_for(
             return w;
         }
     }
+    if (g_model_map_live && g_vulkan_model_map != NULL && g_device != VK_NULL_HANDLE &&
+        offset <= g_vulkan_model_size && bytes <= g_vulkan_model_size - offset) {
+        /* Staging is one-shot and cannot append to an open command scope, so
+         * settle any in-flight scope first (mirrors vulkan_scratch_retire). */
+        if (g_commands_active) {
+            (void)ds4_gpu_flush_commands();
+        }
+        if (vulkan_add_model_window(g_vulkan_model_map, offset, bytes)) {
+            for (uint32_t i = 0; i < g_model_window_count; i++) {
+                struct ds4_vk_model_window *w = &g_model_windows[i];
+                if (offset < w->base) continue;
+                const uint64_t rel = offset - w->base;
+                if (rel <= w->size && bytes <= w->size - rel) {
+                    return w;
+                }
+            }
+        }
+    }
     return NULL;
 }
 
-static struct ds4_vk_bind vulkan_bind_model(uint32_t binding,
+struct ds4_vk_bind vulkan_bind_model(uint32_t binding,
                                             uint64_t offset, uint64_t bytes) {
     struct ds4_vk_bind b = {};
     struct ds4_vk_model_window *w = vulkan_model_window_for(offset, bytes);
@@ -3790,7 +3736,7 @@ static struct ds4_vk_bind vulkan_bind_model(uint32_t binding,
 }
 
 /* True when the model wrapper has a staged window covering [offset, bytes). */
-static int vulkan_model_range_ok(uint64_t offset, uint64_t bytes) {
+int vulkan_model_range_ok(uint64_t offset, uint64_t bytes) {
     return vulkan_model_window_for(offset, bytes) != NULL;
 }
 
@@ -3818,28 +3764,28 @@ static void vulkan_scratch_retire(ds4_gpu_tensor **slot) {
     *slot = NULL;
 }
 
-static ds4_gpu_tensor *vulkan_scratch_a(uint64_t bytes) {
+ds4_gpu_tensor *vulkan_scratch_a(uint64_t bytes) {
     if (g_scratch_a && g_scratch_a->bytes >= bytes) return g_scratch_a;
     vulkan_scratch_retire(&g_scratch_a);
     g_scratch_a = ds4_gpu_tensor_alloc(bytes);
     return g_scratch_a;
 }
 
-static ds4_gpu_tensor *vulkan_scratch_b(uint64_t bytes) {
+ds4_gpu_tensor *vulkan_scratch_b(uint64_t bytes) {
     if (g_scratch_b && g_scratch_b->bytes >= bytes) return g_scratch_b;
     vulkan_scratch_retire(&g_scratch_b);
     g_scratch_b = ds4_gpu_tensor_alloc(bytes);
     return g_scratch_b;
 }
 
-static ds4_gpu_tensor *vulkan_scratch_c(uint64_t bytes) {
+ds4_gpu_tensor *vulkan_scratch_c(uint64_t bytes) {
     if (g_scratch_c && g_scratch_c->bytes >= bytes) return g_scratch_c;
     vulkan_scratch_retire(&g_scratch_c);
     g_scratch_c = ds4_gpu_tensor_alloc(bytes);
     return g_scratch_c;
 }
 
-static ds4_gpu_tensor *vulkan_scratch_d(uint64_t bytes) {
+ds4_gpu_tensor *vulkan_scratch_d(uint64_t bytes) {
     if (g_scratch_d && g_scratch_d->bytes >= bytes) return g_scratch_d;
     vulkan_scratch_retire(&g_scratch_d);
     g_scratch_d = ds4_gpu_tensor_alloc(bytes);
@@ -3850,7 +3796,7 @@ static ds4_gpu_tensor *vulkan_scratch_d(uint64_t bytes) {
  * storage-buffer writes, binds pipeline + push constants + set, dispatches
  * (gx, gy, gz) threadgroups, and inserts a SHADER_WRITE->SHADER_READ memory
  * barrier.  Works both inside an open command scope and as a one-shot. */
-static int vulkan_dispatch(VkPipeline pipeline,
+int vulkan_dispatch(VkPipeline pipeline,
                            const void *params, uint32_t params_size,
                            const struct ds4_vk_bind *binds, uint32_t n_binds,
                            uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -4196,9 +4142,6 @@ extern "C" void ds4_vulkan_synchronize_all_tiers(void) {
  * pointer is still exported through lookup_cache for the host-visible paths
  * (non-streaming only). */
 
-static const void *g_vulkan_model_map = NULL;
-static uint64_t g_vulkan_model_size = 0;
-static int g_vulkan_model_fd = -1;
 static int g_vulkan_ssd_streaming = 0;
 
 extern "C" void ds4_vulkan_set_ssd_streaming(int enabled) {
@@ -4608,21 +4551,33 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     g_vulkan_model_map = model_map;
     g_vulkan_model_size = model_size;
     if (model_map == NULL || model_size == 0) {
+        g_model_map_live = 0;
         vulkan_destroy_model_wrapper();
         return 1;
     }
-    vulkan_set_single_window(model_map, 0, model_size);
+    /* A map registered without a model fd (tools / kernel parity harness) is
+     * host-live: the host may keep writing it after registration, so it is not
+     * copied eagerly; vulkan_model_window_for stages each requested range on
+     * demand.  Production maps are file-backed and keep the eager copy. */
+    g_model_map_live = (g_vulkan_model_fd < 0) ? 1 : 0;
+    if (g_model_map_live) {
+        vulkan_destroy_model_wrapper();
+    } else {
+        vulkan_set_single_window(model_map, 0, model_size);
+    }
     return 1;
 }
 
 int ds4_gpu_set_model_fd(int fd) {
     g_vulkan_model_fd = fd;
+    g_model_map_live = 0;
     return 1;
 }
 
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     g_vulkan_model_fd = fd;
     g_vulkan_model_map = model_map;
+    g_model_map_live = 0;
     return 1;
 }
 
@@ -4633,6 +4588,7 @@ int ds4_gpu_register_model_map_no_copy(const void *model_map,
                                        uint64_t model_size) {
     g_vulkan_model_map = model_map;
     g_vulkan_model_size = model_size;
+    g_model_map_live = 0;
     return 1;
 }
 
@@ -4659,6 +4615,8 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size,
     const uint64_t base = map_offset & ~(g_host_pointer_align - 1);
     const uint64_t end = (map_offset + map_size + g_host_pointer_align - 1) &
                          ~(g_host_pointer_align - 1);
+    /* Explicit windows: an out-of-window bind must fail, never stage. */
+    g_model_map_live = 0;
     vulkan_set_single_window(model_map, base, end - base);
     return 1;
 }
@@ -4670,6 +4628,8 @@ int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size,
     if (model_map == NULL || offsets == NULL || sizes == NULL || count == 0) {
         return ds4_gpu_set_model_map(model_map, model_size);
     }
+    /* Explicit windows: out-of-window binds must fail, never stage. */
+    g_model_map_live = 0;
     /* SSD streaming re-points the staged windows per layer (decode) or per
      * span set.  A single contiguous window over the requested spans would
      * cover the whole interleaved GGUF (this model's per-layer tensors are

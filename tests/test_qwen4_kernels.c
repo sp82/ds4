@@ -3556,6 +3556,40 @@ int main(void) {
         test_half_expert_tiles(&arena,2049,12,39,192);
         return 0;
     }
+    if (getenv("DS4_TEST_QWEN4_GDN_ONLY")) {
+        test_gdn(&arena, 16, 48, 128, 5);
+        test_gdn(&arena, 16, 48, 128, 40);
+        test_gdn(&arena, 16, 48, 128, 200);
+        test_gdn(&arena, 2, 6, 32, 7);
+        test_gdn(&arena, 2, 6, 64, 9);
+        test_gdn(&arena, 2, 6, 96, 17);
+        test_gdn_prefill_dispatch();
+        printf("all qwen4 GDN tests passed\n");
+        return 0;
+    }
+    if (getenv("DS4_TEST_QWEN4_IDX_ONLY")) {
+        test_idx_score_mm(37, 3001, 11000);
+        test_idx_score_mm(3, 70, 100);
+        test_idx_select(4, 70001, 512, 69000);
+        test_idx_select(3, 600, 512, 599);
+        test_idx_select(2, 3000, 512, 520);
+        test_idx_prefilter();
+        printf("all qwen4 indexer tests passed\n");
+        return 0;
+    }
+    if (getenv("DS4_TEST_QWEN4_ATTN_ONLY")) {
+        test_attn_mm(40, 0, false);
+        test_attn_mm(37, 3000, true);
+        test_attn_mm(3, 100, true);
+        test_attn_mm(4, 128, false);
+        test_attn_mm(8, 128, false);
+        test_attn_mm(9, 128, false);
+        test_attn_groups();
+        test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
+        test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+        printf("all qwen4 attention tests passed\n");
+        return 0;
+    }
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {

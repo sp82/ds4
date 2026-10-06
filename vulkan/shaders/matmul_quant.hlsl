@@ -85,3 +85,67 @@ void matmul_q4_0(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
         out_buf[tok * out_dim + row] = matmul_red[0];
     }
 }
+
+/* Q8_0 weights against raw f32 activations (Qwen projections preserve f32
+ * activations, unlike matmul_q8_0 which quantizes x inline).  in_dim must be a
+ * multiple of 32; blocks = in_dim / 32. */
+[numthreads(256, 1, 1)]
+void matmul_q8_0_f32(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
+    uint row = gid_grp.x;
+    uint tok = gid_grp.y;
+    uint out_dim = params.out_dim;
+    uint in_dim = params.in_dim;
+    uint blocks = params.blocks;   /* in_dim / 32 */
+    if (row >= out_dim || tok >= params.rows) return;
+
+    float acc = 0.0f;
+    for (uint b = tid; b < blocks; b += 256u) {
+        uint wblock = row * blocks + b;
+        float d = q8_scale(w_buf, wblock);
+        uint xb = tok * in_dim + b * 32u;
+        for (uint i = 0u; i < 32u; i++) {
+            acc += d * (float)q8_s8(w_buf, wblock, i) * x_buf[xb + i];
+        }
+    }
+
+    matmul_red[tid] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            matmul_red[tid] += matmul_red[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        out_buf[tok * out_dim + row] = matmul_red[0];
+    }
+}
+
+/* BF16 (GGUF type 30) weights against raw f32 activations; 2 bytes/value. */
+[numthreads(256, 1, 1)]
+void matmul_bf16(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
+    uint row = gid_grp.x;
+    uint tok = gid_grp.y;
+    uint out_dim = params.out_dim;
+    uint in_dim = params.in_dim;
+    if (row >= out_dim || tok >= params.rows) return;
+
+    float acc = 0.0f;
+    const uint base = row * in_dim * 2u;
+    const uint xoff = tok * in_dim;
+    for (uint k = tid; k < in_dim; k += 256u) {
+        acc += bf16_at(w_buf, base + k * 2u) * x_buf[xoff + k];
+    }
+
+    matmul_red[tid] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            matmul_red[tid] += matmul_red[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        out_buf[tok * out_dim + row] = matmul_red[0];
+    }
+}
