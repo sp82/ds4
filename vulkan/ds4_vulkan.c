@@ -31,6 +31,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <unistd.h>
 #include <atomic>
 
 #include "ds4_gpu.h"
@@ -1253,6 +1254,395 @@ static int vulkan_query_bdf(VkPhysicalDevice phys, uint32_t *dom, uint32_t *bus,
     return vulkan_query_bdf_inst(g_instance, phys, dom, bus, dev, fn);
 }
 
+/* Create the shared VkInstance once (idempotent); defined below. */
+static int vulkan_ensure_instance(void);
+
+/* ---- verified device-to-device (P2P) probe (SPECS_MGPU.md §18) ------------
+ * A bare successful vkQueueSubmit does NOT prove the copy crossed the PCIe
+ * link: an imported dma-buf can be migrated/cached locally (inflating the
+ * number), or the submit can fail later (RADV prints "Not enough memory for
+ * command submission" when importing an NVIDIA-exported VRAM BO).  So the copy
+ * is content-verified (a marker is written on the source and checked in the
+ * destination) and only then reported.  Run by default as a single 16 MiB copy
+ * per ordered pair: enough to decide whether P2P is usable at all (vs the
+ * host-bounce path); the link *speed* is not needed here (the host<->device
+ * probe already classifies fast/slow).  DS4_VULKAN_PROBE_P2P=1 additionally
+ * measures the per-pair throughput (256 MiB x3).  One throwaway device per
+ * GPU, shared across pairs.  For full characterization use
+ * vulkan/tools/mgpu_probe. */
+
+struct vulkan_p2p_dev {
+    VkDevice dev;
+    VkQueue queue;
+    uint32_t qfam;
+    int dma_buf;
+    VkPhysicalDeviceMemoryProperties mp;
+};
+
+static int vulkan_p2p_dev_create(VkPhysicalDevice phys, struct vulkan_p2p_dev *d) {
+    memset(d, 0, sizeof(*d));
+    uint32_t qfam = UINT32_MAX;
+    if (!vulkan_device_compute_queue(phys, &qfam)) return 0;
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &n, NULL);
+    VkExtensionProperties *e =
+        (VkExtensionProperties *)malloc(sizeof(*e) * (n ? n : 1));
+    if (!e) return 0;
+    vkEnumerateDeviceExtensionProperties(phys, NULL, &n, e);
+    int has_fd = 0, has_dma = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (strcmp(e[i].extensionName, "VK_KHR_external_memory_fd") == 0) has_fd = 1;
+        else if (strcmp(e[i].extensionName, "VK_EXT_external_memory_dma_buf") == 0)
+            has_dma = 1;
+    }
+    free(e);
+    if (!has_fd) return 0;
+    d->dma_buf = has_dma;
+    const char *exts[2];
+    uint32_t ne = 0;
+    exts[ne++] = "VK_KHR_external_memory_fd";
+    if (has_dma) exts[ne++] = "VK_EXT_external_memory_dma_buf";
+    const float prio = 1.0f;
+    VkDeviceQueueCreateInfo qci = {};
+    qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qci.queueFamilyIndex = qfam;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci = {};
+    dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = ne;
+    dci.ppEnabledExtensionNames = exts;
+    if (vkCreateDevice(phys, &dci, NULL, &d->dev) != VK_SUCCESS) return 0;
+    vkGetDeviceQueue(d->dev, qfam, 0, &d->queue);
+    d->qfam = qfam;
+    vkGetPhysicalDeviceMemoryProperties(phys, &d->mp);
+    return 1;
+}
+
+static uint32_t vulkan_p2p_find_type(const VkPhysicalDeviceMemoryProperties *mp,
+                                     uint32_t bits, VkMemoryPropertyFlags want) {
+    for (uint32_t i = 0; i < mp->memoryTypeCount; i++)
+        if ((bits & (1u << i)) &&
+            (mp->memoryTypes[i].propertyFlags & want) == want) return i;
+    return UINT32_MAX;
+}
+
+/* One verified P2P copy A->B on pre-created throwaway devices (the caller owns
+ * them, so N GPUs share one device instead of N^2).  Returns 1 when the
+ * destination content matches the marker written on the source (P2P usable),
+ * 0 otherwise (import/submit failed, or the data did not actually move).  When
+ * out_gbps is non-NULL, also reports the best measured throughput. */
+static int vulkan_probe_p2p_pair(VkInstance inst, const struct vulkan_p2p_dev *A,
+                                 const struct vulkan_p2p_dev *B, uint64_t bytes,
+                                 int iters, double *out_gbps) {
+    PFN_vkGetMemoryFdKHR get_fd =
+        (PFN_vkGetMemoryFdKHR)vkGetInstanceProcAddr(inst, "vkGetMemoryFdKHR");
+    PFN_vkGetMemoryFdPropertiesKHR get_fd_props =
+        (PFN_vkGetMemoryFdPropertiesKHR)vkGetInstanceProcAddr(
+            inst, "vkGetMemoryFdPropertiesKHR");
+    if (!get_fd || !get_fd_props) return 0;
+
+    const VkPhysicalDeviceMemoryProperties *mpa = &A->mp;
+    const VkPhysicalDeviceMemoryProperties *mpb = &B->mp;
+
+    const VkDeviceSize chunk = 4096;
+    const uint32_t pattern = 0xA5A5A5A5u;
+    int ok = 0;
+
+    VkBuffer src = VK_NULL_HANDLE, imp = VK_NULL_HANDLE, dst = VK_NULL_HANDLE;
+    VkDeviceMemory m_src = VK_NULL_HANDLE, m_imp = VK_NULL_HANDLE, m_dst = VK_NULL_HANDLE;
+    VkBuffer stage = VK_NULL_HANDLE;
+    VkDeviceMemory m_stage = VK_NULL_HANDLE;
+    VkCommandPool pool_a = VK_NULL_HANDLE, pool_b = VK_NULL_HANDLE;
+    VkCommandBuffer cb_a = VK_NULL_HANDLE, cb_b = VK_NULL_HANDLE;
+    VkFence fence_a = VK_NULL_HANDLE, fence_b = VK_NULL_HANDLE;
+    int fd = -1;
+
+    VkBufferCreateInfo bci = {};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    const VkExternalMemoryHandleTypeFlagBits ht_a = A->dma_buf
+        ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+        : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    const VkExternalMemoryHandleTypeFlagBits ht_b = B->dma_buf
+        ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+        : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    do {
+        VkMemoryRequirements req;
+        VkMemoryAllocateInfo mai = {};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+
+        /* exportable source on A */
+        VkExternalMemoryBufferCreateInfo ext = {};
+        ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+        ext.handleTypes = ht_a;
+        VkBufferCreateInfo sbci = bci;
+        sbci.pNext = &ext;
+        if (vkCreateBuffer(A->dev, &sbci, NULL, &src) != VK_SUCCESS) break;
+        vkGetBufferMemoryRequirements(A->dev, src, &req);
+        uint32_t mt = vulkan_p2p_find_type(mpa, req.memoryTypeBits,
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mt == UINT32_MAX) break;
+        VkExportMemoryAllocateInfo exp = {};
+        exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+        exp.handleTypes = ht_a;
+        VkMemoryDedicatedAllocateInfo ded = {};
+        ded.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        ded.buffer = src;
+        exp.pNext = &ded;
+        mai.pNext = &exp;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = mt;
+        if (vkAllocateMemory(A->dev, &mai, NULL, &m_src) != VK_SUCCESS) break;
+        if (vkBindBufferMemory(A->dev, src, m_src, 0) != VK_SUCCESS) break;
+
+        /* local destination + host staging on B */
+        if (vkCreateBuffer(B->dev, &bci, NULL, &dst) != VK_SUCCESS) break;
+        vkGetBufferMemoryRequirements(B->dev, dst, &req);
+        mt = vulkan_p2p_find_type(mpb, req.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mt == UINT32_MAX) break;
+        mai.pNext = NULL;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = mt;
+        if (vkAllocateMemory(B->dev, &mai, NULL, &m_dst) != VK_SUCCESS) break;
+        if (vkBindBufferMemory(B->dev, dst, m_dst, 0) != VK_SUCCESS) break;
+
+        VkBufferCreateInfo stci = bci;
+        stci.size = chunk * 2;
+        if (vkCreateBuffer(B->dev, &stci, NULL, &stage) != VK_SUCCESS) break;
+        vkGetBufferMemoryRequirements(B->dev, stage, &req);
+        mt = vulkan_p2p_find_type(mpb, req.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        if (mt == UINT32_MAX) break;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = mt;
+        if (vkAllocateMemory(B->dev, &mai, NULL, &m_stage) != VK_SUCCESS) break;
+        if (vkBindBufferMemory(B->dev, stage, m_stage, 0) != VK_SUCCESS) break;
+
+        /* export the source fd and import it on B */
+        VkMemoryGetFdInfoKHR gfi = {};
+        gfi.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+        gfi.memory = m_src;
+        gfi.handleType = ht_a;
+        if (get_fd(A->dev, &gfi, &fd) != VK_SUCCESS) break;
+
+        VkExternalMemoryBufferCreateInfo iext = {};
+        iext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+        iext.handleTypes = ht_b;
+        VkBufferCreateInfo ibci = bci;
+        ibci.pNext = &iext;
+        if (vkCreateBuffer(B->dev, &ibci, NULL, &imp) != VK_SUCCESS) break;
+        VkMemoryFdPropertiesKHR fdp = {};
+        fdp.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+        if (get_fd_props(B->dev, ht_b, fd, &fdp) != VK_SUCCESS) break;
+        vkGetBufferMemoryRequirements(B->dev, imp, &req);
+        const uint32_t bits = req.memoryTypeBits & fdp.memoryTypeBits;
+        mt = vulkan_p2p_find_type(mpb, bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mt == UINT32_MAX) mt = vulkan_p2p_find_type(mpb, bits, 0);
+        if (mt == UINT32_MAX) break;
+        VkImportMemoryFdInfoKHR imp_info = {};
+        imp_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+        imp_info.handleType = ht_b;
+        imp_info.fd = fd;
+        VkMemoryDedicatedAllocateInfo ided = {};
+        ided.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        ided.buffer = imp;
+        imp_info.pNext = &ided;
+        mai.pNext = &imp_info;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = mt;
+        if (vkAllocateMemory(B->dev, &mai, NULL, &m_imp) != VK_SUCCESS) break;
+        if (vkBindBufferMemory(B->dev, imp, m_imp, 0) != VK_SUCCESS) break;
+
+        VkCommandPoolCreateInfo cpci = {};
+        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = A->qfam;
+        if (vkCreateCommandPool(A->dev, &cpci, NULL, &pool_a) != VK_SUCCESS) break;
+        cpci.queueFamilyIndex = B->qfam;
+        if (vkCreateCommandPool(B->dev, &cpci, NULL, &pool_b) != VK_SUCCESS) break;
+        VkCommandBufferAllocateInfo cai = {};
+        cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cai.commandPool = pool_a;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(A->dev, &cai, &cb_a) != VK_SUCCESS) break;
+        cai.commandPool = pool_b;
+        if (vkAllocateCommandBuffers(B->dev, &cai, &cb_b) != VK_SUCCESS) break;
+        VkFenceCreateInfo fci = {};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (vkCreateFence(A->dev, &fci, NULL, &fence_a) != VK_SUCCESS) break;
+        if (vkCreateFence(B->dev, &fci, NULL, &fence_b) != VK_SUCCESS) break;
+
+        /* write the marker on A */
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cb_a, &bi);
+        vkCmdFillBuffer(cb_a, src, 0, bytes, pattern);
+        vkEndCommandBuffer(cb_a);
+        VkSubmitInfo si = {};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cb_a;
+        if (vkQueueSubmit(A->queue, 1, &si, fence_a) != VK_SUCCESS) break;
+        vkWaitForFences(A->dev, 1, &fence_a, VK_TRUE, UINT64_MAX);
+
+        /* copy imp -> dst on B (best of `iters`, default 1) */
+        const int reps = iters < 1 ? 1 : iters;
+        double best = 0.0;
+        for (int it = 0; it < reps; it++) {
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkResetCommandBuffer(cb_b, 0);
+            vkBeginCommandBuffer(cb_b, &bi);
+            VkBufferCopy bc = {};
+            bc.size = bytes;
+            vkCmdCopyBuffer(cb_b, imp, dst, 1, &bc);
+            vkEndCommandBuffer(cb_b);
+            si.pCommandBuffers = &cb_b;
+            const double t0 = vulkan_now_ms();
+            if (vkQueueSubmit(B->queue, 1, &si, fence_b) != VK_SUCCESS) { best = 0.0; break; }
+            vkWaitForFences(B->dev, 1, &fence_b, VK_TRUE, UINT64_MAX);
+            vkResetFences(B->dev, 1, &fence_b);
+            const double dt = (vulkan_now_ms() - t0) / 1000.0;
+            if (dt > 0.0 && (best == 0.0 || dt < best)) best = dt;
+        }
+        if (best <= 0.0) break;
+
+        /* verify the first and last chunk of dst landed on B */
+        vkResetCommandBuffer(cb_b, 0);
+        vkBeginCommandBuffer(cb_b, &bi);
+        VkBufferCopy c0 = {};
+        c0.size = chunk;
+        VkBufferCopy c1 = {};
+        c1.srcOffset = bytes - chunk;
+        c1.dstOffset = chunk;
+        c1.size = chunk;
+        vkCmdCopyBuffer(cb_b, dst, stage, 1, &c0);
+        vkCmdCopyBuffer(cb_b, dst, stage, 1, &c1);
+        vkEndCommandBuffer(cb_b);
+        if (vkQueueSubmit(B->queue, 1, &si, fence_b) != VK_SUCCESS) break;
+        vkWaitForFences(B->dev, 1, &fence_b, VK_TRUE, UINT64_MAX);
+        void *map = NULL;
+        if (vkMapMemory(B->dev, m_stage, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) break;
+        const uint32_t *w = (const uint32_t *)map;
+        ok = 1;
+        for (VkDeviceSize i = 0; i < chunk / 4; i++) {
+            if (w[i] != pattern || w[chunk / 4 + i] != pattern) { ok = 0; break; }
+        }
+        vkUnmapMemory(B->dev, m_stage);
+        if (ok && out_gbps) *out_gbps = (double)bytes / best / 1e9;
+    } while (0);
+
+    if (fd >= 0) close(fd);
+    if (fence_a) vkDestroyFence(A->dev, fence_a, NULL);
+    if (fence_b) vkDestroyFence(B->dev, fence_b, NULL);
+    if (pool_a) vkDestroyCommandPool(A->dev, pool_a, NULL);
+    if (pool_b) vkDestroyCommandPool(B->dev, pool_b, NULL);
+    if (stage) vkDestroyBuffer(B->dev, stage, NULL);
+    if (imp) vkDestroyBuffer(B->dev, imp, NULL);
+    if (dst) vkDestroyBuffer(B->dev, dst, NULL);
+    if (src) vkDestroyBuffer(A->dev, src, NULL);
+    if (m_stage) vkFreeMemory(B->dev, m_stage, NULL);
+    if (m_imp) vkFreeMemory(B->dev, m_imp, NULL);
+    if (m_dst) vkFreeMemory(B->dev, m_dst, NULL);
+    if (m_src) vkFreeMemory(A->dev, m_src, NULL);
+    return ok;
+}
+
+/* Print the P2P probe result.  With speed_mode the cells are GB/s; otherwise
+ * they are ok/fail (verified content only). */
+static void vulkan_log_p2p_matrix(const ds4_vk_dev_info *info, int nd, int speed_mode) {
+    if (nd < 2) return;
+    fprintf(stderr, DS4_VULKAN_LOG_PREFIX "P2P probe (%s; rows=src cols=dst)\n",
+            speed_mode ? "verified GB/s" : "verified content");
+    fprintf(stderr, DS4_VULKAN_LOG_PREFIX "     ");
+    for (int j = 0; j < nd; j++)
+        if (info[j].usable) fprintf(stderr, "%7u", info[j].vk_index);
+    fprintf(stderr, "\n");
+    for (int i = 0; i < nd; i++) {
+        if (!info[i].usable) continue;
+        fprintf(stderr, DS4_VULKAN_LOG_PREFIX "%3u: ", info[i].vk_index);
+        for (int j = 0; j < nd; j++) {
+            if (!info[j].usable) continue;
+            if (i == j) { fprintf(stderr, "      -"); continue; }
+            if (info[i].p2p_ok[j] == 1) {
+                if (speed_mode) fprintf(stderr, "%7.1f", info[i].p2p_gbps[j]);
+                else            fprintf(stderr, "     ok");
+            } else if (info[i].p2p_ok[j] < 0) {
+                fprintf(stderr, "   fail");
+            } else {
+                fprintf(stderr, "   n/a ");
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+}
+
+/* Fill the P2P fields of an already-classified device array.  Call ONLY when
+ * more than one device will actually be used: a single-device run does not
+ * need P2P at all.  Default is a single verified 16 MiB copy per ordered pair
+ * (usability); DS4_VULKAN_PROBE_P2P=1 also measures throughput (256 MiB x3).
+ * One throwaway device per GPU, shared across pairs. */
+extern "C" void ds4_vulkan_probe_p2p(ds4_vk_dev_info *out, int n) {
+    if (!out || n < 2) return;
+    const int speed_mode = getenv("DS4_VULKAN_PROBE_P2P") != NULL;
+
+    VkInstance inst = g_instance;
+    if (!vulkan_ensure_instance()) return;
+    inst = g_instance;
+
+    uint32_t count = 0;
+    if (vkEnumeratePhysicalDevices(inst, &count, NULL) != VK_SUCCESS || count == 0) {
+        return;
+    }
+    VkPhysicalDevice *devs = (VkPhysicalDevice *)calloc(count, sizeof(*devs));
+    if (!devs || vkEnumeratePhysicalDevices(inst, &count, devs) != VK_SUCCESS) {
+        free(devs);
+        return;
+    }
+
+    struct vulkan_p2p_dev pdevs[DS4_VK_MAX_DEVICES];
+    int slot[DS4_VK_MAX_DEVICES];
+    int pn = 0;
+    for (int i = 0; i < n && pn < DS4_VK_MAX_DEVICES; i++) {
+        if (!out[i].usable || out[i].vk_index >= count) continue;
+        if (!vulkan_p2p_dev_create(devs[out[i].vk_index], &pdevs[pn])) continue;
+        slot[pn] = i;
+        pn++;
+    }
+    for (int a = 0; a < pn; a++) {
+        const int i = slot[a];
+        uint64_t pbytes = speed_mode ? 256ull * 1024ull * 1024ull
+                                     : 16ull * 1024ull * 1024ull;
+        if (out[i].vram_bytes / 8 < pbytes) pbytes = out[i].vram_bytes / 8;
+        for (int b = 0; b < pn; b++) {
+            const int j = slot[b];
+            if (i == j) continue;
+            double gbps = 0.0;
+            const int ok = vulkan_probe_p2p_pair(
+                inst, &pdevs[a], &pdevs[b], pbytes,
+                speed_mode ? 3 : 1, speed_mode ? &gbps : NULL);
+            out[i].p2p_ok[j] = ok ? 1 : -1;
+            out[i].p2p_gbps[j] = ok ? gbps : 0.0;
+            const double bi = out[i].bw_gbps, bj = out[j].bw_gbps;
+            out[i].p2p_host_bounce_gbps[j] =
+                (bi > 0.0 && bj > 0.0) ? (bi * bj) / (bi + bj) : 0.0;
+        }
+    }
+    for (int a = 0; a < pn; a++) vkDestroyDevice(pdevs[a].dev, NULL);
+    vulkan_log_p2p_matrix(out, n, speed_mode);
+
+    free(devs);
+}
+
 static int vulkan_pick_device_ex(int forced_override) {
     uint32_t count = 0;
     VkResult rc = vkEnumeratePhysicalDevices(g_instance, &count, NULL);
@@ -1934,52 +2324,58 @@ static void vulkan_compute_cleanup(void) {
 static void vulkan_autotune_moe_rows(void);
 static void vulkan_autotune_attn_out(void);
 
-int ds4_gpu_init(void) {
-    if (g_device != VK_NULL_HANDLE) return 1; /* already initialized */
-
+/* Create the shared VkInstance once (idempotent).  ALL device enumeration in
+ * the process must go through it: a vk_index is only meaningful within the
+ * instance that produced it, and two different instances can enumerate the
+ * same GPUs in a different order (observed on the 4x RX 6900 XT server).  The
+ * auto-config probe used a throwaway instance while init created another, so
+ * cfg->device_indices pointed at the wrong physical devices (the fast x16 GPU
+ * ended up as a static tier and a slow x1 GPU as the dynamic one). */
+static int vulkan_ensure_instance(void) {
+    if (g_instance != VK_NULL_HANDLE) return 1;
     VkApplicationInfo app = {};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "ds4";
     app.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
     app.apiVersion = VK_API_VERSION_1_1;
-
-    /* Instance extensions: VK_KHR_get_physical_device_properties2 (when
-     * present) lets the startup log report the PCI BDF via
-     * VK_EXT_pci_bus_info.  Nothing else is required (Vulkan 1.0 core). */
     const char *inst_exts[1];
     uint32_t n_inst_exts = 0;
-    {
-        uint32_t n = 0;
-        vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
-        if (n > 0) {
-            VkExtensionProperties *e =
-                (VkExtensionProperties *)malloc(sizeof(*e) * n);
-            if (e) {
-                vkEnumerateInstanceExtensionProperties(NULL, &n, e);
-                for (uint32_t i = 0; i < n; i++) {
-                    if (strcmp(e[i].extensionName,
-                               "VK_KHR_get_physical_device_properties2") == 0) {
-                        inst_exts[n_inst_exts++] =
-                            "VK_KHR_get_physical_device_properties2";
-                        break;
-                    }
+    uint32_t n = 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
+    if (n > 0) {
+        VkExtensionProperties *e =
+            (VkExtensionProperties *)malloc(sizeof(*e) * n);
+        if (e) {
+            vkEnumerateInstanceExtensionProperties(NULL, &n, e);
+            for (uint32_t i = 0; i < n; i++) {
+                if (strcmp(e[i].extensionName,
+                           "VK_KHR_get_physical_device_properties2") == 0) {
+                    inst_exts[n_inst_exts++] =
+                        "VK_KHR_get_physical_device_properties2";
+                    break;
                 }
-                free(e);
             }
+            free(e);
         }
     }
-
     VkInstanceCreateInfo ici = {};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &app;
     ici.enabledExtensionCount = n_inst_exts;
     ici.ppEnabledExtensionNames = n_inst_exts ? inst_exts : NULL;
-
     VkResult rc = vkCreateInstance(&ici, NULL, &g_instance);
     if (rc != VK_SUCCESS) {
         vulkan_log_vk(rc, "vkCreateInstance");
+        g_instance = VK_NULL_HANDLE;
         return 0;
     }
+    return 1;
+}
+
+int ds4_gpu_init(void) {
+    if (g_device != VK_NULL_HANDLE) return 1; /* already initialized */
+
+    if (!vulkan_ensure_instance()) return 0;
     /* Multi-GPU discovery/classification (SPECS_MGPU.md M1): measure the real
      * host<->device PCIe bandwidth of every usable device and mark fast/slow.
      * Cached for the pick below (and for the future multi-device planner). */
@@ -2003,7 +2399,7 @@ int ds4_gpu_init(void) {
         g_instance = VK_NULL_HANDLE;
         return 0;
     }
-    rc = vulkan_create_device();
+    VkResult rc = vulkan_create_device();
     if (rc != VK_SUCCESS) {
         vkDestroyInstance(g_instance, NULL);
         g_instance = VK_NULL_HANDLE;
@@ -2053,44 +2449,7 @@ int ds4_gpu_init(void) {
  * every physical device.  Shared by ds4_gpu_init (single) and the multi-device
  * init below. */
 static int vulkan_instance_init(void) {
-    if (g_instance != VK_NULL_HANDLE) return 1;
-    VkApplicationInfo app = {};
-    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app.pApplicationName = "ds4";
-    app.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
-    app.apiVersion = VK_API_VERSION_1_1;
-
-    const char *inst_exts[1];
-    uint32_t n_inst_exts = 0;
-    {
-        uint32_t n = 0;
-        vkEnumerateInstanceExtensionProperties(NULL, &n, NULL);
-        if (n > 0) {
-            VkExtensionProperties *e = (VkExtensionProperties *)malloc(sizeof(*e) * n);
-            if (e) {
-                vkEnumerateInstanceExtensionProperties(NULL, &n, e);
-                for (uint32_t i = 0; i < n; i++) {
-                    if (strcmp(e[i].extensionName,
-                               "VK_KHR_get_physical_device_properties2") == 0) {
-                        inst_exts[n_inst_exts++] =
-                            "VK_KHR_get_physical_device_properties2";
-                        break;
-                    }
-                }
-                free(e);
-            }
-        }
-    }
-    VkInstanceCreateInfo ici = {};
-    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = n_inst_exts;
-    ici.ppEnabledExtensionNames = n_inst_exts ? inst_exts : NULL;
-    VkResult rc = vkCreateInstance(&ici, NULL, &g_instance);
-    if (rc != VK_SUCCESS) {
-        vulkan_log_vk(rc, "vkCreateInstance");
-        return 0;
-    }
+    if (!vulkan_ensure_instance()) return 0;
     ds4_vk_dev_info dinfo[DS4_VK_MAX_DEVICES];
     const int nd = ds4_vulkan_probe_devices(dinfo, DS4_VK_MAX_DEVICES);
     if (nd > 1) {
@@ -2103,6 +2462,7 @@ static int vulkan_instance_init(void) {
                     !dinfo[i].usable ? "unusable"
                                      : (dinfo[i].is_fast ? "FAST" : "SLOW"));
         }
+        ds4_vulkan_probe_p2p(dinfo, nd);
     }
     return 1;
 }
@@ -3867,18 +4227,11 @@ static uint64_t vulkan_phys_vram_bytes(VkPhysicalDevice phys) {
  * Creates a throwaway instance when g_instance is not yet up. */
 extern "C" int ds4_vulkan_probe_devices(ds4_vk_dev_info *out, int max_devices) {
     if (!out || max_devices <= 0) return 0;
+    /* Use the shared instance (created once for the whole process): a vk_index
+     * is only valid within the instance that produced it, and separate
+     * instances can enumerate the same GPUs in different orders. */
+    if (!vulkan_ensure_instance()) return 0;
     VkInstance inst = g_instance;
-    int own_instance = 0;
-    if (inst == VK_NULL_HANDLE) {
-        VkApplicationInfo ai = {};
-        ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-        ai.apiVersion = VK_API_VERSION_1_0;
-        VkInstanceCreateInfo ici = {};
-        ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-        ici.pApplicationInfo = &ai;
-        if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS) return 0;
-        own_instance = 1;
-    }
 
     /* Fast/slow classification threshold (GB/s).  5.0 so a PCIe 4.0 x4 link
      * (~6-7 GB/s real) counts as FAST: a bifurcated 4x4x4x4 topology then
@@ -3927,7 +4280,6 @@ extern "C" int ds4_vulkan_probe_devices(ds4_vk_dev_info *out, int max_devices) {
         }
         free(devs);
     }
-    if (own_instance) vkDestroyInstance(inst, NULL);
     return n;
 }
 

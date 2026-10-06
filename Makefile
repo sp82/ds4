@@ -895,8 +895,15 @@ vkbench: $(VKBENCH_DIR)/vkbench.o
 # --- mgpu-probe multi-GPU capability probe (vulkan/tools/mgpu_probe) --------
 MGPU_PROBE_DIR = vulkan/tools/mgpu_probe
 
-$(MGPU_PROBE_DIR)/mgpu_probe.o: $(MGPU_PROBE_DIR)/mgpu_probe.c
-	gcc $(CFLAGS) -D_GNU_SOURCE -c -o $@ $(MGPU_PROBE_DIR)/mgpu_probe.c
+MGPU_PROBE_SPV = $(MGPU_PROBE_DIR)/read_spv.h $(MGPU_PROBE_DIR)/write_spv.h
+
+# Grouped target (&:): one recipe run generates BOTH headers (avoids -j races).
+$(MGPU_PROBE_SPV) &: $(MGPU_PROBE_DIR)/gen_spv.py \
+                   $(MGPU_PROBE_DIR)/read_bench.hlsl $(MGPU_PROBE_DIR)/write_bench.hlsl
+	python3 $(MGPU_PROBE_DIR)/gen_spv.py
+
+$(MGPU_PROBE_DIR)/mgpu_probe.o: $(MGPU_PROBE_DIR)/mgpu_probe.c $(MGPU_PROBE_SPV)
+	gcc $(CFLAGS) -D_GNU_SOURCE -I$(MGPU_PROBE_DIR) -c -o $@ $(MGPU_PROBE_DIR)/mgpu_probe.c
 
 mgpu-probe: $(MGPU_PROBE_DIR)/mgpu_probe.o
 	gcc -o $@ $^ -lvulkan -lm
