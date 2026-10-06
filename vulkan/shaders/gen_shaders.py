@@ -115,6 +115,13 @@ SHADERS = [
     ("qwen4_block_key", "qwen4_attn.hlsl", "block_key"),
     ("qwen4_attn_decode", "qwen4_attn.hlsl", "attn_decode"),
     ("qwen4_attn_merge", "qwen4_attn.hlsl", "attn_merge"),
+    ("qwen4_router_topk", "qwen4_router.hlsl", "router_topk"),
+    ("qwen4_moe_mid", "qwen4_moe.hlsl", "moe_mid"),
+    ("qwen4_moe_down", "qwen4_moe.hlsl", "moe_down"),
+    ("qwen4_moe_reduce", "qwen4_moe_reduce.hlsl", "moe_reduce"),
+    ("qwen4_moe_build_lists", "qwen4_moe_reduce.hlsl", "moe_build_lists"),
+    ("qwen4_moe_mm_mid", "qwen4_moe_mm.hlsl", "moe_mm_mid"),
+    ("qwen4_moe_mm_down", "qwen4_moe_mm.hlsl", "moe_mm_down"),
 ]
 
 # Binding shifts must match common.hlsl and the descriptor layout in

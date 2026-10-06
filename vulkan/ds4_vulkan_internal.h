@@ -180,8 +180,15 @@ enum ds4_vk_pipe {
     DS4_PIPE_QWEN4_BLOCK_KEY,
     DS4_PIPE_QWEN4_ATTN_DECODE,
     DS4_PIPE_QWEN4_ATTN_MERGE,
+    DS4_PIPE_QWEN4_ROUTER_TOPK,
+    DS4_PIPE_QWEN4_MOE_MID,
+    DS4_PIPE_QWEN4_MOE_DOWN,
+    DS4_PIPE_QWEN4_MOE_REDUCE,
+    DS4_PIPE_QWEN4_MOE_BUILD_LISTS,
+    DS4_PIPE_QWEN4_MOE_MM_MID,
+    DS4_PIPE_QWEN4_MOE_MM_DOWN,
 };
-#define DS4_VK_PIPE_COUNT 88
+#define DS4_VK_PIPE_COUNT 95
 
 /* Active pipeline table (swapped per logical device tier by the context
  * save/load path). */

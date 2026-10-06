@@ -2168,6 +2168,18 @@ static int vulkan_compute_init(void) {
           "attn_decode" },
         { ds4_spv_qwen4_attn_merge, ds4_spv_qwen4_attn_merge_len,
           "attn_merge" },
+        { ds4_spv_qwen4_router_topk, ds4_spv_qwen4_router_topk_len,
+          "router_topk" },
+        { ds4_spv_qwen4_moe_mid, ds4_spv_qwen4_moe_mid_len, "moe_mid" },
+        { ds4_spv_qwen4_moe_down, ds4_spv_qwen4_moe_down_len, "moe_down" },
+        { ds4_spv_qwen4_moe_reduce, ds4_spv_qwen4_moe_reduce_len,
+          "moe_reduce" },
+        { ds4_spv_qwen4_moe_build_lists, ds4_spv_qwen4_moe_build_lists_len,
+          "moe_build_lists" },
+        { ds4_spv_qwen4_moe_mm_mid, ds4_spv_qwen4_moe_mm_mid_len,
+          "moe_mm_mid" },
+        { ds4_spv_qwen4_moe_mm_down, ds4_spv_qwen4_moe_mm_down_len,
+          "moe_mm_down" },
     };
     for (uint32_t i = 0; i < DS4_VK_PIPE_COUNT; i++) {
         snprintf(g_pipe_names[i], sizeof(g_pipe_names[i]), "%s",

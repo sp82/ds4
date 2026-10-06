@@ -3590,6 +3590,27 @@ int main(void) {
         printf("all qwen4 attention tests passed\n");
         return 0;
     }
+    if (getenv("DS4_TEST_QWEN4_ROUTER_ONLY")) {
+        test_router(&arena, 512, 10, 3);
+        test_router(&arena, 32, 10, 5);
+        printf("all qwen4 router tests passed\n");
+        return 0;
+    }
+    if (getenv("DS4_TEST_QWEN4_MOE_ONLY")) {
+        test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
+        test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
+        test_moe(&arena, 16, 10, 2560, 640, 2, 12u);
+        test_moe_types(&arena, 16, 10, 2560, 640, 2, 12u, 39u);
+        test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
+        test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
+        test_moe(&arena, 16, 10, 2560, 640, 37, 10u);
+        test_moe(&arena, 16, 10, 2560, 640, 37, 16u);
+        test_moe(&arena, 8, 10, 2560, 640, 1, 0u);
+        test_moe(&arena, 32, 10, 64, 32, 3, 8u);
+        test_moe(&arena, 32, 10, 64, 32, 3, 0u);
+        printf("all qwen4 MoE decode tests passed\n");
+        return 0;
+    }
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
