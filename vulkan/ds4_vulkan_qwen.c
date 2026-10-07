@@ -961,7 +961,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     }
     if (pool) binds[nb++] = tblb;
     return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_MOE_MID], &p, sizeof(p),
-                           binds, nb, (ff_dim + 3u) / 4u, n_out, n_tokens);
+                           binds, nb, ff_dim, n_out, n_tokens);
 }
 
 int ds4_gpu_qwen4_moe_down_tensor(
@@ -1036,7 +1036,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     }
     if (pool) binds[nb++] = tblb;
     return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_MOE_DOWN], &p, sizeof(p),
-                           binds, nb, (out_dim + 3u) / 4u, n_out, n_tokens);
+                           binds, nb, out_dim, n_out, n_tokens);
 }
 
 int ds4_gpu_qwen4_moe_reduce_tensor(

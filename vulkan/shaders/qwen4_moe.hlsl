@@ -8,10 +8,12 @@
  * Unlike the DeepSeek kernels these do NOT scale by the router weight (the
  * weight is applied in moe_reduce) and the shared expert is an extra slot.
  *
- * One 128-thread block (4 warps) per (4 rows, slot, token); each warp owns one
- * output row.  The whole dot runs on lane 0 (correct; the warp-cooperative
- * variant is a later optimisation).  Weight rows are addressed by absolute
- * byte offset inside the bound model range.
+ * One 256-thread block per (row, slot, token).  The dot is block-cooperative:
+ * each thread dequantises one 32-value sub-block (or a strided slice of the
+ * element-wise formats) and a groupshared tree reduction sums the block.  This
+ * replaces the earlier lane-0-only dot (32x underutilised) that dominated the
+ * Qwen decode.  Weight rows are addressed by absolute byte offset inside the
+ * bound model range (or the expert-pool slab when params.flags bit0 is set).
  *
  * Bindings: x (t0), w0 (t1), w1 (t2), shared w0 (t10), shared w1 (t11),
  * selected (u0), out (u4), pool table (u5).
@@ -30,6 +32,10 @@ RWStructuredBuffer<float> out4_buf : register(u4);
 RWStructuredBuffer<int> tbl_buf : register(u5);
 
 [[vk::push_constant]] DS4Params params;
+
+groupshared float moe_gate_red[256];
+groupshared float moe_up_red[256];
+groupshared float moe_down_red[256];
 
 float qwen4_silu(float x) {
     const float e = exp(-abs(x));
@@ -83,56 +89,52 @@ float qwen4_q2k_sub_dot(ByteAddressBuffer w, uint bbase, uint sub, uint xb) {
     return acc;
 }
 
-/* Dot of one dequantised weight row at `base` against x[xb..xb+K). */
-float qwen4_moe_dot(ByteAddressBuffer w, uint base, uint xb, uint K, uint type) {
+/* This thread's contribution to the dot of the weight row at `base` against
+ * x[xb..xb+K).  `tid` is the thread index; one 32-value sub-block per thread
+ * for the block formats, a strided slice for the element-wise formats. */
+float qwen4_dot_part(ByteAddressBuffer w, uint base, uint type, uint K,
+                     uint xb, uint tid) {
+    if (type == 0u || type == 1u || type == 30u) {
+        float acc = 0.0f;
+        for (uint i = tid; i < K; i += 256u) {
+            float wv = (type == 0u) ? asfloat(w.Load(base + i * 4u))
+                     : (type == 1u) ? f16_at(w, base + i * 2u)
+                                    : bf16_at(w, base + i * 2u);
+            acc += wv * a_buf[xb + i];
+        }
+        return acc;
+    }
+    uint nsub = (type == 10u || type == 12u || type == 16u)
+              ? ((K + 31u) >> 5u) : (K >> 5u);
+    if (tid >= nsub) return 0.0f;
+    const uint sb = tid;
+    const uint xb32 = xb + sb * 32u;
+    if (type == 16u)
+        return qwen4_iq2_sub_dot(w, base + (sb >> 3u) * 66u + 2u +
+                                    8u * (sb & 7u),
+                                 f16_at(w, base + (sb >> 3u) * 66u), xb32);
+    if (type == 10u)
+        return qwen4_q2k_sub_dot(w, base + (sb >> 3u) * 84u, sb & 7u, xb32);
+    if (type == 12u)
+        return q4k_sub_dot(w, base + (sb >> 3u) * 144u, sb & 7u, a_buf, xb32);
+    if (type == 39u)
+        return mxfp4_block_dot(w, base + sb * 17u, a_buf, xb32);
+    if (type == 8u) {
+        uint bb = base + sb * 34u;
+        float d = q8_scale_at(w, bb);
+        float acc = 0.0f;
+        for (uint i = 0u; i < 32u; i++)
+            acc += d * (float)q8_s8_at(w, bb, i) * a_buf[xb32 + i];
+        return acc;
+    }
+    /* Q4_0 */
+    uint bb = base + sb * 18u;
+    float d = f16_at(w, bb);
     float acc = 0.0f;
-    if (type == 0u) {
-        for (uint i = 0u; i < K; i++) acc += asfloat(w.Load(base + i * 4u)) * a_buf[xb + i];
-    } else if (type == 1u) {
-        for (uint i = 0u; i < K; i++) acc += f16_at(w, base + i * 2u) * a_buf[xb + i];
-    } else if (type == 30u) {
-        for (uint i = 0u; i < K; i++) acc += bf16_at(w, base + i * 2u) * a_buf[xb + i];
-    } else if (type == 8u) {
-        uint blocks = K >> 5u;
-        for (uint b = 0u; b < blocks; b++) {
-            uint bb = base + b * 34u;
-            float d = q8_scale_at(w, bb);
-            for (uint i = 0u; i < 32u; i++)
-                acc += d * (float)q8_s8_at(w, bb, i) * a_buf[xb + b * 32u + i];
-        }
-    } else if (type == 2u) {
-        uint blocks = K >> 5u;
-        for (uint b = 0u; b < blocks; b++) {
-            uint bb = base + b * 18u;
-            float d = f16_at(w, bb);
-            for (uint j = 0u; j < 16u; j++) {
-                uint packed = q8_byte_at(w, bb + 2u, j);
-                acc += d * ((float)(packed & 0xfu) - 8.0f) * a_buf[xb + b * 32u + j];
-                acc += d * ((float)(packed >> 4u) - 8.0f) * a_buf[xb + b * 32u + j + 16u];
-            }
-        }
-    } else if (type == 39u) {
-        uint blocks = K >> 5u;
-        for (uint b = 0u; b < blocks; b++)
-            acc += mxfp4_block_dot(w, base + b * 17u, a_buf, xb + b * 32u);
-    } else if (type == 12u) {
-        uint blocks = K >> 8u;
-        for (uint b = 0u; b < blocks; b++) {
-            uint bb = base + b * 144u;
-            for (uint j = 0u; j < 8u; j++)
-                acc += q4k_sub_dot(w, bb, j, a_buf, xb + b * 256u + j * 32u);
-        }
-    } else if (type == 10u) {
-        uint subs = (K + 31u) >> 5u;
-        for (uint s = 0u; s < subs; s++)
-            acc += qwen4_q2k_sub_dot(w, base + (s >> 3u) * 84u, s & 7u, xb + s * 32u);
-    } else if (type == 16u) {
-        uint subs = K >> 5u;
-        for (uint s = 0u; s < subs; s++) {
-            uint b = s >> 3u;
-            acc += qwen4_iq2_sub_dot(w, base + b * 66u + 2u + 8u * (s & 7u),
-                                     f16_at(w, base + b * 66u), xb + s * 32u);
-        }
+    for (uint j = 0u; j < 16u; j++) {
+        uint packed = q8_byte_at(w, bb + 2u, j);
+        acc += d * ((float)(packed & 0xfu) - 8.0f) * a_buf[xb32 + j];
+        acc += d * ((float)(packed >> 4u) - 8.0f) * a_buf[xb32 + j + 16u];
     }
     return acc;
 }
@@ -140,70 +142,91 @@ float qwen4_moe_dot(ByteAddressBuffer w, uint base, uint xb, uint K, uint type) 
 /* params: n=K (activation len), rows=T, in_dim=M (out rows), out_dim=NS,
  * aux=expert_bytes, ratio=row_bytes, blocks=shared_type (0xffffffff=none),
  * index=shared row bytes, rsvd3=routed type, flags bit0=pool bit1=shared. */
-[numthreads(128, 1, 1)]
+[numthreads(256, 1, 1)]
 void moe_mid(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x * 4u + (tid >> 5u);
-    uint slot = gid_grp.y;
-    uint t = gid_grp.z;
     uint M = params.in_dim;
     uint NS = params.out_dim;
     uint K = params.n;
-    if (row >= M || t >= params.rows) return;
+    uint row = gid_grp.x;
+    uint slot = gid_grp.y;
+    uint t = gid_grp.z;
     const bool has_shared = (params.flags & 2u) != 0u;
     const bool use_shared = has_shared && slot == NS;
-    const uint stride = NS + (has_shared ? 1u : 0u);
-    const uint pair = t * stride + slot;
-    float a = 0.0f, b = 0.0f;
-    if ((tid & 31u) == 0u) {
-        if (use_shared) {
-            uint srb = params.index;
-            a = qwen4_moe_dot(sh0_buf, row * srb, t * K, K, params.blocks);
-            b = qwen4_moe_dot(sh1_buf, row * srb, t * K, K, params.blocks);
-        } else {
-            int e = selected_buf[t * NS + slot];
-            if ((params.flags & 1u) != 0u) {
-                int ts = tbl_buf[e];
-                if (ts >= 0) e = ts;
-            }
-            if (e >= 0) {
-                uint off = ((uint)e * M + row) * params.ratio;
-                a = qwen4_moe_dot(w_buf, off, t * K, K, params.rsvd3);
-                b = qwen4_moe_dot(up_w_buf, off, t * K, K, params.rsvd3);
-            }
+    const uint n_out = NS + (has_shared ? 1u : 0u);
+    const uint pair = t * n_out + slot;
+    if (row >= M || t >= params.rows) return;
+
+    const uint xb = t * K;
+    float ga, ua;
+    if (use_shared) {
+        uint srb = params.index;
+        ga = qwen4_dot_part(sh0_buf, row * srb, params.blocks, K, xb, tid);
+        ua = qwen4_dot_part(sh1_buf, row * srb, params.blocks, K, xb, tid);
+    } else {
+        int e = selected_buf[t * NS + slot];
+        if ((params.flags & 1u) != 0u) {
+            int ts = tbl_buf[e];
+            if (ts >= 0) e = ts;
         }
-        out4_buf[pair * M + row] = qwen4_silu(a) * b;
+        if (e < 0) {
+            if (tid == 0u) out4_buf[pair * M + row] = 0.0f;
+            return;
+        }
+        uint base = ((uint)e * M + row) * params.ratio;
+        ga = qwen4_dot_part(w_buf, base, params.rsvd3, K, xb, tid);
+        ua = qwen4_dot_part(up_w_buf, base, params.rsvd3, K, xb, tid);
     }
+    moe_gate_red[tid] = ga;
+    moe_up_red[tid] = ua;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+        if (tid < st) {
+            moe_gate_red[tid] += moe_gate_red[tid + st];
+            moe_up_red[tid] += moe_up_red[tid + st];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u)
+        out4_buf[pair * M + row] = qwen4_silu(moe_gate_red[0]) * moe_up_red[0];
 }
 
-[numthreads(128, 1, 1)]
+[numthreads(256, 1, 1)]
 void moe_down(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
-    uint row = gid_grp.x * 4u + (tid >> 5u);
-    uint slot = gid_grp.y;
-    uint t = gid_grp.z;
     uint M = params.in_dim;
     uint NS = params.out_dim;
     uint K = params.n;
-    if (row >= M || t >= params.rows) return;
+    uint row = gid_grp.x;
+    uint slot = gid_grp.y;
+    uint t = gid_grp.z;
     const bool has_shared = (params.flags & 2u) != 0u;
     const bool use_shared = has_shared && slot == NS;
-    const uint stride = NS + (has_shared ? 1u : 0u);
-    const uint pair = t * stride + slot;
-    float a = 0.0f;
-    if ((tid & 31u) == 0u) {
-        if (use_shared) {
-            a = qwen4_moe_dot(sh0_buf, row * params.index, pair * K, K,
-                              params.blocks);
-        } else {
-            int e = selected_buf[t * NS + slot];
-            if ((params.flags & 1u) != 0u) {
-                int ts = tbl_buf[e];
-                if (ts >= 0) e = ts;
-            }
-            if (e >= 0) {
-                uint off = ((uint)e * M + row) * params.ratio;
-                a = qwen4_moe_dot(w_buf, off, pair * K, K, params.rsvd3);
-            }
+    const uint n_out = NS + (has_shared ? 1u : 0u);
+    const uint pair = t * n_out + slot;
+    if (row >= M || t >= params.rows) return;
+
+    const uint xb = pair * K;
+    float a;
+    if (use_shared) {
+        a = qwen4_dot_part(sh0_buf, row * params.index, params.blocks, K, xb,
+                           tid);
+    } else {
+        int e = selected_buf[t * NS + slot];
+        if ((params.flags & 1u) != 0u) {
+            int ts = tbl_buf[e];
+            if (ts >= 0) e = ts;
         }
-        out4_buf[pair * M + row] = a;
+        if (e < 0) {
+            if (tid == 0u) out4_buf[pair * M + row] = 0.0f;
+            return;
+        }
+        uint base = ((uint)e * M + row) * params.ratio;
+        a = qwen4_dot_part(w_buf, base, params.rsvd3, K, xb, tid);
     }
+    moe_down_red[tid] = a;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+        if (tid < st) moe_down_red[tid] += moe_down_red[tid + st];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) out4_buf[pair * M + row] = moe_down_red[0];
 }
