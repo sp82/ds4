@@ -34,7 +34,9 @@ static float g_qwen4_rope_freq[32];
 static uint32_t g_qwen4_rope_pairs = 0;
 static float g_qwen4_rope_scale = 1.0f;
 static int g_qwen4_rope_set = 0;
-static ds4_gpu_tensor *g_qwen4_rope_tensor = NULL;
+/* One table per logical tier: attention runs on whichever tier owns the layer,
+ * so a single global tensor would be bound on the wrong device in multi-GPU. */
+static ds4_gpu_tensor *g_qwen4_rope_tensor[DS4_MAX_GPUS] = {0};
 
 void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n_pairs, float mscale) {
     g_qwen4_rope_set = freq != NULL;
@@ -42,9 +44,11 @@ void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n_pairs, float mscale) {
     memset(g_qwen4_rope_freq, 0, sizeof(g_qwen4_rope_freq));
     g_qwen4_rope_pairs = freq ? (n_pairs < 32u ? n_pairs : 32u) : 0u;
     if (freq) memcpy(g_qwen4_rope_freq, freq, g_qwen4_rope_pairs * sizeof(float));
-    if (g_qwen4_rope_tensor) {
-        ds4_gpu_tensor_free(g_qwen4_rope_tensor);
-        g_qwen4_rope_tensor = NULL;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        if (g_qwen4_rope_tensor[t]) {
+            ds4_gpu_tensor_free(g_qwen4_rope_tensor[t]);
+            g_qwen4_rope_tensor[t] = NULL;
+        }
     }
 }
 
@@ -58,15 +62,17 @@ int ds4_gpu_qwen4_decode_fusions_enabled(void) {
 
 static const ds4_gpu_tensor *qwen4_rope_table(void) {
     if (!g_qwen4_rope_set) return NULL;
-    if (!g_qwen4_rope_tensor) {
-        g_qwen4_rope_tensor = ds4_gpu_tensor_alloc(32u * sizeof(float));
-        if (g_qwen4_rope_tensor) {
-            (void)ds4_gpu_tensor_write(g_qwen4_rope_tensor, 0,
+    int tier = ds4_vulkan_current_tier();
+    if (tier < 0 || tier >= DS4_MAX_GPUS) tier = 0;
+    if (!g_qwen4_rope_tensor[tier]) {
+        g_qwen4_rope_tensor[tier] = ds4_gpu_tensor_alloc(32u * sizeof(float));
+        if (g_qwen4_rope_tensor[tier]) {
+            (void)ds4_gpu_tensor_write(g_qwen4_rope_tensor[tier], 0,
                                        g_qwen4_rope_freq,
                                        32u * sizeof(float));
         }
     }
-    return g_qwen4_rope_tensor;
+    return g_qwen4_rope_tensor[tier];
 }
 
 /* Model range check: in-window and inside the registered map. */

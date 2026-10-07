@@ -241,6 +241,11 @@ ds4_gpu_tensor *vulkan_scratch_b(uint64_t bytes);
 ds4_gpu_tensor *vulkan_scratch_c(uint64_t bytes);
 ds4_gpu_tensor *vulkan_scratch_d(uint64_t bytes);
 
+/* Currently selected logical device tier (0 when single-GPU / before init).
+ * Backend-global tensors that must live on every tier use this to pick the
+ * per-tier copy (e.g. the Qwen rope table). */
+int ds4_vulkan_current_tier(void);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

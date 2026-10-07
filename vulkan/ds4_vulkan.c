@@ -701,6 +701,12 @@ extern "C" int ds4_vulkan_multi_tier_active(void) {
     return g_vulkan_multi_tier;
 }
 
+/* Currently selected logical tier (0 before init).  Backend-global tensors
+ * replicated per tier resolve their active copy through this. */
+extern "C" int ds4_vulkan_current_tier(void) {
+    return g_vk_ctx_active < 0 ? 0 : g_vk_ctx_active;
+}
+
 static void vulkan_ctx_save(struct ds4_vk_dev_ctx *c) {
     memset(c, 0, sizeof(*c));
     c->phys = g_phys;
@@ -2828,11 +2834,14 @@ static int vulkan_upload_to_tensor(ds4_gpu_tensor *t, uint64_t offset,
     struct ds4_vulkan_tensor *h = vulkan_tensor_handle(t);
     if (!h || !data || bytes == 0) return 0;
     if (offset > h->bytes || bytes > h->bytes - offset) return 0;
-    vulkan_check_tensor_device("upload", h);
     if (h->host_map) {
+        /* A host-visible tensor is written through its persistent mapping, so
+         * the selected tier is irrelevant (multi-GPU replicates pos3/ple_emb
+         * this way).  No device check needed. */
         memcpy(h->host_map + h->offset + offset, data, bytes);
         return 1;
     }
+    vulkan_check_tensor_device("upload", h);
     if (g_commands_active) return 0;   /* staging path is one-shot only */
     if (!vulkan_compute_init()) return 0;
     ds4_gpu_tensor *st = ds4_gpu_tensor_alloc(bytes);
@@ -2872,7 +2881,6 @@ static int vulkan_download_from_tensor(const ds4_gpu_tensor *t, uint64_t offset,
     struct ds4_vulkan_tensor *h = vulkan_tensor_handle(t);
     if (!h || !data || bytes == 0) return 0;
     if (offset > h->bytes || bytes > h->bytes - offset) return 0;
-    vulkan_check_tensor_device("download", h);
     if (h->host_map) {
         if (g_commands_active) {
             /* An open (unsubmitted) scope may hold the kernel that wrote this
@@ -2889,6 +2897,7 @@ static int vulkan_download_from_tensor(const ds4_gpu_tensor *t, uint64_t offset,
         memcpy(data, h->host_map + h->offset + offset, bytes);
         return 1;
     }
+    vulkan_check_tensor_device("download", h);
     if (g_commands_active) return 0;
     if (!vulkan_compute_init()) return 0;
     ds4_gpu_tensor *st = ds4_gpu_tensor_alloc(bytes);
