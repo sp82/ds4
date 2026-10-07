@@ -2190,6 +2190,10 @@ static int vulkan_compute_init(void) {
           "hc_mix_rows" },
         { ds4_spv_qwen4_ple_gate, ds4_spv_qwen4_ple_gate_len, "ple_gate" },
         { ds4_spv_qwen4_ple_conv, ds4_spv_qwen4_ple_conv_len, "ple_conv" },
+        { ds4_spv_qwen4_argmax, ds4_spv_qwen4_argmax_len, "qwen4_argmax" },
+        { ds4_spv_qwen4_mtp_stage, ds4_spv_qwen4_mtp_stage_len, "mtp_stage" },
+        { ds4_spv_qwen4_mtp_combine, ds4_spv_qwen4_mtp_combine_len,
+          "mtp_combine" },
     };
     for (uint32_t i = 0; i < DS4_VK_PIPE_COUNT; i++) {
         snprintf(g_pipe_names[i], sizeof(g_pipe_names[i]), "%s",

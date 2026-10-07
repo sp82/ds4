@@ -3632,6 +3632,13 @@ int main(void) {
         return 0;
     }
 #endif
+    if (getenv("DS4_TEST_QWEN4_MTP_ONLY")) {
+        test_qwen4_argmax();
+        test_mtp(&arena, 2560, 4);
+        test_mtp(&arena, 64, 4);
+        printf("all qwen4 MTP tests passed\n");
+        return 0;
+    }
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);

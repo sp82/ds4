@@ -129,6 +129,9 @@ SHADERS = [
     ("qwen4_hc_mix_rows", "qwen4_hc.hlsl", "hc_mix_rows"),
     ("qwen4_ple_gate", "qwen4_ple.hlsl", "ple_gate"),
     ("qwen4_ple_conv", "qwen4_ple.hlsl", "ple_conv"),
+    ("qwen4_argmax", "qwen4_mtp.hlsl", "qwen4_argmax"),
+    ("qwen4_mtp_stage", "qwen4_mtp.hlsl", "mtp_stage"),
+    ("qwen4_mtp_combine", "qwen4_mtp.hlsl", "mtp_combine"),
 ]
 
 # Binding shifts must match common.hlsl and the descriptor layout in

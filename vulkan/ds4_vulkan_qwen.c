@@ -1466,3 +1466,86 @@ int ds4_gpu_qwen4_ple_conv_tensor(
     return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_PLE_CONV], &p, sizeof(p),
                            binds, nb, (n_channels + 255u) / 256u, 1u, 1u);
 }
+
+/* --- P5: multi-token predictor (nextn / MTP) ---------------------------- */
+
+/* Two-pass argmax over n_vocab F32 logits: pass 1 reduces 4096-value chunks
+ * into `scratch` (uint2 per chunk), pass 2 merges the winners into out[0].
+ * NaN is skipped, +-Inf kept, ties break toward the lower index (matches the
+ * host sample_argmax and the Metal kernel_qwen4_argmax). */
+int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch,
+                                const ds4_gpu_tensor *logits, uint32_t n_vocab) {
+    if (!out_idx || !scratch || !logits) return 0;
+    if (n_vocab == 0u || n_vocab > 0x7fffffffu) return 0;
+    const uint32_t chunks = (n_vocab + 4095u) / 4096u;
+    if (out_idx->bytes < sizeof(int32_t)) return 0;
+    if (scratch->bytes < (uint64_t)chunks * 8u) return 0;
+    if (logits->bytes < (uint64_t)n_vocab * sizeof(float)) return 0;
+    struct ds4_vk_params p = {};
+    p.n = n_vocab;
+    struct ds4_vk_bind binds[3];
+    binds[0] = vulkan_bind_tensor(DS4_VK_BINDING_A, logits);
+    binds[1] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out_idx);
+    binds[2] = vulkan_bind_tensor(DS4_VK_BINDING_OUT2, scratch);
+    if (!vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_ARGMAX], &p, sizeof(p), binds, 3,
+                         chunks, 1u, 1u)) {
+        return 0;
+    }
+    p.n = chunks;
+    p.flags = 1u;
+    return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_ARGMAX], &p, sizeof(p), binds, 3,
+                           1u, 1u, 1u);
+}
+
+/* Stage the MTP concat rows: row 0 = [rms(e)*g_e | 0], row 1+s =
+ * [0 | R_s/rms(R)*g_h_s], one RMS over all hc streams.  One threadgroup per
+ * row. */
+int ds4_gpu_qwen4_mtp_stage_tensor(
+    ds4_gpu_tensor *cat, const ds4_gpu_tensor *e, const ds4_gpu_tensor *R,
+    const void *model_map, uint64_t model_size, uint64_t g_e_offset,
+    uint64_t g_h_offset, uint32_t n_embd, uint32_t n_hc, float eps) {
+    if (!cat || !e || !R || !model_map) return 0;
+    if (n_embd == 0u || n_hc == 0u || n_hc > 8u) return 0;
+    const uint64_t eb = (uint64_t)n_embd * sizeof(float);
+    const uint64_t hb = (uint64_t)n_hc * eb;
+    if (e->bytes < eb || R->bytes < hb) return 0;
+    if (cat->bytes < (uint64_t)(n_hc + 1u) * 2u * eb) return 0;
+    if (!qwen4_range_ok(g_e_offset, eb, model_size) ||
+        !qwen4_range_ok(g_h_offset, hb, model_size)) {
+        return 0;
+    }
+    struct ds4_vk_params p = {};
+    p.n = n_embd;
+    p.index = n_hc;
+    p.eps = eps;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, e);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_B, R);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_C, g_e_offset, eb);
+    binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_W, g_h_offset, hb);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, cat);
+    return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_MTP_STAGE], &p, sizeof(p), binds,
+                           nb, n_hc + 1u, 1u, 1u);
+}
+
+/* R_out[s][d] = proj[0][d] + proj[1+s][d]. */
+int ds4_gpu_qwen4_mtp_combine_tensor(
+    ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd,
+    uint32_t n_hc) {
+    if (!R_out || !proj) return 0;
+    if (n_embd == 0u || n_hc == 0u || n_hc > 8u) return 0;
+    const uint64_t eb = (uint64_t)n_embd * sizeof(float);
+    if (R_out->bytes < (uint64_t)n_hc * eb) return 0;
+    if (proj->bytes < (uint64_t)(n_hc + 1u) * eb) return 0;
+    struct ds4_vk_params p = {};
+    p.n = n_embd;
+    p.index = n_hc;
+    struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
+    uint32_t nb = 0;
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, proj);
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, R_out);
+    const uint32_t n = n_embd * n_hc;
+    return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_MTP_COMBINE], &p, sizeof(p),
+                           binds, nb, (n + 255u) / 256u, 1u, 1u);
+}
