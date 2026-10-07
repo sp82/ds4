@@ -8794,6 +8794,10 @@ static bool vulkan_streaming_pool_active(const ds4_weights *w) {
     return false;
 }
 #endif
+/* True when the Qwen MTP predictor (--mtp) is active: the off-slab MTP layer
+ * is then run and its experts must be in the decode map (the single-size-class
+ * pool cannot serve them).  Set from the engine's glm_mtp at session create. */
+static bool g_qwen4_mtp_active = false;
 /*
  * Decode-time spans for one layer. The static set excludes routed expert
  * tensors only when the streaming expert-cache path can really serve them.
@@ -8820,8 +8824,13 @@ static void model_map_span_vec_include_layer_decode(
      * multi-tier is active: the pool load (begin_selected_load) is per-tier and
      * the MoE binds the pool when its layer is active.  (The static tiers, whose
      * experts ARE in the persistent cache, suppress the pool load in the
-     * backend and bind the cache directly.) */
-    if (!vulkan_streaming_pool_active(w)) {
+     * backend and bind the cache directly.)  Off-slab layers (a different
+     * per-expert size class, e.g. Qwen's MTP layer 48) can never be served by
+     * the single-size-class pool, so their expert blobs must be in the decode
+     * map: they are read through the mapped model views. */
+    if (!vulkan_streaming_pool_active(w) ||
+        (g_qwen4_mtp_active &&
+         !weights_streaming_layer_experts_uniform(w, il))) {
         model_map_span_vec_include_one(spans, l->ffn_gate_exps);
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
         model_map_span_vec_include_one(spans, l->ffn_down_exps);
@@ -59553,7 +59562,13 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
                qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
     if (ok && g_qwen4_streaming && T <= 8u) {
-        ok = qwen4_moe_stream_seed(g, m, l, il, T);
+        /* A seed failure is not fatal: the off-slab layers (the MTP layer 48,
+         * a different per-expert size class) can never be served by the
+         * single-size-class pool, so their experts live in the mapped model
+         * views and the MoE falls back to them.  A uniform layer whose seed
+         * really failed then fails the MoE range check cleanly (its experts
+         * are not in the decode map). */
+        (void)qwen4_moe_stream_seed(g, m, l, il, T);
     }
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
@@ -59767,7 +59782,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (g_qwen4_streaming && T <= 8u && !g_qwen4_static_decode_mapped &&
         getenv("DS4_QWEN4_NO_STATIC_DECODE") == NULL) {
         ds4_model_map_span_vec spans;
-        if (!weights_model_map_decode_static_spans(w, false, true, &spans)) {
+        /* runtime_spans (not the static variant): it also maps the routed
+         * experts of off-slab layers (the MTP layer 48), which the
+         * single-size-class expert pool cannot serve. */
+        if (!weights_model_map_decode_runtime_spans(w, false, true, &spans)) {
             return false;
         }
         if (!ds4_gpu_end_commands()) { free(spans.v); return false; }
@@ -74385,12 +74403,16 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_model_is_qwen4()) {
-        if ((e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) ||
+        if ((e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA &&
+             e->backend != DS4_BACKEND_VULKAN) ||
             e->distributed.role != DS4_DISTRIBUTED_NONE) {
-            fprintf(stderr, "ds4: Qwen3.8 sessions require single-host Metal or CUDA\n");
+            fprintf(stderr, "ds4: Qwen3.8 sessions require single-host Metal, CUDA or Vulkan\n");
             free(s);
             return 1;
         }
+        /* The MTP predictor runs the off-slab layer 48; its experts must then
+         * be in the decode map (the pool cannot serve them). */
+        g_qwen4_mtp_active = e->glm_mtp && DS4_N_NEXTN_PREDICT != 0;
         const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
             e->prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
         /* Every slot of a batched server has the same shape, so one arena of

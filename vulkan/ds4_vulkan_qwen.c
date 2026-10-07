@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ds4_gpu.h"
@@ -49,7 +50,11 @@ void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n_pairs, float mscale) {
 
 /* The Vulkan backend implements every fused decode entry point (q8_pair,
  * gdn_front, multi_gemv, hc_combine_norm), matching the CUDA reference. */
-int ds4_gpu_qwen4_decode_fusions_enabled(void) { return 1; }
+int ds4_gpu_qwen4_decode_fusions_enabled(void) {
+    const char *env = getenv("DS4_QWEN4_DECODE_FUSIONS");
+    if (env && env[0] && strcmp(env, "0") == 0) return 0;
+    return 1;
+}
 
 static const ds4_gpu_tensor *qwen4_rope_table(void) {
     if (!g_qwen4_rope_set) return NULL;
