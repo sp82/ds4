@@ -59497,7 +59497,49 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
-static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
+/* P7: Qwen SSD-streaming mode (set from the engine's --ssd-streaming on the
+ * Vulkan backend).  When on, the Qwen graph stages model spans per layer and
+ * the decode MoE streams experts through the device-local expert pool. */
+static bool g_qwen4_streaming = false;
+
+/* P7: seed the device-local expert pool for a decode batch (T<=8) from the
+ * router's selected expert ids; the Qwen MoE dispatchers then bind the pool. */
+static bool qwen4_moe_stream_seed(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il,
+                                  uint32_t T) {
+    if (T == 0u || T > 8u) return false;
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return false;
+    const uint64_t gate_bytes =
+        routed_expert_row_bytes(l->ffn_gate_exps) * DS4_N_FF_EXP;
+    const uint64_t down_bytes =
+        routed_expert_row_bytes(l->ffn_down_exps) * DS4_N_EMBD;
+    if (gate_bytes == 0u || down_bytes == 0u) return false;
+    const uint64_t n_ids = (uint64_t)T * DS4_N_EXPERT_USED;
+    int32_t ids[8u * DS4_N_EXPERT_USED];
+    if (n_ids > sizeof(ids) / sizeof(ids[0])) return false;
+    if (!ds4_gpu_end_commands()) return false;
+    bool ok = ds4_gpu_tensor_read(g->selected, 0, ids,
+                                  n_ids * sizeof(ids[0])) != 0;
+    if (!ok && getenv("DS4_QWEN4_DEBUG"))
+        fprintf(stderr, "DBG moe_seed il=%u T=%u selected read failed\n", il, T);
+    if (ok) {
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(m, l, il, gate_bytes, down_bytes);
+        if (T == 1u) {
+            ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                     &table, ids, DS4_N_EXPERT_USED) != 0;
+        } else {
+            ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                     &table, ids, T, DS4_N_EXPERT_USED) != 0;
+        }
+        if (!ok && getenv("DS4_QWEN4_DEBUG"))
+            fprintf(stderr, "DBG moe_seed il=%u T=%u seed failed\n", il, T);
+    }
+    if (!ds4_gpu_begin_commands()) ok = false;
+    return ok;
+}
+
+static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t il, uint32_t T) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
@@ -59505,7 +59547,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
               ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
-              qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
+               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
+    if (ok && g_qwen4_streaming && T <= 8u) {
+        ok = qwen4_moe_stream_seed(g, m, l, il, T);
+    }
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
@@ -59673,8 +59718,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * tokens in order and attention reads the caches written for the same
  * chunk.  g->R keeps the pre-mixer streams of every row afterwards. */
 static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                                       const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
-    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+                                       const int *tokens, uint32_t T, float *logits_out, bool all_rows) {    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
     if (all_rows && T > g->n_logit_rows) return false;
     for (uint32_t t = 0; t < T; t++) {
         if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
@@ -59722,6 +59766,17 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     } while (0)
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        if (g_qwen4_streaming) {
+            /* Stage this layer's model spans.  Prefill keeps the full layer
+             * (experts included, tiled GEMM); decode maps only the non-expert
+             * tensors -- the routed experts stream through the pool. */
+            if (!ds4_gpu_end_commands()) { ok = false; break; }
+            ok = (T > 8u) ? metal_graph_stream_map_layer(m, w, il)
+                          : metal_graph_stream_map_layer_decode(m, w, il);
+            if (!ok && getenv("DS4_QWEN4_DEBUG"))
+                fprintf(stderr, "DBG stream map layer %u T=%u failed\n", il, T);
+            if (!ok || !ds4_gpu_begin_commands()) { ok = false; break; }
+        }
         if (ds4_qwen4_layer_is_ple(il)) {
             ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
                  qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
@@ -59767,7 +59822,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         }
         QWEN4_PROF(4);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
+        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);   /* the reduce folds the combine in */
         if (ok && g->dump_prompt_rows)
             metal_graph_debug_dump_tensor("qwen_router", g->router,
                                            (uint64_t)T * DS4_N_EXPERT, il, pos0);
@@ -59786,6 +59841,16 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                 1000.0 * prof[2], 1000.0 * prof[3], 1000.0 * prof[4], 1000.0 * prof[5]);
     }
 #undef QWEN4_PROF
+    if (!ok && getenv("DS4_QWEN4_DEBUG"))
+        fprintf(stderr, "DBG forward T=%u pos0=%u ok=0 after layer loop\n", T, pos0);
+    if (ok && g_qwen4_streaming) {
+        if (!ds4_gpu_end_commands()) ok = false;
+        if (ok && !metal_graph_stream_map_output(m, w)) {
+            if (getenv("DS4_QWEN4_DEBUG")) fprintf(stderr, "DBG output map failed\n");
+            ok = false;
+        }
+        if (ok && !ds4_gpu_begin_commands()) ok = false;
+    }
     if (ok && logits_out && all_rows) {
         ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
              qwen4_gemv(g->logits, m, w->output, g->mixed, T);
@@ -60042,7 +60107,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-    if (ok) ok = qwen4_graph_moe(g, m, l, T);
+    if (ok) ok = qwen4_graph_moe(g, m, l, il, T);
     ds4_gpu_tensor *last = NULL;
     const char *argmax_env = getenv("DS4_QWEN4_MTP_GPU_ARGMAX");
     const bool gpu_argmax = want_logits && draft_out && !logits_out &&
@@ -60134,7 +60199,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, 1);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
-    if (ok) ok = qwen4_graph_moe(g, m, l, 1);
+    if (ok) ok = qwen4_graph_moe(g, m, l, il, 1);
     /* the chained draft only needs its argmax; DS4_QWEN4_MTP_DRAFT_ROWS can
      * score the frequent-token prefix exactly like the first draft's head */
     const uint32_t chain_head_rows = qwen4_mtp_draft_rows();
@@ -71739,6 +71804,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     config_validate_model(&e->model);
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
+#ifdef DS4_HAS_QWEN4_GPU
+        g_qwen4_streaming = e->ssd_streaming && e->backend == DS4_BACKEND_VULKAN;
+#endif
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
             e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA ||
@@ -71750,10 +71818,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
-            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
+            (e->ssd_streaming && e->backend != DS4_BACKEND_VULKAN) ||
+            opt->dspark || e->power_percent != 100 ||
             (opt->mtp_path && opt->mtp_path[0])) {
             fprintf(stderr, "ds4: Qwen3.8 requires Metal, CUDA or Vulkan (or --cpu --first-token-test); "
-                            "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
+                            "tensor parallelism, pipeline execution, DSpark, "
                             "external MTP models and power throttling are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -80087,7 +80156,7 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down,
                                         l->hc_ffn_up, l->hc_ffn_inject, T);
         QWEN4_BATCH_PROF(5);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);
+        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);
         QWEN4_BATCH_PROF(6);
     }
     /* The output matrix is the single largest weight read of a decode step,
@@ -80294,7 +80363,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
         }
         if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);
+        if (ok) ok = qwen4_graph_moe(g, m, l, il, T);
     }
     if (ok) ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
                  qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
@@ -80376,7 +80445,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
                  qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, N);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, N, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, N);
-    if (ok) ok = qwen4_graph_moe(g, m, l, N);
+    if (ok) ok = qwen4_graph_moe(g, m, l, il, N);
     /* every session's last committed row, gathered for one pass of the head
      * mixer into the batch's head rows */
     for (int i = 0; ok && i < count; i++) {

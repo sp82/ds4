@@ -222,6 +222,16 @@ struct ds4_vk_bind vulkan_bind_model(uint32_t binding,
                                      uint64_t offset, uint64_t bytes);
 int vulkan_model_range_ok(uint64_t offset, uint64_t bytes);
 
+/* Qwen MoE expert-pool binds for the most recently seeded layer (P7).  `which`
+ * 0 = mid (w0=gate, w1=up), 1 = down (w0=down).  Returns 1 when the pool is
+ * active and fills w0/w1/sel/tbl; 0 to fall back to the model windows. */
+int vulkan_qwen_moe_pool_binds(uint32_t which, uint64_t expert_bytes,
+                               uint32_t n_tokens, uint32_t n_expert,
+                               const ds4_gpu_tensor *selected,
+                               struct ds4_vk_bind *w0, struct ds4_vk_bind *w1,
+                               struct ds4_vk_bind *sel_b,
+                               struct ds4_vk_bind *tbl_b);
+
 /* Persistent scratch tensors, grown on demand (reused across dispatches). */
 ds4_gpu_tensor *vulkan_scratch_a(uint64_t bytes);
 ds4_gpu_tensor *vulkan_scratch_b(uint64_t bytes);

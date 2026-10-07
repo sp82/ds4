@@ -322,7 +322,7 @@ static int g_model_map_live = 0;
 #define DS4_VK_POOL_MIN_SLOTS 6u
 #define DS4_VK_POOL_MAX_SLOTS 256u
 #define DS4_VK_POOL_SEL_CAP 4096u   /* max (token,slot) pairs per MoE call */
-#define DS4_VK_POOL_TABLE_ENTRIES 384u /* max expert id per layer */
+#define DS4_VK_POOL_TABLE_ENTRIES 512u /* max expert id per layer (Qwen: 512) */
 
 /* Hotness (SPECS_HOTNESS): route hotness is a per-(layer,expert) counter that
  * survives eviction.  The pool stores it per layer (n_experts entries); the
@@ -8221,6 +8221,8 @@ static void vulkan_require_layer_tier(uint32_t layer, const char *op) {
             op, layer, want, g_vk_ctx_active);
 }
 
+static uint32_t g_qwen_moe_pool_layer = UINT32_MAX;
+
 extern "C" int ds4_vulkan_stream_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *ids, uint32_t n_selected) {
@@ -8230,18 +8232,27 @@ extern "C" int ds4_vulkan_stream_seed_selected(
         return 0;
     }
     vulkan_require_layer_tier(table->layer, "seed_selected_async");
+    g_qwen_moe_pool_layer = table->layer;
     if (vulkan_weight_cache_covers_experts(table)) return 1;
     struct ds4_vk_pool_layer *l = vulkan_pool_layer(table->layer);
     if (!l) return 0;
     if (!vulkan_pool_layer_ensure(l, table->gate_expert_bytes,
                                   table->down_expert_bytes, n_selected,
                                   n_selected, 1)) {
+        if (getenv("DS4_QWEN4_DEBUG") != NULL)
+            fprintf(stderr, "DBG seed layer=%u pool ensure failed total=%.2fGiB\n",
+                    table->layer, (double)g_pool_total_bytes / 1073741824.0);
         return 0;
     }
     vulkan_pool_hotness_note_selected(l, ids, n_selected);
     int32_t remap[DS4_VK_POOL_SEL_CAP];
-    return vulkan_pool_seed_remap(l, table, ids, n_selected, remap, 0,
-                                  DS4_GPU_EXPERT_PHASE_DECODE) >= 0;
+    {
+        const int rr = vulkan_pool_seed_remap(l, table, ids, n_selected, remap,
+                                              0, DS4_GPU_EXPERT_PHASE_DECODE);
+        if (rr < 0 && getenv("DS4_QWEN4_DEBUG") != NULL)
+            fprintf(stderr, "DBG seed layer=%u remap failed\n", table->layer);
+        return rr >= 0;
+    }
 }
 
 /* Async seed (Fase 7 worker path): same as ds4_vulkan_stream_seed_selected
@@ -8288,6 +8299,7 @@ extern "C" int ds4_vulkan_stream_seed_batch(
         return 0;
     }
     vulkan_require_layer_tier(table->layer, "seed_batch");
+    g_qwen_moe_pool_layer = table->layer;
     if (vulkan_weight_cache_covers_experts(table)) return 1;
     const uint32_t n_ids = (uint32_t)((uint64_t)n_tokens * n_selected);
     uint32_t distinct = 0;
@@ -8383,6 +8395,44 @@ static int vulkan_pool_moe_binds(uint32_t layer_index,
     *down_b = vulkan_bind_tensor_at(DS4_VK_BINDING_B, l->tensor,
                                     vulkan_pool_down_base(l),
                                     (uint64_t)l->n_slots * l->down_expert_bytes);
+    *sel_b = vulkan_bind_tensor(DS4_VK_BINDING_OUT, selected);
+    *tbl_b = vulkan_bind_tensor(DS4_VK_BINDING_TBL, l->meta);
+    return 1;
+}
+
+/* Qwen MoE pool binds.  The Qwen entry points do not carry a layer index, so
+ * the backend remembers the layer of the last synchronous pool seed (the
+ * engine seeds a layer's experts immediately before dispatching that layer's
+ * MoE).  `which` 0 = mid (w0=gate, w1=up), 1 = down (w0=down).  Returns 1 and
+ * fills the binds when the layer pool is active; 0 to fall back to windows. */
+extern "C" int vulkan_qwen_moe_pool_binds(
+        uint32_t which, uint64_t expert_bytes, uint32_t n_tokens,
+        uint32_t n_expert, const ds4_gpu_tensor *selected,
+        struct ds4_vk_bind *w0, struct ds4_vk_bind *w1,
+        struct ds4_vk_bind *sel_b, struct ds4_vk_bind *tbl_b) {
+    if (!g_vulkan_ssd_streaming || g_qwen_moe_pool_layer == UINT32_MAX) return 0;
+    struct ds4_vk_pool_layer *l = vulkan_pool_layer(g_qwen_moe_pool_layer);
+    if (!l || !l->active || !l->tensor || !l->meta || l->n_used == 0) return 0;
+    if (which == 0) {
+        if (l->gate_expert_bytes != expert_bytes) return 0;
+    } else {
+        if (l->down_expert_bytes != expert_bytes) return 0;
+    }
+    const uint64_t n_pair = (uint64_t)n_tokens * n_expert;
+    if (n_pair == 0 || n_pair > DS4_VK_POOL_SEL_CAP) return 0;
+    if (which == 0) {
+        *w0 = vulkan_bind_tensor_at(DS4_VK_BINDING_B, l->tensor,
+                                    vulkan_pool_gate_base(l),
+                                    (uint64_t)l->n_slots * l->gate_expert_bytes);
+        *w1 = vulkan_bind_tensor_at(DS4_VK_BINDING_C, l->tensor,
+                                    vulkan_pool_up_base(l),
+                                    (uint64_t)l->n_slots * l->gate_expert_bytes);
+    } else {
+        *w0 = vulkan_bind_tensor_at(DS4_VK_BINDING_B, l->tensor,
+                                    vulkan_pool_down_base(l),
+                                    (uint64_t)l->n_slots * l->down_expert_bytes);
+        *w1 = *w0;
+    }
     *sel_b = vulkan_bind_tensor(DS4_VK_BINDING_OUT, selected);
     *tbl_b = vulkan_bind_tensor(DS4_VK_BINDING_TBL, l->meta);
     return 1;
