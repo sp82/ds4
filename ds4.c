@@ -20177,9 +20177,9 @@ static bool metal_graph_alloc(
         const ds4_layer_weights *layer) {
     /* single-tier convenience wrapper; placement=NULL routes
      * all per-layer allocations to tier 0. */
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA,
-                                      1, false, NULL, false, NULL, NULL);
-}
+     return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA,
+                                       1, false, NULL, false, NULL, NULL);
+ }
 
 static bool metal_graph_install_model_spans(
         const ds4_model              *model,
@@ -59501,6 +59501,10 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
  * Vulkan backend).  When on, the Qwen graph stages model spans per layer and
  * the decode MoE streams experts through the device-local expert pool. */
 static bool g_qwen4_streaming = false;
+/* P7 decode fast path: the all-layers non-expert decode map is staged once
+ * and reused across every decode token instead of re-staged per layer
+ * (vulkan_set_span_windows destroys + re-uploads the windows per call). */
+static bool g_qwen4_static_decode_mapped = false;
 
 /* P7: seed the device-local expert pool for a decode batch (T<=8) from the
  * router's selected expert ids; the Qwen MoE dispatchers then bind the pool. */
@@ -59755,6 +59759,23 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     double prof[6] = {0};
     const bool prof_on = timing == 2 && T > 1u;
     double prof_last = prof_on ? now_sec() : 0.0;
+    /* P7 decode: stage the all-layers non-expert decode map ONCE.  The Vulkan
+     * span setter destroys + re-uploads the windows on every call, so
+     * re-staging the non-expert tensors per layer per token dominated the
+     * decode.  Prefill keeps per-layer full-layer staging (experts included
+     * for the tiled GEMM). */
+    if (g_qwen4_streaming && T <= 8u && !g_qwen4_static_decode_mapped &&
+        getenv("DS4_QWEN4_NO_STATIC_DECODE") == NULL) {
+        ds4_model_map_span_vec spans;
+        if (!weights_model_map_decode_static_spans(w, false, true, &spans)) {
+            return false;
+        }
+        if (!ds4_gpu_end_commands()) { free(spans.v); return false; }
+        ok = metal_graph_install_model_spans(m, &spans, "static decode");
+        free(spans.v);
+        if (!ok || !ds4_gpu_begin_commands()) return false;
+        g_qwen4_static_decode_mapped = true;
+    }
 #define QWEN4_PROF(idx_) do { \
         if (prof_on) { \
             ds4_gpu_end_commands(); \
@@ -59766,7 +59787,19 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     } while (0)
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
-        if (g_qwen4_streaming) {
+        /* Static decode map: the per-layer scopes would otherwise overlap
+         * across submissions and RADV does not order shader writes against
+         * the next submission's reads (a barrier inside the next CB does not
+         * create a cross-submission dependency), so layer il+1's first kernels
+         * could read layer il's residual/activation buffers before its MoE
+         * finished.  Drain the previous layer before recording the next one
+         * (the per-layer streaming path gets the same drain for free from
+         * vulkan_set_span_windows -> vulkan_destroy_model_wrapper). */
+        if (g_qwen4_static_decode_mapped && T <= 8u) {
+            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
+                !ds4_gpu_begin_commands()) { ok = false; break; }
+        }
+        if (g_qwen4_streaming && (T > 8u || !g_qwen4_static_decode_mapped)) {
             /* Stage this layer's model spans.  Prefill keeps the full layer
              * (experts included, tiled GEMM); decode maps only the non-expert
              * tensors -- the routed experts stream through the pool. */
@@ -59776,6 +59809,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             if (!ok && getenv("DS4_QWEN4_DEBUG"))
                 fprintf(stderr, "DBG stream map layer %u T=%u failed\n", il, T);
             if (!ok || !ds4_gpu_begin_commands()) { ok = false; break; }
+            g_qwen4_static_decode_mapped = false;
         }
         if (ds4_qwen4_layer_is_ple(il)) {
             ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
@@ -59843,7 +59877,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
 #undef QWEN4_PROF
     if (!ok && getenv("DS4_QWEN4_DEBUG"))
         fprintf(stderr, "DBG forward T=%u pos0=%u ok=0 after layer loop\n", T, pos0);
-    if (ok && g_qwen4_streaming) {
+    if (ok && g_qwen4_streaming && (T > 8u || !g_qwen4_static_decode_mapped)) {
         if (!ds4_gpu_end_commands()) ok = false;
         if (ok && !metal_graph_stream_map_output(m, w)) {
             if (getenv("DS4_QWEN4_DEBUG")) fprintf(stderr, "DBG output map failed\n");
