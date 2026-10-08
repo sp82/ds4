@@ -2768,7 +2768,19 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     unsigned char *map = NULL;
     VkBuffer buffer = vulkan_create_host_buffer(bytes, &mem, &map);
     if (buffer == VK_NULL_HANDLE) return NULL;
-    return vulkan_tensor_wrap_buffer(buffer, mem, map, bytes);
+    ds4_gpu_tensor *t = vulkan_tensor_wrap_buffer(buffer, mem, map, bytes);
+    /* On a large-BAR GPU g_host_visible_mem_type is the device-local VRAM
+     * exposed via the BAR: such "host-visible" tensors really live in VRAM, so
+     * account them as device-local (the pool auto-budget subtracts
+     * g_device_local_bytes, otherwise it would over-commit VRAM). */
+    struct ds4_vulkan_tensor *h = t ? vulkan_tensor_handle(t) : NULL;
+    if (h && g_host_visible_mem_type < g_mem_props.memoryTypeCount &&
+        (g_mem_props.memoryTypes[g_host_visible_mem_type].propertyFlags &
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+        h->device_local = 1;
+        g_device_local_bytes += bytes;
+    }
+    return t;
 }
 
 /* Allocate a host-visible tensor on a specific logical tier and restore the

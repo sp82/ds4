@@ -54,6 +54,10 @@ VULKAN_UNAVAILABLE_INT(ds4_gpu_routed_moe_owned_packed_combine_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_routed_moe_owned_slots_combine_rows_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_routed_moe_owned_slots_combine_tensor)
 VULKAN_UNAVAILABLE_INT(ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor)
+/* Metal-only pre-M5 KV+RoPE fp8 fuse.  On Vulkan fuse_kv_rope_store is always
+ * false (ds4_gpu_kv_rope_fp8_fuse_available() == 0), so the call is dead at
+ * -O3 and only surfaced by an -O0 build; keep the symbol for that case. */
+VULKAN_UNAVAILABLE_INT(ds4_gpu_kv_rope_fp8_store_raw_tensor)
 
 /* The streaming expert cache surface (seed/begin/prepare/load/seed_experts)
  * is implemented in ds4_vulkan_compat.c as the Fase 6 all-resident policy:

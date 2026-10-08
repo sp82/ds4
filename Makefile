@@ -321,6 +321,17 @@ vulkan:
 		DS4_LINK="g++ -std=c++17 -pthread -rdynamic" \
 		DS4_LINK_LIBS="-lm -lvulkan"
 
+# Fast iteration build: identical object set/backend to `vulkan` but compiled
+# with -O0, so the huge ds4.c TU builds in ~3s instead of ~37s at -O3.  Not for
+# benchmarking (much slower runtime), only for compile/debug loops.  The shader
+# compilation is cached either way (gen_shaders.py .spv_cache).
+vulkan-dev:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent vkbench \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_engram.o ds4_vulkan.o ds4_vulkan_qwen.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o ds4_layer_pack.o" \
+		CFLAGS="-O0 -g $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -DDS4_VULKAN_BUILD" \
+		DS4_LINK="g++ -std=c++17 -pthread -rdynamic" \
+		DS4_LINK_LIBS="-lm -lvulkan"
+
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
 		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \

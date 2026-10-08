@@ -99,3 +99,6 @@ __pycache__/
 /vulkan/tools/vkbench/vkbench.o
 /.clangd
 /compile_commands.json
+
+# gen_shaders.py per-shader SPIR-V cache
+vulkan/shaders/.spv_cache/
