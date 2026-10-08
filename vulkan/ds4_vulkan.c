@@ -320,7 +320,7 @@ static int g_model_map_live = 0;
 
 #define DS4_VK_POOL_MAX_LAYERS 512
 #define DS4_VK_POOL_MIN_SLOTS 6u
-#define DS4_VK_POOL_MAX_SLOTS 256u
+#define DS4_VK_POOL_MAX_SLOTS 512u
 #define DS4_VK_POOL_SEL_CAP 4096u   /* max (token,slot) pairs per MoE call */
 #define DS4_VK_POOL_TABLE_ENTRIES 512u /* max expert id per layer (Qwen: 512) */
 
@@ -1623,20 +1623,50 @@ static int vulkan_pick_device_ex(int forced_override) {
 
     /* Prefer a host-visible AND host-coherent type so host reads/writes of
      * the shared memory need no explicit flush/invalidate after compute
-     * kernels.  Fall back to plain host-visible. */
+     * kernels.  When the GPU has a LARGE BAR, the device-local VRAM is itself
+     * exposed as a HOST_VISIBLE|HOST_COHERENT type: prefer that over the
+     * system-RAM (GTT) host-visible heap, so the activations/scratch the
+     * shaders hammer every layer live in VRAM instead of crossing PCIe (very
+     * slow on the x1 links).  Small-BAR discrete GPUs expose only a tiny
+     * DEVICE_LOCAL|HOST_VISIBLE carveout, so require a large heap. */
     g_host_visible_mem_type = UINT32_MAX;
     uint32_t fallback = UINT32_MAX;
+    uint32_t vram_host = UINT32_MAX;
     for (uint32_t i = 0; i < g_mem_props.memoryTypeCount; i++) {
         const VkMemoryPropertyFlags f = g_mem_props.memoryTypes[i].propertyFlags;
         if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
         if (fallback == UINT32_MAX) fallback = i;
-        if (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
+        const bool coherent = (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        if (coherent && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            const uint32_t h = g_mem_props.memoryTypes[i].heapIndex;
+            if (h < g_mem_props.memoryHeapCount &&
+                g_mem_props.memoryHeaps[h].size >=
+                    (uint64_t)4u * 1024u * 1024u * 1024u &&
+                vram_host == UINT32_MAX) {
+                vram_host = i;
+            }
+        }
+        if (coherent && g_host_visible_mem_type == UINT32_MAX) {
             g_host_visible_mem_type = i;
-            break;
         }
     }
+    if (vram_host != UINT32_MAX) g_host_visible_mem_type = vram_host;
     if (g_host_visible_mem_type == UINT32_MAX) {
         g_host_visible_mem_type = fallback;
+    }
+    if (getenv("DS4_VULKAN_DEBUG_MEM") != NULL) {
+        for (uint32_t i = 0; i < g_mem_props.memoryTypeCount; i++) {
+            const VkMemoryPropertyFlags f = g_mem_props.memoryTypes[i].propertyFlags;
+            const uint32_t h = g_mem_props.memoryTypes[i].heapIndex;
+            fprintf(stderr,
+                    "ds4: memtype[%u] flags=0x%x (D=%d HV=%d HC=%d) heap=%u size=%.2f GiB%s\n",
+                    i, (unsigned)f,
+                    (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? 1 : 0,
+                    (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? 1 : 0,
+                    (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? 1 : 0,
+                    h, (double)g_mem_props.memoryHeaps[h].size / 1073741824.0,
+                    i == g_host_visible_mem_type ? "  <= activations" : "");
+        }
     }
 
     /* Fase 6 step 4a: pick the device-local tiers.  Prefer a pure
@@ -2971,6 +3001,18 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
             if (h->host_map) vkUnmapMemory(g_device, h->memory);
             vkDestroyBuffer(g_device, h->buffer, NULL);
             if (h->memory) vkFreeMemory(g_device, h->memory, NULL);
+            /* Keep the device-local accounting in step with the frees (the
+             * release_device path does this too); without it every freed
+             * device-local tensor -- e.g. the per-layer model windows the
+             * multi-tier prefill restages -- leaks its bytes and the pool
+             * auto-budget collapses to zero. */
+            if (h->device_local) {
+                if (h->bytes <= g_device_local_bytes) {
+                    g_device_local_bytes -= h->bytes;
+                } else {
+                    g_device_local_bytes = 0;
+                }
+            }
         }
         vulkan_handle_free(h);
         /* A free must never change the backend's selected tier. */
@@ -7425,13 +7467,23 @@ static void vulkan_pool_configure(void) {
         fprintf(stderr,
                 "ds4: Vulkan debug: pool layers=%u eff_budget=%.2f GiB "
                 "per_expert=%.2f MiB slots_per_layer=%u max_bytes=%.2f GiB "
-                "device_local=%.2f GiB\n",
+                "device_local=%.2f GiB budget_experts=%u heap=%.2f GiB "
+                "auto=%.2f GiB\n",
                 layers,
                 (double)eff / 1073741824.0,
                 (double)g_pool_per_expert_bytes / 1048576.0,
                 g_pool_slots_per_layer,
                 (double)vulkan_pool_max_bytes() / 1073741824.0,
-                (double)g_device_local_bytes / 1073741824.0);
+                (double)g_device_local_bytes / 1073741824.0,
+                g_pool_budget,
+                (double)vulkan_pool_heap_bytes() / 1073741824.0,
+                (double)vulkan_pool_auto_budget_bytes() / 1073741824.0);
+        for (int t = 0; t < g_vk_ctx_count; t++) {
+            fprintf(stderr,
+                    "ds4:   ctx[%d] device_local=%.2f GiB pool=%.2f GiB\n",
+                    t, (double)g_vk_ctx[t].device_local_bytes / 1073741824.0,
+                    (double)g_vk_ctx[t].pool_total_bytes / 1073741824.0);
+        }
     }
     g_pool_ready = 1;
 }

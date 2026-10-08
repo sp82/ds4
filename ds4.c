@@ -70942,18 +70942,23 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
      * runs. The reservation flows into the packer via e->gpu_cfg (NOT
      * the caller's cfg) — see the budget loop below. */
     const size_t per_tier_overhead = engine_per_tier_graph_overhead_bytes(e);
+    /* Qwen's graph transients and KV are host-visible (GTT), not device-local,
+     * so they never consume VRAM: reserving them from the VRAM budget only
+     * starves the packer and leaves the static tiers' caches underfilled. */
+    const size_t per_tier_vram_overhead =
+        ds4_model_is_qwen4() ? 0 : per_tier_overhead;
     for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
-        if (e->gpu_cfg.vram_bytes[d] <= per_tier_overhead) {
+        if (e->gpu_cfg.vram_bytes[d] <= per_tier_vram_overhead) {
             fprintf(stderr,
                     "ds4: GPU%d budget %.2f GiB <= per-tier graph overhead "
                     "%.2f GiB; tier cannot hold its own runtime scratch — "
                     "refusing upfront.\n",
                     e->gpu_cfg.device_indices[d],
                     (double)e->gpu_cfg.vram_bytes[d] / (1024.0 * 1024.0 * 1024.0),
-                    (double)per_tier_overhead       / (1024.0 * 1024.0 * 1024.0));
+                    (double)per_tier_vram_overhead / (1024.0 * 1024.0 * 1024.0));
             return -1;
         }
-        e->gpu_cfg.vram_bytes[d] -= per_tier_overhead;
+        e->gpu_cfg.vram_bytes[d] -= per_tier_vram_overhead;
     }
 
     size_t entry_bytes[DS4_MAX_LAYER + 2];
@@ -70974,7 +70979,7 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
         size_t budget = e->gpu_cfg.vram_bytes[d];
         size_t reserve = e->gpu_cfg.safety_margin_bytes + cublas_workspace_overhead;
 #if defined(DS4_VULKAN_BUILD)
-        if (mgpu_dynamic) {
+        if (mgpu_dynamic && !ds4_model_is_qwen4()) {
             /* Vulkan multi-tier keeps every weight of a static tier resident
              * in the persistent device-local cache, so the runtime graph
              * scratch (Class-P decode + the per-tier prefill/output
@@ -71006,7 +71011,32 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
         return -1;
     }
     int placement_rc;
-    if (!cuda_tp_ep && mgpu_dynamic) {
+    bool qwen_static = false;
+    if (ds4_model_is_qwen4() && !cuda_tp_ep) {
+        /* The Qwen trunk (every layer + the head, minus the disk-only n-gram
+         * embeddings) often fits the GPUs' VRAM entirely.  Prefer an
+         * all-resident static layout -- no runtime expert streaming -- and
+         * fall back to the asymmetric slow=static/fast=dynamic plan only when
+         * it does not fit. */
+        int tmp[DS4_MAX_LAYER + 2];
+        if (ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg, tmp) == 0) {
+            int spill = 0;
+            for (int i = 0; i < (int)(DS4_N_LAYER + 2); i++) {
+                if (tmp[i] == DS4_LAYER_PACK_CPU) { spill = 1; break; }
+            }
+            if (!spill) {
+                memcpy(e->placement, tmp, sizeof(tmp));
+                for (int d = 0; d < e->gpu_cfg.n_gpus; d++) e->gpu_cfg.dev_mode[d] = 0;
+                mgpu_dynamic = 0;
+                qwen_static = true;
+                fprintf(stderr, "ds4: Qwen multi-GPU: all layers resident "
+                        "(static, no expert streaming)\n");
+            }
+        }
+    }
+    if (qwen_static) {
+        placement_rc = 0;
+    } else if (!cuda_tp_ep && mgpu_dynamic) {
         /* Asymmetric multi-GPU (SPECS_MGPU.md): slow (static) tiers take the
          * first contiguous layers; the fast (dynamic) tier streams the rest. */
         ds4_mgpu_layer_bytes lb[DS4_MAX_LAYER];
@@ -72886,9 +72916,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     ds4_gpu_set_streaming_expert_cache_expert_bytes(
                             tier_slab_expert_bytes);
                 }
-                if (e->ssd_streaming && e->ssd_streaming_cache_experts > 0) {
-                    ds4_gpu_set_streaming_expert_cache_budget(
-                            e->ssd_streaming_cache_experts);
+                /* Multi-tier does not run the single-tier auto-cache config, so
+                 * e->ssd_streaming_cache_experts is still 0 here: derive each
+                 * tier's expert count from its own VRAM budget (the planner
+                 * already split it per tier).  Otherwise the pool collapses to
+                 * the 3 GiB floor / 6 slots per layer and the dynamic tier's
+                 * VRAM goes unused. */
+                uint32_t tier_experts = e->ssd_streaming_cache_experts;
+                if (tier_slab_expert_bytes != 0 &&
+                    e->gpu_cfg.dev_expert_cache_bytes[t] != 0) {
+                    const uint64_t n =
+                        e->gpu_cfg.dev_expert_cache_bytes[t] / tier_slab_expert_bytes;
+                    if (n > 0 && n <= UINT32_MAX) tier_experts = (uint32_t)n;
+                }
+                if (e->ssd_streaming && tier_experts > 0) {
+                    ds4_gpu_set_streaming_expert_cache_budget(tier_experts);
                 }
                 ds4_model_map_span_vec spans;
                 bool spans_ok;
