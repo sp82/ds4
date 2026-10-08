@@ -72901,7 +72901,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
              *    multi-GPU execution. */
             /* ds4_gpu_init_multi returns 1 on success and 0 on failure
              * (matches ds4_gpu_init). */
-            if (ds4_gpu_init_multi(gpu_cfg) == 0) {
+            /* Pass the CLASSIFIED config (e->gpu_cfg): the planner may have
+             * rewritten dev_mode (e.g. Qwen all-resident forces static), and
+             * the backend's weight-cache mode must match the engine's. */
+            if (ds4_gpu_init_multi(&e->gpu_cfg) == 0) {
                 fprintf(stderr, "ds4: ds4_gpu_init_multi failed; aborting multi-tier startup\n");
                 ds4_engine_close(e);
                 *out = NULL;
