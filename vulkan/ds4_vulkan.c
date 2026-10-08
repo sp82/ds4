@@ -3048,6 +3048,18 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         return 0;
     }
             VkBufferCopy region = { s_start, d_start, bytes };
+            /* Order any preceding writes to the source (shader or host) before
+             * the transfer read, and the transfer write before subsequent
+             * shader reads.  The fused hc_combine_norm copies the residual
+             * stream into its output buffer this way inside an open scope. */
+            VkMemoryBarrier pre = {};
+            pre.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            pre.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            pre.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cb,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                 1, &pre, 0, NULL, 0, NULL);
             vkCmdCopyBuffer(cb, sh->buffer, dh->buffer, 1, &region);
             VkMemoryBarrier mb = {};
             mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -3071,12 +3083,22 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         if (g_vk_ctx_count > 1 && dh->tier != sh->tier &&
             sh->tier >= 0 && sh->tier < g_vk_ctx_count) {
             const int prev = g_vk_ctx_active;
+            /* Drain the source device, then the destination device (they are
+             * different).  The old code switched back to prev before the
+             * second wait, so when prev == source (the per-layer boundary
+             * case) it drained the source twice and never the destination,
+             * leaving the destination's in-flight reads of the buffer we are
+             * about to overwrite unordered. */
             if (ds4_vulkan_set_current_device(sh->tier) == 0) {
                 vulkan_device_wait();               /* drain source */
-                if (prev >= 0 && prev != sh->tier)
-                    (void)ds4_vulkan_set_current_device(prev);
             }
-            if (g_device != VK_NULL_HANDLE) vulkan_device_wait();  /* drain dst */
+            if (dh->tier >= 0 && dh->tier < g_vk_ctx_count &&
+                ds4_vulkan_set_current_device(dh->tier) == 0) {
+                vulkan_device_wait();               /* drain destination */
+            }
+            if (prev >= 0 && prev != g_vk_ctx_active) {
+                (void)ds4_vulkan_set_current_device(prev);
+            }
         }
         memmove(dh->host_map + dh->offset + dst_offset,
                 sh->host_map + sh->offset + src_offset, bytes);
