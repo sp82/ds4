@@ -14732,6 +14732,19 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
     if (prompt_len <= 0) return 1;
     uint32_t cap = (uint32_t)prompt_len;
 
+#if defined(DS4_VULKAN_BUILD)
+    /* The chunked-prefill workspace (batch_*_by_tier) is host-visible; on a
+     * large-BAR Vulkan GPU that lands in VRAM, so a 4096-row scratch costs
+     * ~4 GiB per tier and overflows the weight budget (the placement then
+     * either spills to GTT or refuses upfront).  Cap the chunk at 512, the
+     * same pc the planner reserves (engine_per_tier_graph_overhead_bytes), so
+     * the scratch stays in VRAM and the packer stays honest.  Long-context
+     * prefill is unaffected (chunking just uses more, smaller batches). */
+    const uint32_t ds4_max_chunk = 512u;
+#else
+    const uint32_t ds4_max_chunk = 4096u;
+#endif
+
     if (requested_chunk != 0) {
         cap = requested_chunk;
     } else {
@@ -14743,8 +14756,9 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                 if (v <= 0) return cap;
                 cap = (uint32_t)v;
             }
-        } else if (prompt_len > 4096) {
-            cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
+        } else if (prompt_len > (int)ds4_max_chunk) {
+            cap = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? ds4_max_chunk * 2u
+                                                       : ds4_max_chunk;
         }
     }
 
@@ -40594,9 +40608,20 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
 static ds4_context_memory ds41_graph_memory(uint32_t ctx);
 #endif
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
+#if defined(DS4_VULKAN_BUILD)
+    /* On a large-BAR Vulkan GPU the chunked-prefill workspace (R/xn/mixed/
+     * part/moe_lists, sized for this many rows) is host-visible and therefore
+     * lives in VRAM.  An 8192-row workspace costs ~4 GiB per tier and overflows
+     * the resident weights, which then spill to GTT (slow PCIe).  Match the
+     * DeepSeek prefill cap (512): the workspace stays in VRAM and prefill
+     * throughput is unchanged (measured 13.6 t/s at 32k). */
+    const unsigned long default_chunk = 512ul;
+#else
+    const unsigned long default_chunk = 8192ul;
+#endif
     const char *env = getenv("DS4_QWEN4_PREFILL_CHUNK");
-    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
-    uint32_t chunk = v == 0 || v > 65536ul ? 8192u : (uint32_t)v;
+    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : default_chunk;
+    uint32_t chunk = v == 0 || v > 65536ul ? (uint32_t)default_chunk : (uint32_t)v;
     return chunk > ctx ? ctx : chunk;
 }
 
