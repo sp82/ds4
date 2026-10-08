@@ -18816,11 +18816,18 @@ static bool metal_graph_kv_cache_in_ram_for_tier(
     if (vram != NULL && vram[0] != '\0' && vram[0] != '0') return false;
     const char *ram = getenv("DS4_VULKAN_KV_IN_RAM");
     if (ram != NULL && ram[0] != '\0' && ram[0] != '0') {
-        /* "dynamic" -> only the dynamic (fast-PCIe, expert-pool) tier keeps its
-         * KV in GTT; any other value -> every tier. */
+        /* "dynamic" -> only the dynamic (fast-PCIe, expert-pool) tiers;
+         * "tier:N" -> only logical tier N; "1"/"all"/"yes"/anything else ->
+         * every tier.  A bare number is NOT a tier index, so "=1" means every
+         * tier (what single-GPU users expect). */
         if (strcmp(ram, "dynamic") == 0) {
             return gpu_cfg && gpu_cfg->n_gpus > 1 && tier >= 0 &&
                    tier < gpu_cfg->n_gpus && gpu_cfg->dev_mode[tier] == 1;
+        }
+        if (strncmp(ram, "tier:", 5) == 0) {
+            char *end = NULL;
+            const long v = strtol(ram + 5, &end, 10);
+            if (end != ram + 5 && *end == '\0') return tier == (int)v;
         }
         return true;
     }
@@ -58933,10 +58940,14 @@ static bool qwen4_kv_in_ram_for_tier(int tier) {
 #if defined(DS4_VULKAN_BUILD)
     const char *ram = getenv("DS4_VULKAN_KV_IN_RAM");
     if (ram != NULL && ram[0] != '\0' && ram[0] != '0') {
+        /* Qwen runs all-resident, so it has no dynamic tier.  "tier:N" -> only
+         * logical tier N; "1"/"all"/anything else -> every tier. */
         if (strcmp(ram, "dynamic") == 0) return false;
-        char *end = NULL;
-        const long v = strtol(ram, &end, 10);
-        if (end != ram && *end == '\0') return tier == (int)v;
+        if (strncmp(ram, "tier:", 5) == 0) {
+            char *end = NULL;
+            const long v = strtol(ram + 5, &end, 10);
+            if (end != ram + 5 && *end == '\0') return tier == (int)v;
+        }
         return true;
     }
 #endif
@@ -59184,8 +59195,7 @@ private_state:
         const int lt = g->multi_tier ? g->placement[il + 1u] : 0;
 #define QWEN4_STATE_F32(field_, n_) (g->multi_tier ? qwen4_graph_alloc_f32_on(lt, (n_)) \
                                                    : qwen4_graph_alloc_f32(n_))
-#define QWEN4_STATE_BUF(field_, bytes_) (g->multi_tier ? qwen4_graph_alloc_kv_on(lt, (bytes_)) \
-                                                        : ds4_gpu_tensor_alloc(bytes_))
+#define QWEN4_STATE_BUF(field_, bytes_) qwen4_graph_alloc_kv_on((g->multi_tier ? lt : 0), (bytes_))
         if (ds4_qwen4_layer_is_linear(il)) {
             if (state_pool && hist_pool) {
                 g->layer_lin_state[il] = ds4_gpu_tensor_view(state_pool[il],
