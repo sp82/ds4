@@ -70977,19 +70977,22 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
          * cfg) so the per-tier overhead pre-subtract actually flows into
          * the packer. */
         size_t budget = e->gpu_cfg.vram_bytes[d];
-        size_t reserve = e->gpu_cfg.safety_margin_bytes + cublas_workspace_overhead;
+        /* The 64 MiB cuBLAS workspace is CUDA-only; reserving it on Vulkan
+         * wasted just enough to keep the packer from fitting one more layer
+         * in a slow tier. */
 #if defined(DS4_VULKAN_BUILD)
-        if (mgpu_dynamic && !ds4_model_is_qwen4()) {
-            /* Vulkan multi-tier keeps every weight of a static tier resident
-             * in the persistent device-local cache, so the runtime graph
-             * scratch (Class-P decode + the per-tier prefill/output
-             * workspaces) coexists with the full weight set.  The static
-             * planner estimate under-counts that scratch by ~2-4 GiB
-             * (measured: tier 0 filled to <50 MiB free, so the next
-             * allocation failed mid-decode).  Reserve an extra 3 GiB per tier
-             * so the packer leaves a real graph/scratch headroom. */
-            reserve += (size_t)1536ull * 1024ull * 1024ull;
+        (void)cublas_workspace_overhead;
+        /* The graph scratch is already pre-subtracted per tier; the safety
+         * margin here only covers the driver/headroom.  The default 0.5 GiB
+         * was just enough to keep the packer from fitting one more layer in
+         * the second slow tier (the real scratch+driver is ~0.25 GiB), so cap
+         * it lower and fill the static tiers' VRAM. */
+        size_t reserve = e->gpu_cfg.safety_margin_bytes;
+        if (reserve > (size_t)320ull * 1024ull * 1024ull) {
+            reserve = (size_t)320ull * 1024ull * 1024ull;
         }
+#else
+        size_t reserve = e->gpu_cfg.safety_margin_bytes + cublas_workspace_overhead;
 #endif
         pcfg.gpu_budget_bytes[d] = budget > reserve ? budget - reserve : 0;
 #if defined(DS4_VULKAN_BUILD)
