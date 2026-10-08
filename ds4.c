@@ -58924,6 +58924,38 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32_on(int tier, uint64_t n) {
     return t;
 }
 
+/* Residency of a Qwen KV cache tensor.  Default: VRAM (host-visible, i.e.
+ * VRAM-BAR on a large-BAR GPU).  DS4_VULKAN_KV_IN_RAM=1 -> GTT on every tier;
+ * a numeric value -> GTT only on that tier index.  "dynamic" is meaningless
+ * for Qwen (all-resident, no dynamic tier) and is treated as the default. */
+static bool qwen4_kv_in_ram_for_tier(int tier) {
+    (void)tier;
+#if defined(DS4_VULKAN_BUILD)
+    const char *ram = getenv("DS4_VULKAN_KV_IN_RAM");
+    if (ram != NULL && ram[0] != '\0' && ram[0] != '0') {
+        if (strcmp(ram, "dynamic") == 0) return false;
+        char *end = NULL;
+        const long v = strtol(ram, &end, 10);
+        if (end != ram && *end == '\0') return tier == (int)v;
+        return true;
+    }
+#endif
+    return false;
+}
+
+/* Qwen KV-cache tensor on a tier: GTT when requested (keeps the KV out of
+ * VRAM), else pure device-local VRAM (no host map).  The KV is GPU-only, so a
+ * host-visible (VRAM-BAR) allocation only adds BAR overhead. */
+static ds4_gpu_tensor *qwen4_graph_alloc_kv_on(int tier, uint64_t bytes) {
+#if defined(DS4_VULKAN_BUILD)
+    if (qwen4_kv_in_ram_for_tier(tier)) {
+        ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_host_ram_on(tier, bytes);
+        if (t != NULL) return t;
+    }
+#endif
+    return ds4_gpu_tensor_alloc_device_local_on(tier, bytes);
+}
+
 /* Point the flat transient fields at one tier's set.  The layer code keeps
  * using g->R/g->mixed/... unchanged; only the active tier moves. */
 static void qwen4_alias_tier(ds4_qwen4_gpu_graph *g, int tier) {
@@ -59152,7 +59184,7 @@ private_state:
         const int lt = g->multi_tier ? g->placement[il + 1u] : 0;
 #define QWEN4_STATE_F32(field_, n_) (g->multi_tier ? qwen4_graph_alloc_f32_on(lt, (n_)) \
                                                    : qwen4_graph_alloc_f32(n_))
-#define QWEN4_STATE_BUF(field_, bytes_) (g->multi_tier ? ds4_gpu_tensor_alloc_ptr_on(lt, (bytes_)) \
+#define QWEN4_STATE_BUF(field_, bytes_) (g->multi_tier ? qwen4_graph_alloc_kv_on(lt, (bytes_)) \
                                                         : ds4_gpu_tensor_alloc(bytes_))
         if (ds4_qwen4_layer_is_linear(il)) {
             if (state_pool && hist_pool) {
