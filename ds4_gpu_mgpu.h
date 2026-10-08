@@ -124,6 +124,12 @@ void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t);
  * legacy ds4_gpu_tensor_alloc(bytes) which is equivalent to
  * ds4_gpu_tensor_alloc_ptr_on(0, bytes). */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes);
+
+/* Host-visible GTT (system RAM) tensor on a specific logical tier.  Unlike
+ * ds4_gpu_tensor_alloc_ptr_on it never lands in VRAM, so it does not consume
+ * the per-tier VRAM budget.  Used for the optional RAM-resident KV cache
+ * (DS4_VULKAN_KV_IN_RAM) so a tier's KV can be kept out of VRAM. */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_host_ram_on(int tier, uint64_t bytes);
 int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes);
 void ds4_gpu_enable_q8_dequant_gemm(void);
 

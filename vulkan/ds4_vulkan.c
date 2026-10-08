@@ -144,6 +144,7 @@ static PFN_vkGetQueueCheckpointDataNV    g_pfnGetQueueCheckpointDataNV = NULL;
 static int                               g_dbg_checkpoints = -1;
 static VkPhysicalDeviceMemoryProperties g_mem_props;
 static uint32_t g_host_visible_mem_type = UINT32_MAX;
+static uint32_t g_host_ram_mem_type = UINT32_MAX; /* GTT: HOST_VISIBLE|COHERENT, not device-local */
 static uint32_t g_device_local_mem_type = UINT32_MAX; /* pure VRAM (no map) */
 static uint32_t g_uma_mem_type = UINT32_MAX; /* DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT */
 static int g_is_uma = 0; /* true when the only device-local heap is also host-visible */
@@ -629,6 +630,7 @@ struct ds4_vk_dev_ctx {
     VkPhysicalDeviceProperties       props;
     VkPhysicalDeviceMemoryProperties mem_props;
     uint32_t host_visible_mem_type;
+    uint32_t host_ram_mem_type;
     uint32_t device_local_mem_type;
     uint32_t uma_mem_type;
     int      is_uma;
@@ -717,6 +719,7 @@ static void vulkan_ctx_save(struct ds4_vk_dev_ctx *c) {
     c->props = g_props;
     c->mem_props = g_mem_props;
     c->host_visible_mem_type = g_host_visible_mem_type;
+    c->host_ram_mem_type = g_host_ram_mem_type;
     c->device_local_mem_type = g_device_local_mem_type;
     c->uma_mem_type = g_uma_mem_type;
     c->is_uma = g_is_uma;
@@ -785,6 +788,7 @@ static void vulkan_ctx_load(const struct ds4_vk_dev_ctx *c) {
     g_props = c->props;
     g_mem_props = c->mem_props;
     g_host_visible_mem_type = c->host_visible_mem_type;
+    g_host_ram_mem_type = c->host_ram_mem_type;
     g_device_local_mem_type = c->device_local_mem_type;
     g_uma_mem_type = c->uma_mem_type;
     g_is_uma = c->is_uma;
@@ -1630,6 +1634,7 @@ static int vulkan_pick_device_ex(int forced_override) {
      * slow on the x1 links).  Small-BAR discrete GPUs expose only a tiny
      * DEVICE_LOCAL|HOST_VISIBLE carveout, so require a large heap. */
     g_host_visible_mem_type = UINT32_MAX;
+    g_host_ram_mem_type = UINT32_MAX;
     uint32_t fallback = UINT32_MAX;
     uint32_t vram_host = UINT32_MAX;
     for (uint32_t i = 0; i < g_mem_props.memoryTypeCount; i++) {
@@ -1637,6 +1642,10 @@ static int vulkan_pick_device_ex(int forced_override) {
         if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
         if (fallback == UINT32_MAX) fallback = i;
         const bool coherent = (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        if (coherent && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+            g_host_ram_mem_type == UINT32_MAX) {
+            g_host_ram_mem_type = i;   /* GTT (system RAM) */
+        }
         if (coherent && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             const uint32_t h = g_mem_props.memoryTypes[i].heapIndex;
             if (h < g_mem_props.memoryHeapCount &&
@@ -1651,6 +1660,7 @@ static int vulkan_pick_device_ex(int forced_override) {
         }
     }
     if (vram_host != UINT32_MAX) g_host_visible_mem_type = vram_host;
+    if (g_host_ram_mem_type == UINT32_MAX) g_host_ram_mem_type = fallback;
     if (g_host_visible_mem_type == UINT32_MAX) {
         g_host_visible_mem_type = fallback;
     }
@@ -2709,6 +2719,17 @@ static VkBuffer vulkan_create_host_buffer(
     return vulkan_create_buffer(bytes, mem_type, 1, out_mem, out_map);
 }
 
+/* GTT (system RAM) host-visible buffer: HOST_VISIBLE|HOST_COHERENT but NOT
+ * device-local.  Used for buffers the CPU drives that should NOT consume VRAM
+ * (e.g. an optional RAM-resident KV cache). */
+static VkBuffer vulkan_create_host_ram_buffer(
+        uint64_t bytes, VkDeviceMemory *out_mem,
+        unsigned char **out_map) {
+    const uint32_t mem_type = (g_host_ram_mem_type != UINT32_MAX) ?
+                              g_host_ram_mem_type : 0u;
+    return vulkan_create_buffer(bytes, mem_type, 1, out_mem, out_map);
+}
+
 /* Shared tensor construction from a created buffer. */
 static ds4_gpu_tensor *vulkan_tensor_wrap_buffer(VkBuffer buffer,
                                                  VkDeviceMemory mem,
@@ -2783,6 +2804,19 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     return t;
 }
 
+/* Host-visible GTT (system RAM) tensor.  NOT device-local, so it does not
+ * consume VRAM and is not counted in g_device_local_bytes.  Used for the
+ * optional RAM-resident KV cache (DS4_VULKAN_KV_IN_RAM). */
+static ds4_gpu_tensor *vulkan_tensor_alloc_host_ram(uint64_t bytes) {
+    if (g_device == VK_NULL_HANDLE) return NULL;
+    if (bytes == 0) bytes = 1;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    unsigned char *map = NULL;
+    VkBuffer buffer = vulkan_create_host_ram_buffer(bytes, &mem, &map);
+    if (buffer == VK_NULL_HANDLE) return NULL;
+    return vulkan_tensor_wrap_buffer(buffer, mem, map, bytes);
+}
+
 /* Allocate a host-visible tensor on a specific logical tier and restore the
  * previously active tier.  Used by the engine's multi-tier allocations
  * (SPECS_MGPU.md M4). */
@@ -2792,6 +2826,21 @@ extern "C" ds4_gpu_tensor *ds4_vulkan_tensor_alloc_ptr_on(int tier,
     const int prev = g_vk_ctx_active;
     if (ds4_vulkan_set_current_device(tier) != 0) return NULL;
     ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(bytes);
+    struct ds4_vulkan_tensor *h = t ? vulkan_tensor_handle(t) : NULL;
+    if (h) h->tier = tier;
+    if (t) t->device_id = tier;
+    if (prev >= 0 && prev != tier) ds4_vulkan_set_current_device(prev);
+    return t;
+}
+
+/* GTT (RAM) tensor on a specific logical tier.  Mirrors
+ * ds4_vulkan_tensor_alloc_ptr_on but uses system RAM, not VRAM-BAR. */
+extern "C" ds4_gpu_tensor *ds4_vulkan_tensor_alloc_host_ram_on(int tier,
+                                                               uint64_t bytes) {
+    if (tier < 0 || tier >= g_vk_ctx_count) return NULL;
+    const int prev = g_vk_ctx_active;
+    if (ds4_vulkan_set_current_device(tier) != 0) return NULL;
+    ds4_gpu_tensor *t = vulkan_tensor_alloc_host_ram(bytes);
     struct ds4_vulkan_tensor *h = t ? vulkan_tensor_handle(t) : NULL;
     if (h) h->tier = tier;
     if (t) t->device_id = tier;

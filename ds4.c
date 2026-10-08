@@ -18815,12 +18815,20 @@ static bool metal_graph_kv_cache_in_ram_for_tier(
     const char *vram = getenv("DS4_VULKAN_KV_IN_VRAM");
     if (vram != NULL && vram[0] != '\0' && vram[0] != '0') return false;
     const char *ram = getenv("DS4_VULKAN_KV_IN_RAM");
-    if (ram != NULL && ram[0] != '\0' && ram[0] != '0') return true;
-    if (gpu_cfg && gpu_cfg->n_gpus > 1 && tier >= 0 &&
-        tier < gpu_cfg->n_gpus) {
-        return gpu_cfg->dev_mode[tier] == 1;   /* dynamic tier -> RAM */
+    if (ram != NULL && ram[0] != '\0' && ram[0] != '0') {
+        /* "dynamic" -> only the dynamic (fast-PCIe, expert-pool) tier keeps its
+         * KV in GTT; any other value -> every tier. */
+        if (strcmp(ram, "dynamic") == 0) {
+            return gpu_cfg && gpu_cfg->n_gpus > 1 && tier >= 0 &&
+                   tier < gpu_cfg->n_gpus && gpu_cfg->dev_mode[tier] == 1;
+        }
+        return true;
     }
 #endif
+    /* Default: the KV lives in VRAM on every tier.  It is hammered every token
+     * by the attention kernels, so GTT (PCIe) is the wrong home; the optional
+     * DS4_VULKAN_KV_IN_RAM env keeps it in RAM when a tier needs the VRAM for
+     * its expert pool instead. */
     return false;
 }
 
@@ -18830,11 +18838,19 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor_on(
         int tier,
         uint64_t bytes) {
     (void)managed;
+#if defined(DS4_VULKAN_BUILD)
+    /* in_ram is only ever true on Vulkan (see the function above); the CUDA/
+     * Metal backends keep their KV in VRAM and do not link this symbol. */
     if (metal_graph_kv_cache_in_ram_for_tier(gpu_cfg, tier)) {
-        ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
+        /* GTT (system RAM), not VRAM-BAR: keeps this tier's KV out of VRAM. */
+        ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_host_ram_on(tier, bytes);
         if (t != NULL) return t;
         /* host allocation refused: fall back to VRAM rather than fail. */
     }
+#else
+    (void)gpu_cfg;
+    (void)tier;
+#endif
     return ds4_gpu_tensor_alloc_device_local_on(tier, bytes);
 }
 
