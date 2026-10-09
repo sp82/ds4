@@ -88,8 +88,9 @@ struct ds4_vk_bind {
 };
 
 /* Pipeline table.  Values are append-only (the enum index is the stable pipe
- * id used by telemetry); never reorder.  DS4_VK_PIPE_COUNT must equal the
- * number of rows in the pipes[] table in ds4_vulkan.c. */
+ * id used by telemetry); never reorder.  DS4_VK_PIPE_COUNT is derived from
+ * the DS4_PIPE_COUNT sentinel, so appending an entry never desyncs it from
+ * the pipes[] table in ds4_vulkan.c (which must have one row per enum). */
 enum ds4_vk_pipe {
     DS4_PIPE_ADD = 0,
     DS4_PIPE_ADD3,
@@ -160,6 +161,8 @@ enum ds4_vk_pipe {
     DS4_PIPE_MOE_DOWN_MXFP4,
     DS4_PIPE_MOE_GATE_UP_MID_MXFP4_V2,
     DS4_PIPE_MOE_DOWN_MXFP4_V2,
+    DS4_PIPE_MOE_GATE_UP_MID_MXFP4_V3,
+    DS4_PIPE_MOE_DOWN_MXFP4_V3,
     DS4_PIPE_MOE_GROUP,
     DS4_PIPE_MATMUL_Q4K,
     DS4_PIPE_MATMUL_Q4_0,
@@ -197,8 +200,9 @@ enum ds4_vk_pipe {
     DS4_PIPE_QWEN4_ARGMAX,
     DS4_PIPE_QWEN4_MTP_STAGE,
     DS4_PIPE_QWEN4_MTP_COMBINE,
+    DS4_PIPE_COUNT
 };
-#define DS4_VK_PIPE_COUNT 105
+#define DS4_VK_PIPE_COUNT ((int)DS4_PIPE_COUNT)
 
 /* Active pipeline table (swapped per logical device tier by the context
  * save/load path). */

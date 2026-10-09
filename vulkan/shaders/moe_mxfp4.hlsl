@@ -326,3 +326,115 @@ void moe_down_mxfp4_v2(uint3 gid_grp : SV_GroupID,
         }
     }
 }
+
+/* v3: subgroup reduction (llama.cpp-style).  Every subgroup of the 256-thread
+ * block owns whole rows (row rr is handled by subgroup rr % nsg), each lane
+ * dots full 32-value MXFP4 blocks with a lane-strided block index, and the
+ * row total is one WaveActiveSum -- no LDS, no barriers.  The control flow
+ * around the wave ops is uniform per subgroup (same sg => same rr sequence)
+ * and the early returns are uniform per workgroup, so every lane of each
+ * subgroup is active at the reduction.  Requires Vulkan 1.1 subgroup
+ * arithmetic; the host selects v3 only when the device reports it and falls
+ * back to v2 otherwise. */
+[numthreads(256, 1, 1)]
+void moe_gate_up_mid_mxfp4_v3(uint3 gid_grp : SV_GroupID,
+                              uint tid : SV_GroupThreadID) {
+    uint mid_dim = params.out_dim;
+    uint n_expert = params.index;
+    uint n_tokens = params.rows;
+    uint blocks = params.blocks;
+    uint expert_bytes = params.aux;
+    uint row_bytes = params.ratio;
+    uint pair = gid_grp.y;
+    if (pair >= n_tokens * n_expert) return;
+    uint apair = ((params.flags & 2u) != 0u) ? order_buf[pair] : pair;
+    uint tok = apair / n_expert;
+    uint slot = apair - tok * n_expert;
+    int sel = selected_buf[apair];
+    if (sel < 0) sel = 0;
+    uint expert;
+    if ((params.flags & 1u) != 0u) {
+        int ts = tbl_buf[sel];
+        if (ts < 0) ts = 0;
+        expert = (uint)ts;
+    } else {
+        expert = (uint)sel;
+    }
+    uint R = params.rsvd2;
+    if (R == 0u) R = 1u;
+    const uint wsize = WaveGetLaneCount();
+    const uint nsg = max(1u, 256u / wsize);
+    const uint sg = tid / wsize;
+    const uint lane = tid - sg * wsize;
+    for (uint rr = sg; rr < R; rr += nsg) {
+        uint row = gid_grp.x * R + rr;
+        float gacc = 0.0f;
+        float uacc = 0.0f;
+        if (row < mid_dim) {
+            uint gbase = expert * expert_bytes + row * row_bytes;
+            for (uint bb = lane; bb < blocks; bb += wsize) {
+                uint xb = tok * params.in_dim + bb * 32u;
+                gacc += mxfp4_block_dot(w_buf, gbase + bb * 17u, a_buf, xb);
+                uacc += mxfp4_block_dot(up_w_buf, gbase + bb * 17u, a_buf, xb);
+            }
+        }
+        gacc = WaveActiveSum(gacc);
+        uacc = WaveActiveSum(uacc);
+        if (WaveIsFirstLane()) {
+            if (params.clamp > 1.0e-6f) {
+                gacc = min(gacc, params.clamp);
+                uacc = min(max(uacc, -params.clamp), params.clamp);
+            }
+            uint off = apair * mid_dim + row;
+            out2_buf[off] = gacc;
+            out3_buf[off] = uacc;
+            out4_buf[off] = (gacc / (1.0f + exp(-gacc))) * uacc *
+                            weights_buf[apair];
+        }
+    }
+}
+
+[numthreads(256, 1, 1)]
+void moe_down_mxfp4_v3(uint3 gid_grp : SV_GroupID,
+                       uint tid : SV_GroupThreadID) {
+    uint out_dim = params.out_dim;
+    uint n_expert = params.index;
+    uint n_tokens = params.rows;
+    uint blocks = params.blocks;
+    uint expert_bytes = params.aux;
+    uint row_bytes = params.ratio;
+    uint pair = gid_grp.y;
+    if (pair >= n_tokens * n_expert) return;
+    uint apair = ((params.flags & 2u) != 0u) ? order_buf[pair] : pair;
+    int sel = selected_buf[apair];
+    if (sel < 0) sel = 0;
+    uint expert;
+    if ((params.flags & 1u) != 0u) {
+        int ts = tbl_buf[sel];
+        if (ts < 0) ts = 0;
+        expert = (uint)ts;
+    } else {
+        expert = (uint)sel;
+    }
+    uint R = params.rsvd2;
+    if (R == 0u) R = 1u;
+    const uint wsize = WaveGetLaneCount();
+    const uint nsg = max(1u, 256u / wsize);
+    const uint sg = tid / wsize;
+    const uint lane = tid - sg * wsize;
+    for (uint rr = sg; rr < R; rr += nsg) {
+        uint row = gid_grp.x * R + rr;
+        float acc = 0.0f;
+        if (row < out_dim) {
+            uint bbase = expert * expert_bytes + row * row_bytes;
+            for (uint bb = lane; bb < blocks; bb += wsize) {
+                uint xb = apair * params.in_dim + bb * 32u;
+                acc += mxfp4_block_dot(w_buf, bbase + bb * 17u, a_buf, xb);
+            }
+        }
+        acc = WaveActiveSum(acc);
+        if (WaveIsFirstLane()) {
+            out4_buf[apair * out_dim + row] = acc;
+        }
+    }
+}

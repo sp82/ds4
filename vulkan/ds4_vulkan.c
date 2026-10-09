@@ -114,6 +114,7 @@ static VkFence           g_worker_fence = VK_NULL_HANDLE;
 static int               g_worker_fence_pending = 0;
 /* VK_KHR_shader_integer_dot_product available (hardware packed int8 dot). */
 static int               g_has_int_dot = 0;
+static int               g_has_subgroup_arith = 0;
 /* VK_EXT_descriptor_indexing available (VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
  * on every descriptor-set binding is only legal with this extension enabled). */
 static int               g_has_desc_indexing = 0;
@@ -1822,6 +1823,23 @@ static VkResult vulkan_create_device(void) {
             }
         }
     }
+    /* Subgroup arithmetic (Vulkan 1.1 core): gates the MoE v3 kernels,
+     * whose reduction is WaveActiveSum-based.  A 1.0-only driver leaves the
+     * pNext chain untouched, so the fields stay zero and the gate is off. */
+    {
+        VkPhysicalDeviceProperties2 p2 = {};
+        VkPhysicalDeviceVulkan11Properties v11 = {};
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        v11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES;
+        p2.pNext = &v11;
+        vkGetPhysicalDeviceProperties2(g_phys, &p2);
+        if ((v11.subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+            (v11.subgroupSupportedOperations &
+             VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
+            v11.subgroupSize >= 1u) {
+            g_has_subgroup_arith = 1;
+        }
+    }
     int have_bda = 0;
     for (uint32_t i = 0; i < n_dev_exts; i++) {
         if (dev_exts[i] == bda_ext) have_bda = 1;
@@ -2188,6 +2206,11 @@ static int vulkan_compute_init(void) {
           "moe_gate_up_mid_mxfp4_v2" },
         { ds4_spv_moe_down_mxfp4_v2, ds4_spv_moe_down_mxfp4_v2_len,
           "moe_down_mxfp4_v2" },
+        { ds4_spv_moe_gate_up_mid_mxfp4_v3,
+          ds4_spv_moe_gate_up_mid_mxfp4_v3_len,
+          "moe_gate_up_mid_mxfp4_v3" },
+        { ds4_spv_moe_down_mxfp4_v3, ds4_spv_moe_down_mxfp4_v3_len,
+          "moe_down_mxfp4_v3" },
         { ds4_spv_moe_group, ds4_spv_moe_group_len, "moe_group" },
         { ds4_spv_matmul_q4k, ds4_spv_matmul_q4k_len, "matmul_q4k" },
         { ds4_spv_matmul_q4_0, ds4_spv_matmul_q4_0_len, "matmul_q4_0" },
@@ -5705,12 +5728,27 @@ static VkPipeline vulkan_pipe_moe_mxfp4_gate(void) {
     if (vulkan_force_variant("MOE_MXFP4", "0")) {
         return g_pipes[DS4_PIPE_MOE_GATE_UP_MID_MXFP4];
     }
+    if (vulkan_force_variant("MOE_MXFP4", "1")) {
+        return g_pipes[DS4_PIPE_MOE_GATE_UP_MID_MXFP4_V2];
+    }
+    if (vulkan_force_variant("MOE_MXFP4", "2")) {
+        return g_pipes[DS4_PIPE_MOE_GATE_UP_MID_MXFP4_V3];
+    }
+    /* v3 (subgroup reduce) measured 2.3x slower than v2 at the autotune
+     * shape on RDNA2 (9.4 vs 4.2 ms @16 tok): the wave reduce latency is
+     * not hidden at these workgroup counts.  Keep v2 the default. */
     return g_pipes[DS4_PIPE_MOE_GATE_UP_MID_MXFP4_V2];
 }
 
 static VkPipeline vulkan_pipe_moe_mxfp4_down(void) {
     if (vulkan_force_variant("MOE_MXFP4", "0")) {
         return g_pipes[DS4_PIPE_MOE_DOWN_MXFP4];
+    }
+    if (vulkan_force_variant("MOE_MXFP4", "1")) {
+        return g_pipes[DS4_PIPE_MOE_DOWN_MXFP4_V2];
+    }
+    if (vulkan_force_variant("MOE_MXFP4", "2")) {
+        return g_pipes[DS4_PIPE_MOE_DOWN_MXFP4_V3];
     }
     return g_pipes[DS4_PIPE_MOE_DOWN_MXFP4_V2];
 }

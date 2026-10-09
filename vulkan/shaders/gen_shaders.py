@@ -107,6 +107,9 @@ SHADERS = [
     ("moe_gate_up_mid_mxfp4_v2", "moe_mxfp4.hlsl",
      "moe_gate_up_mid_mxfp4_v2"),
     ("moe_down_mxfp4_v2", "moe_mxfp4.hlsl", "moe_down_mxfp4_v2"),
+    ("moe_gate_up_mid_mxfp4_v3", "moe_mxfp4.hlsl",
+     "moe_gate_up_mid_mxfp4_v3"),
+    ("moe_down_mxfp4_v3", "moe_mxfp4.hlsl", "moe_down_mxfp4_v3"),
     ("moe_group", "moe_group.hlsl", "moe_group"),
     ("matmul_q4k", "matmul_quant.hlsl", "matmul_q4k"),
     ("matmul_q4_0", "matmul_quant.hlsl", "matmul_q4_0"),
@@ -147,7 +150,7 @@ SHADERS = [
 # ds4_vulkan.c: SRVs at set 0 bindings 0..3, UAVs at 4..7, cbuffer at 8.
 DXC_FLAGS = [
     "-spirv",
-    "-fspv-target-env=vulkan1.0",
+    "-fspv-target-env=vulkan1.3",
     "-fvk-t-shift", "0", "0",
     "-fvk-u-shift", "4", "0",
     "-fvk-b-shift", "8", "0",
