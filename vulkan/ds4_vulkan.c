@@ -28,6 +28,9 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -1647,6 +1650,11 @@ static int vulkan_pick_device_ex(int forced_override) {
             g_host_ram_mem_type == UINT32_MAX) {
             g_host_ram_mem_type = i;   /* GTT (system RAM) */
         }
+        /* NOTE: do NOT prefer HOST_CACHED here.  The DMA readback into
+         * cached GTT runs at ~20 MB/s (measured: 750 ms per 15 MB) while the
+         * write-combined type accepts the DMA at link rate; the slow CPU
+         * side of WC memory is handled with non-temporal loads in the
+         * staging copy (vulkan_nt_copy_from_staging). */
         if (coherent && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             const uint32_t h = g_mem_props.memoryTypes[i].heapIndex;
             if (h < g_mem_props.memoryHeapCount &&
@@ -1670,13 +1678,14 @@ static int vulkan_pick_device_ex(int forced_override) {
             const VkMemoryPropertyFlags f = g_mem_props.memoryTypes[i].propertyFlags;
             const uint32_t h = g_mem_props.memoryTypes[i].heapIndex;
             fprintf(stderr,
-                    "ds4: memtype[%u] flags=0x%x (D=%d HV=%d HC=%d) heap=%u size=%.2f GiB%s\n",
+                    "ds4: memtype[%u] flags=0x%x (D=%d HV=%d HC=%d) heap=%u size=%.2f GiB%s%s\n",
                     i, (unsigned)f,
                     (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? 1 : 0,
                     (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? 1 : 0,
                     (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? 1 : 0,
                     h, (double)g_mem_props.memoryHeaps[h].size / 1073741824.0,
-                    i == g_host_visible_mem_type ? "  <= activations" : "");
+                    i == g_host_visible_mem_type ? "  <= activations" : "",
+                    i == g_host_ram_mem_type ? "  <= host_ram staging" : "");
         }
     }
 
@@ -3144,14 +3153,178 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
     return ok;
 }
 
+/* CPU copy out of a write-combined staging mapping.  Plain memcpy reads WC
+ * memory uncached at ~150 MB/s; non-temporal (streaming) loads fetch whole
+ * cache lines without cache pollution and reach several GB/s. */
+static void vulkan_nt_copy_from_staging(void *dst, const void *src,
+                                        uint64_t bytes) {
+#if defined(__AVX2__)
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned char *d = (unsigned char *)dst;
+    uint64_t i = 0;
+    const uint64_t n32 = bytes & ~(uint64_t)31u;
+    for (; i < n32; i += 32u) {
+        const __m256i v = _mm256_stream_load_si256(
+            (const __m256i *)(const void *)(s + i));
+        _mm256_storeu_si256((__m256i *)(void *)(d + i), v);
+    }
+    if (i < bytes) memcpy(d + i, s + i, (size_t)(bytes - i));
+#else
+    memcpy(dst, src, (size_t)bytes);
+#endif
+}
+
+/* One-shot DMA readback of a device-local tensor, bypassing a BAR memmove
+ * (which reads device-local memory through the PCIe link at a fraction of
+ * the DMA rate).  Mirrors vulkan_download_from_tensor's staging path but is
+ * used even when the tensor is BAR-mapped. */
+static int vulkan_download_dma_from_tensor(const ds4_gpu_tensor *t,
+                                           uint64_t offset, void *data,
+                                           uint64_t bytes) {
+    struct ds4_vulkan_tensor *h = vulkan_tensor_handle(t);
+    if (!h || !data || bytes == 0) return 0;
+    if (offset > h->bytes || bytes > h->bytes - offset) return 0;
+    const int prof = getenv("DS4_QWEN4_PLE_PROF") != NULL;
+    const double t0 = prof ? vulkan_now_ms() : 0.0;
+    vulkan_check_tensor_device("download-dma", h);
+    if (g_commands_active) return 0;
+    if (!vulkan_compute_init()) return 0;
+    /* GTT (cached system RAM) staging: ds4_gpu_tensor_alloc prefers the
+     * device BAR, and CPU reads of uncached BAR memory run at ~2-10 MB/s. */
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
+    if (!st) return 0;
+    struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
+    if (!sh || !sh->host_map) {
+        ds4_gpu_tensor_free(st);
+        return 0;
+    }
+    const double t1 = prof ? vulkan_now_ms() : 0.0;
+    VkCommandBuffer cb = vulkan_dispatch_begin();
+    if (!cb) {
+        ds4_gpu_tensor_free(st);
+        return 0;
+    }
+    VkBufferCopy region = { h->offset + offset, sh->offset, bytes };
+    vkCmdCopyBuffer(cb, h->buffer, sh->buffer, 1, &region);
+    const double t2 = prof ? vulkan_now_ms() : 0.0;
+    if (!vulkan_submit_one_shot()) {
+        ds4_gpu_tensor_free(st);
+        return 0;
+    }
+    const double t3 = prof ? vulkan_now_ms() : 0.0;
+    if (prof) {
+        fprintf(stderr,
+                "ds4: down-dma submit split: record %.1f + submit/wait %.1f\n",
+                t2 - t1, t3 - t2);
+    }
+    vulkan_nt_copy_from_staging(data, sh->host_map, bytes);
+    ds4_gpu_tensor_free(st);
+    if (prof)
+        fprintf(stderr,
+                "ds4: down-dma: alloc %.1f + memcpy %.1f ms\n",
+                t1 - t0, vulkan_now_ms() - t3);
+    return 1;
+}
+
+/* One-shot DMA upload into a device-local tensor (the mirror of the
+ * download helper; used by the cross-tier handover bounce). */
+static int vulkan_upload_dma_to_tensor(ds4_gpu_tensor *t, uint64_t offset,
+                                       const void *data, uint64_t bytes) {
+    struct ds4_vulkan_tensor *h = vulkan_tensor_handle(t);
+    if (!h || !data || bytes == 0) return 0;
+    if (offset > h->bytes || bytes > h->bytes - offset) return 0;
+    vulkan_check_tensor_device("upload-dma", h);
+    if (g_commands_active) return 0;
+    if (!vulkan_compute_init()) return 0;
+    /* GTT staging, see the download helper. */
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
+    if (!st) return 0;
+    struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
+    if (!sh || !sh->host_map) {
+        ds4_gpu_tensor_free(st);
+        return 0;
+    }
+    memcpy(sh->host_map, data, bytes);
+    VkCommandBuffer cb = vulkan_dispatch_begin();
+    if (!cb) {
+        ds4_gpu_tensor_free(st);
+        return 0;
+    }
+    VkBufferCopy region = { sh->offset, h->offset + offset, bytes };
+    vkCmdCopyBuffer(cb, sh->buffer, h->buffer, 1, &region);
+    VkMemoryBarrier mb = {};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                         1, &mb, 0, NULL, 0, NULL);
+    if (!vulkan_submit_one_shot()) {
+        ds4_gpu_tensor_free(st);
+        return 0;
+    }
+    ds4_gpu_tensor_free(st);
+    return 1;
+}
+
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                         const ds4_gpu_tensor *src, uint64_t src_offset,
                         uint64_t bytes) {
     struct ds4_vulkan_tensor *dh = vulkan_tensor_handle(dst);
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(src);
+    const int copy_prof = getenv("DS4_QWEN4_PLE_PROF") != NULL;
+    if (copy_prof && dh && sh && dh->tier != sh->tier)
+        fprintf(stderr,
+                "ds4: copy_xdev %llu B: dst(local=%d map=%d tier=%d) "
+                "src(local=%d map=%d tier=%d) active=%d\n",
+                (unsigned long long)bytes, dh->device_local,
+                dh->host_map != NULL, dh->tier, sh->device_local,
+                sh->host_map != NULL, sh->tier, g_commands_active);
     if (!dh || !sh || dst_offset + bytes > dh->bytes ||
         src_offset + bytes > sh->bytes) return 0;
     if (bytes == 0) return 1;
+
+    /* Cross-tier device-local bounce: a BAR-to-BAR memmove reads the source
+     * through the PCIe link (x1: ~1.6 MB/s -- the 2.7 MB per-tier residual
+     * handover cost 1.75 s and the 40 kB decode handover ~25 ms each).
+     * Bounce with one-shot DMA staging instead: one readback submit on the
+     * source device, one upload submit on the destination device.  Ordering
+     * matches the memmove path: the caller drains the queue first (the
+     * open-scope case ends it here), the one-shot completions fence both
+     * sides, and the upload carries the transfer->shader barrier. */
+    if (g_vk_ctx_count > 1 && dh->tier != sh->tier &&
+        sh->device_local && dh->device_local &&
+        bytes <= (64ull << 20)) {
+        const int copy_prof2 = getenv("DS4_QWEN4_PLE_PROF") != NULL;
+        const double tb0 = copy_prof2 ? vulkan_now_ms() : 0.0;
+        if (g_commands_active && !ds4_gpu_end_commands()) return 0;
+        const int prev_dev = g_vk_ctx_active;
+        void *tmp = malloc((size_t)bytes);
+        if (!tmp) return 0;
+        int bounce = 1;
+        if (sh->tier >= 0 && sh->tier < g_vk_ctx_count &&
+            sh->tier != g_vk_ctx_active)
+            (void)ds4_vulkan_set_current_device(sh->tier);
+        const double tb1 = copy_prof2 ? vulkan_now_ms() : 0.0;
+        bounce = vulkan_download_dma_from_tensor(src, src_offset, tmp, bytes);
+        const double tb2 = copy_prof2 ? vulkan_now_ms() : 0.0;
+        if (dh->tier >= 0 && dh->tier < g_vk_ctx_count &&
+            dh->tier != g_vk_ctx_active)
+            (void)ds4_vulkan_set_current_device(dh->tier);
+        if (bounce)
+            bounce = vulkan_upload_dma_to_tensor(dst, dst_offset, tmp, bytes);
+        const double tb3 = copy_prof2 ? vulkan_now_ms() : 0.0;
+        free(tmp);
+        if (prev_dev >= 0 && prev_dev != g_vk_ctx_active)
+            (void)ds4_vulkan_set_current_device(prev_dev);
+        if (copy_prof2)
+            fprintf(stderr,
+                    "ds4: bounce: set %.1f + down %.1f + up %.1f ms "
+                    "(%llu B)\n",
+                    tb1 - tb0, tb2 - tb1, tb3 - tb2,
+                    (unsigned long long)bytes);
+        return bounce;
+    }
 
     /* GPU copy path: only inside an open command scope and only when the
      * regions do not overlap (vkCmdCopyBuffer semantics require disjoint).
@@ -3366,7 +3539,12 @@ static VkCommandBuffer vulkan_cb_acquire(int switch_ok) {
     }
     if (g_cmd_fence[g_cmd_i] != VK_NULL_HANDLE) {
         const VkFence f = g_cmd_fence[g_cmd_i];
+        const int prof = getenv("DS4_QWEN4_PLE_PROF") != NULL;
+        const double tf0 = prof ? vulkan_now_ms() : 0.0;
         vkWaitForFences(g_device, 1, &f, VK_TRUE, UINT64_MAX);
+        if (prof)
+            fprintf(stderr, "ds4: cb_acquire fence wait: %.1f ms\n",
+                    vulkan_now_ms() - tf0);
         /* Clear the in-flight marker; the CB's own persistent fence stays in
          * g_cb_fence[] and is reset+reused by the next vulkan_cb_submit (the
          * readback fence is a global owned by the signal). */
@@ -3376,7 +3554,12 @@ static VkCommandBuffer vulkan_cb_acquire(int switch_ok) {
      * the pool (all in-flight sets are reclaimable) before it can exhaust
      * during long read-free passes (decode-style prefill). */
     if (g_desc_sets_allocated >= DS4_VK_DESC_SET_HWM) {
+        const int prof = getenv("DS4_QWEN4_PLE_PROF") != NULL;
+        const double tp0 = prof ? vulkan_now_ms() : 0.0;
         vulkan_device_wait();
+        if (prof)
+            fprintf(stderr, "ds4: cb_acquire pool drain (sets=%u): %.1f ms\n",
+                    g_desc_sets_allocated, vulkan_now_ms() - tp0);
     }
     VkCommandBufferBeginInfo bi = {};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;

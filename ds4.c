@@ -58991,11 +58991,17 @@ static bool qwen4_switch_layer_tier(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_
     const int tier = qwen4_layer_tier(g, il);
     if (tier == g->active_tier) return true;
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
+    const bool prof = getenv("DS4_QWEN4_PLE_PROF") != NULL;
+    double tp = prof ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) return false;
+    if (prof) { fprintf(stderr, "ds4: switch[%u] end_commands: %.1f ms\n", il, (now_sec()-tp)*1000.0); tp = now_sec(); }
     ds4_gpu_tensor *dst = g->tier_scratch[tier].R;
     if (!ds4_gpu_tensor_copy_xdev(dst, g->R, (uint64_t)T * hc_dim * sizeof(float))) return false;
+    if (prof) { fprintf(stderr, "ds4: switch[%u] copy_xdev (%u kB): %.1f ms\n", il, (unsigned)(T*hc_dim*4/1024), (now_sec()-tp)*1000.0); tp = now_sec(); }
     if (ds4_gpu_set_current_device(tier) != 0) return false;
+    if (prof) { fprintf(stderr, "ds4: switch[%u] set_device: %.1f ms\n", il, (now_sec()-tp)*1000.0); tp = now_sec(); }
     qwen4_alias_tier(g, tier);
+    if (prof) fprintf(stderr, "ds4: switch[%u] alias: %.1f ms\n", il, (now_sec()-tp)*1000.0);
     return ds4_gpu_begin_commands() != 0;
 }
 
@@ -60040,7 +60046,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             qwen4_alias_tier(g, t0i);
         }
     }
+    const bool ple_prof = getenv("DS4_QWEN4_PLE_PROF") != NULL;
+    const double tsi0 = ple_prof ? now_sec() : 0.0;
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    if (ple_prof)
+        fprintf(stderr, "ds4: stage_inputs: %.1f ms\n",
+                (now_sec() - tsi0) * 1000.0);
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
@@ -60080,7 +60091,11 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (prof_on) { \
             ds4_gpu_end_commands(); \
             const double now_ = now_sec(); \
-            prof[idx_] += now_ - prof_last; \
+            const double d_ = now_ - prof_last; \
+            prof[idx_] += d_; \
+            if (d_ > 0.010 && ple_prof) \
+                fprintf(stderr, "ds4: prof stage=%u layer=%u interval: %.1f ms\n", \
+                        idx_, il, d_ * 1000.0); \
             prof_last = now_; \
             glm_graph_begin_commands_if_needed(); \
         } \
@@ -60089,6 +60104,11 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         const ds4_layer_weights *l = &w->layer[il];
         /* Layer-parallel multi-GPU: move to the device owning this layer,
          * handing the residual stream over at the boundary. */
+        const double tsw0 = ple_prof ? now_sec() : 0.0;
+        if (!qwen4_switch_layer_tier(g, il, T)) { ok = false; break; }
+        if (ple_prof && now_sec() - tsw0 > 0.001)
+            fprintf(stderr, "ds4: switch layer=%u: %.1f ms\n", il,
+                    (now_sec() - tsw0) * 1000.0);
         if (!qwen4_switch_layer_tier(g, il, T)) { ok = false; break; }
         /* Static decode map: the per-layer scopes would otherwise overlap
          * across submissions and RADV does not order shader writes against
@@ -60115,16 +60135,32 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             g_qwen4_static_decode_mapped = false;
         }
         if (ds4_qwen4_layer_is_ple(il)) {
-            ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
-                 qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
-                 ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
+            double tp = ple_prof ? now_sec() : 0.0;
+            ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T);
+            if (ple_prof)
+                fprintf(stderr, "ds4: ple gemv_key: %.1f ms\n",
+                        (now_sec() - tp) * 1000.0);
+            tp = now_sec();
+            ok = ok && qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T);
+            if (ple_prof)
+                fprintf(stderr, "ds4: ple gemv_val: %.1f ms\n",
+                        (now_sec() - tp) * 1000.0);
+            tp = now_sec();
+            ok = ok && ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key, g->ple_val,
                                                m->map, m->size, l->ple_norm_key->abs_offset,
                                                l->ple_norm_query->abs_offset, l->ple_norm_conv->abs_offset,
-                                               T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS) &&
-                 ds4_gpu_qwen4_ple_conv_tensor(g->R, g->ple_gated, g->ple_normed, g->ple_hist, m->map, m->size,
+                                               T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS);
+            if (ple_prof)
+                fprintf(stderr, "ds4: ple gate: %.1f ms\n",
+                        (now_sec() - tp) * 1000.0);
+            tp = now_sec();
+            ok = ok && ds4_gpu_qwen4_ple_conv_tensor(g->R, g->ple_gated, g->ple_normed, g->ple_hist, m->map, m->size,
                                                l->ple_conv->abs_offset, l->ple_conv->type, T, hc_dim, DS4_N_PLE_CONV,
                                                DS4_N_PLE_NGRAM, g->snap_after_first ? g->snap_ple_hist : NULL, 0u,
                                                g->snap_after_second ? g->snap2_ple_hist : NULL, 1u);
+            if (ple_prof)
+                fprintf(stderr, "ds4: ple conv: %.1f ms\n",
+                        (now_sec() - tp) * 1000.0);
         }
         QWEN4_PROF(0);
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
