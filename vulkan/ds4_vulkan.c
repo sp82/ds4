@@ -117,6 +117,7 @@ static VkFence           g_worker_fence = VK_NULL_HANDLE;
 static int               g_worker_fence_pending = 0;
 /* VK_KHR_shader_integer_dot_product available (hardware packed int8 dot). */
 static int               g_has_int_dot = 0;
+static int               g_vulkan_zero_all = 0;
 static int               g_has_subgroup_arith = 0;
 /* VK_EXT_descriptor_indexing available (VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
  * on every descriptor-set binding is only legal with this extension enabled). */
@@ -1794,6 +1795,7 @@ static VkResult vulkan_create_device(void) {
     VkPhysicalDeviceBufferDeviceAddressFeatures bda_feat = {};
     VkPhysicalDeviceFeatures dev_feats = {};
     vkGetPhysicalDeviceFeatures(g_phys, &dev_feats);
+    g_vulkan_zero_all = getenv("DS4_VULKAN_ZERO_ALL") != NULL;
     if (getenv("DS4_VULKAN_DEBUG_ROBUST") != NULL) {
         /* Clamp out-of-bounds shader accesses instead of faulting: a
          * diagnostic to confirm an OOB write and to let the decode proceed. */
@@ -2786,9 +2788,19 @@ static ds4_gpu_tensor *vulkan_tensor_wrap_buffer(VkBuffer buffer,
     h->bytes = bytes;
     h->owner = 1;
     h->host_map = map;
-    /* Debug: zero host-visible allocations so any read of uninitialized memory
-     * (a multi-GPU-only nondeterminism suspect) becomes deterministic. */
+    /* Debug: zero allocations so any read of uninitialized memory (a
+     * multi-GPU-only nondeterminism suspect) becomes deterministic.
+     * DS4_VULKAN_ZERO_ALLOC covers host-visible mappings; DS4_VULKAN_ZERO_ALL
+     * additionally clears device-local buffers via a one-shot fill, which is
+     * what exposed the per-boot first-run-vs-later nondeterminism. */
     if (map && getenv("DS4_VULKAN_ZERO_ALLOC") != NULL) memset(map, 0, bytes);
+    if (!map && g_vulkan_zero_all && g_device != VK_NULL_HANDLE) {
+        VkCommandBuffer cb = vulkan_dispatch_begin();
+        if (cb != VK_NULL_HANDLE) {
+            vkCmdFillBuffer(cb, buffer, 0, VK_WHOLE_SIZE, 0);
+            (void)vulkan_submit_one_shot();
+        }
+    }
 
     ds4_gpu_tensor *t = vulkan_tensor_new();
     if (!t) {
