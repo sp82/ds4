@@ -60228,6 +60228,13 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
          * end_commands below waits for both batches before inputs are reused. */
         if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
     }
+    /* NOTE: a chunk-end end+synchronize+begin here looked like the missing
+     * prefill->decode ordering point, but it REGRESSES the working cases
+     * (T=84/200 degenerate with it): the synchronize's descriptor-pool reset
+     * invalidates sets the following submissions still reference.  The
+     * per-layer submission boundary is the only proven fix.  Multi-chunk
+     * prompts (>512 tokens) remain under investigation; use
+     * DS4_QWEN4_PREFILL_CHUNK >= prompt tokens for one-chunk correctness. */
     if (prof_on) {
         fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (pos=%u T=%u ok=%d): "
                 "ple %.1f hc_attn %.1f gdn %.1f attn %.1f hc_ffn %.1f moe %.1f\n",
