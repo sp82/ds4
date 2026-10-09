@@ -60118,7 +60118,16 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
          * finished.  Drain the previous layer before recording the next one
          * (the per-layer streaming path gets the same drain for free from
          * vulkan_set_span_windows -> vulkan_destroy_model_wrapper). */
-        if (g_qwen4_static_decode_mapped && T <= 8u) {
+        if ((g_qwen4_static_decode_mapped && T <= 8u) ||
+            getenv("DS4_QWEN4_NO_DRAIN") == NULL) {
+            /* RADV does not order shader writes of one submission against
+             * the next submission's reads (see the T<=8 note): drain every
+             * layer boundary on the prefill path too.  Without this the
+             * multi-GPU prefill ran unordered and generated degenerate
+             * output (visible with any prompt >= ~200 tokens); the drain is
+             * the serialization the earlier slow kernels provided by
+             * accident.  DS4_QWEN4_NO_DRAIN restores the old unordered
+             * submission for perf experiments only. */
             if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
                 !ds4_gpu_begin_commands()) { ok = false; break; }
         }
