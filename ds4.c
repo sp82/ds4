@@ -60128,8 +60128,20 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
              * the serialization the earlier slow kernels provided by
              * accident.  DS4_QWEN4_NO_DRAIN restores the old unordered
              * submission for perf experiments only. */
-            if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize() ||
-                !ds4_gpu_begin_commands()) { ok = false; break; }
+            /* A per-layer submission boundary restores correct ordering
+             * (the queue serializes the submissions); the full host
+             * synchronize is NOT needed and costs the encode/execute
+             * pipelining (113 vs 170 t/s at T=365).  DS4_QWEN4_DRAIN_SYNC
+             * adds the host sync back for debugging only. */
+            if (!ds4_gpu_end_commands() || !ds4_gpu_begin_commands()) {
+                ok = false;
+                break;
+            }
+            if (getenv("DS4_QWEN4_DRAIN_SYNC") != NULL &&
+                !ds4_gpu_synchronize()) {
+                ok = false;
+                break;
+            }
         }
         if (qwen_stage_layer) {
             /* Stage this layer's model spans.  Prefill keeps the full layer
