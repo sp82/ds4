@@ -45,6 +45,7 @@ SHADERS = [
     ("top1", "top1.hlsl", "matmul_q8_0_top1"),
     ("f32_to_f16", "f16_conv.hlsl", "f32_to_f16"),
     ("matmul_f16", "matmul_f16.hlsl", "matmul_f16"),
+    ("matmul_f16_mr", "matmul_f16.hlsl", "matmul_f16_mr"),
     ("matmul_f16_pair_compressor_store", "matmul_f16_comp.hlsl",
      "matmul_f16_pair_compressor_store"),
     ("matmul_f32", "matmul_f32.hlsl", "matmul_f32"),

@@ -2272,6 +2272,8 @@ static int vulkan_compute_init(void) {
         { ds4_spv_qwen4_mtp_stage, ds4_spv_qwen4_mtp_stage_len, "mtp_stage" },
         { ds4_spv_qwen4_mtp_combine, ds4_spv_qwen4_mtp_combine_len,
           "mtp_combine" },
+        { ds4_spv_matmul_f16_mr, ds4_spv_matmul_f16_mr_len,
+          "matmul_f16_mr" },
     };
     for (uint32_t i = 0; i < DS4_VK_PIPE_COUNT; i++) {
         snprintf(g_pipe_names[i], sizeof(g_pipe_names[i]), "%s",
@@ -2295,7 +2297,11 @@ static int vulkan_compute_init(void) {
             continue;
         }
         g_mods[i] = vulkan_create_shader_module(pipes[i].code, pipes[i].len);
-        if (!g_mods[i]) return 0;
+        if (!g_mods[i]) {
+            fprintf(stderr, "ds4: shader module %u (%s) failed\n", i,
+                    pipes[i].entry);
+            return 0;
+        }
         g_pipes[i] = vulkan_create_compute_pipeline(g_mods[i], g_pipe_layout,
                                                     pipes[i].entry);
         if (!g_pipes[i]) return 0;

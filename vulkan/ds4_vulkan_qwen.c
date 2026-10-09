@@ -113,7 +113,7 @@ static VkPipeline qwen4_dense_pipe(uint32_t type, uint32_t in_dim,
         return g_pipes[DS4_PIPE_MATMUL_F32];
     case 1u:
         *blocks = (in_dim + 31u) / 32u;
-        return g_pipes[DS4_PIPE_MATMUL_F16];
+        return g_pipes[DS4_PIPE_MATMUL_F16_MR];
     case 30u:
         *blocks = (in_dim + 31u) / 32u;
         return g_pipes[DS4_PIPE_MATMUL_BF16];
@@ -159,7 +159,7 @@ static int qwen4_dense_bind(ds4_gpu_tensor *out, struct ds4_vk_bind wbind,
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out);
     /* matmul_q8_0_f32 tiles Q8F32_NR output rows per workgroup. */
     uint32_t gx = out_rows;
-    if (type == 8u) gx = (out_rows + 3u) / 4u;
+    if (type == 8u || type == 1u) gx = (out_rows + 3u) / 4u;
     return vulkan_dispatch(pipe, &p, sizeof(p), binds, nb, gx, n_tokens,
                            1u);
 }
