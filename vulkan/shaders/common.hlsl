@@ -253,12 +253,35 @@ float e8m0_to_f32(uint e) {
 
 /* Dot of one 32-value MXFP4 block at byte offset bbase against
  * x[xb..xb+31]. */
+/* Four consecutive bytes starting at byte offset `off` (any alignment):
+ * one load when aligned, two overlapping words otherwise.  Word reads cut the
+ * MXFP4 dot cost roughly in half on RDNA2 (byte-wise q8_byte_at costs one
+ * Load per byte). */
+static uint q8_word4(ByteAddressBuffer w, uint off) {
+    uint a = w.Load(off & ~3u);
+    uint sh = (off & 3u) * 8u;
+    if (sh == 0u) return a;
+    return (a >> sh) | (w.Load((off & ~3u) + 4u) << (32u - sh));
+}
+
 float mxfp4_block_dot(ByteAddressBuffer w, uint bbase,
                       StructuredBuffer<float> x, uint xb) {
     float d = e8m0_to_f32(q8_byte_at(w, bbase, 0u));
+    uint off = bbase + 1u;
+    uint sb = off & 3u;
+    uint w0 = w.Load(off & ~3u);
+    uint w1 = w.Load((off & ~3u) + 4u);
+    uint w2 = w.Load((off & ~3u) + 8u);
+    uint w3 = w.Load((off & ~3u) + 12u);
+    uint w4 = w.Load((off & ~3u) + 16u);
     float acc = 0.0f;
     for (uint j = 0u; j < 16u; j++) {
-        uint q = q8_byte_at(w, bbase + 1u, j);
+        uint kb = sb + j;
+        uint q = kb < 4u ? ((w0 >> ((kb & 3u) * 8u)) & 0xffu)
+               : kb < 8u ? ((w1 >> ((kb & 3u) * 8u)) & 0xffu)
+               : kb < 12u ? ((w2 >> ((kb & 3u) * 8u)) & 0xffu)
+               : kb < 16u ? ((w3 >> ((kb & 3u) * 8u)) & 0xffu)
+               : ((w4 >> ((kb & 3u) * 8u)) & 0xffu);
         acc += d * mxfp4_value(q & 0xfu) * x[xb + j];
         acc += d * mxfp4_value(q >> 4u) * x[xb + j + 16u];
     }

@@ -157,7 +157,10 @@ static int qwen4_dense_bind(ds4_gpu_tensor *out, struct ds4_vk_bind wbind,
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, x);
     binds[nb++] = wbind;
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out);
-    return vulkan_dispatch(pipe, &p, sizeof(p), binds, nb, out_rows, n_tokens,
+    /* matmul_q8_0_f32 tiles Q8F32_NR output rows per workgroup. */
+    uint32_t gx = out_rows;
+    if (type == 8u) gx = (out_rows + 3u) / 4u;
+    return vulkan_dispatch(pipe, &p, sizeof(p), binds, nb, gx, n_tokens,
                            1u);
 }
 
@@ -972,7 +975,7 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     }
     if (pool) binds[nb++] = tblb;
     return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_MOE_MID], &p, sizeof(p),
-                           binds, nb, ff_dim, n_out, n_tokens);
+                           binds, nb, (ff_dim + 3u) / 4u, n_out, n_tokens);
 }
 
 int ds4_gpu_qwen4_moe_down_tensor(
@@ -1047,7 +1050,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
     }
     if (pool) binds[nb++] = tblb;
     return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_MOE_DOWN], &p, sizeof(p),
-                           binds, nb, out_dim, n_out, n_tokens);
+                           binds, nb, (out_dim + 3u) / 4u, n_out, n_tokens);
 }
 
 int ds4_gpu_qwen4_moe_reduce_tensor(

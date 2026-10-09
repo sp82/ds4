@@ -33,9 +33,15 @@ RWStructuredBuffer<int> tbl_buf : register(u5);
 
 [[vk::push_constant]] DS4Params params;
 
-groupshared float moe_gate_red[256];
-groupshared float moe_up_red[256];
-groupshared float moe_down_red[256];
+/* Output rows computed per workgroup.  The grid is (ceil(M/MOE_NR), slots,
+ * tokens); one 256-thread block still does the cooperative dot, but now for
+ * MOE_NR rows at once, so the per-block launch and reduction cost is amortized
+ * (the previous one-row-per-block grid was 640x11 blocks for a single token). */
+#define MOE_NR 4
+
+groupshared float moe_gate_red[MOE_NR][256];
+groupshared float moe_up_red[MOE_NR][256];
+groupshared float moe_down_red[MOE_NR][256];
 
 float qwen4_silu(float x) {
     const float e = exp(-abs(x));
@@ -147,21 +153,19 @@ void moe_mid(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
     uint M = params.in_dim;
     uint NS = params.out_dim;
     uint K = params.n;
-    uint row = gid_grp.x;
+    uint row0 = gid_grp.x * MOE_NR;
     uint slot = gid_grp.y;
     uint t = gid_grp.z;
     const bool has_shared = (params.flags & 2u) != 0u;
     const bool use_shared = has_shared && slot == NS;
     const uint n_out = NS + (has_shared ? 1u : 0u);
     const uint pair = t * n_out + slot;
-    if (row >= M || t >= params.rows) return;
+    if (row0 >= M || t >= params.rows) return;
 
     const uint xb = t * K;
-    float ga, ua;
+    uint base0 = 0u;
     if (use_shared) {
-        uint srb = params.index;
-        ga = qwen4_dot_part(sh0_buf, row * srb, params.blocks, K, xb, tid);
-        ua = qwen4_dot_part(sh1_buf, row * srb, params.blocks, K, xb, tid);
+        base0 = row0 * params.index;
     } else {
         int e = selected_buf[t * NS + slot];
         if ((params.flags & 1u) != 0u) {
@@ -169,25 +173,46 @@ void moe_mid(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
             if (ts >= 0) e = ts;
         }
         if (e < 0) {
-            if (tid == 0u) out4_buf[pair * M + row] = 0.0f;
+            if (tid == 0u)
+                [unroll] for (uint r = 0u; r < MOE_NR; r++)
+                    if (row0 + r < M) out4_buf[pair * M + row0 + r] = 0.0f;
             return;
         }
-        uint base = ((uint)e * M + row) * params.ratio;
-        ga = qwen4_dot_part(w_buf, base, params.rsvd3, K, xb, tid);
-        ua = qwen4_dot_part(up_w_buf, base, params.rsvd3, K, xb, tid);
+        base0 = ((uint)e * M + row0) * params.ratio;
     }
-    moe_gate_red[tid] = ga;
-    moe_up_red[tid] = ua;
+
+    float ga[MOE_NR], ua[MOE_NR];
+    [unroll] for (uint r = 0u; r < MOE_NR; r++) { ga[r] = 0.0f; ua[r] = 0.0f; }
+    [unroll] for (uint r = 0u; r < MOE_NR; r++) {
+        if (row0 + r >= M) break;
+        if (use_shared) {
+            ga[r] = qwen4_dot_part(sh0_buf, base0 + r * params.index, params.blocks, K, xb, tid);
+            ua[r] = qwen4_dot_part(sh1_buf, base0 + r * params.index, params.blocks, K, xb, tid);
+        } else {
+            uint base = base0 + r * params.ratio;
+            ga[r] = qwen4_dot_part(w_buf, base, params.rsvd3, K, xb, tid);
+            ua[r] = qwen4_dot_part(up_w_buf, base, params.rsvd3, K, xb, tid);
+        }
+    }
+    [unroll] for (uint r = 0u; r < MOE_NR; r++) {
+        moe_gate_red[r][tid] = ga[r];
+        moe_up_red[r][tid] = ua[r];
+    }
     GroupMemoryBarrierWithGroupSync();
     for (uint st = 128u; st > 0u; st >>= 1u) {
         if (tid < st) {
-            moe_gate_red[tid] += moe_gate_red[tid + st];
-            moe_up_red[tid] += moe_up_red[tid + st];
+            [unroll] for (uint r = 0u; r < MOE_NR; r++) {
+                moe_gate_red[r][tid] += moe_gate_red[r][tid + st];
+                moe_up_red[r][tid] += moe_up_red[r][tid + st];
+            }
         }
         GroupMemoryBarrierWithGroupSync();
     }
     if (tid == 0u)
-        out4_buf[pair * M + row] = qwen4_silu(moe_gate_red[0]) * moe_up_red[0];
+        [unroll] for (uint r = 0u; r < MOE_NR; r++)
+            if (row0 + r < M)
+                out4_buf[pair * M + row0 + r] =
+                    qwen4_silu(moe_gate_red[r][0]) * moe_up_red[r][0];
 }
 
 [numthreads(256, 1, 1)]
@@ -195,20 +220,19 @@ void moe_down(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
     uint M = params.in_dim;
     uint NS = params.out_dim;
     uint K = params.n;
-    uint row = gid_grp.x;
+    uint row0 = gid_grp.x * MOE_NR;
     uint slot = gid_grp.y;
     uint t = gid_grp.z;
     const bool has_shared = (params.flags & 2u) != 0u;
     const bool use_shared = has_shared && slot == NS;
     const uint n_out = NS + (has_shared ? 1u : 0u);
     const uint pair = t * n_out + slot;
-    if (row >= M || t >= params.rows) return;
+    if (row0 >= M || t >= params.rows) return;
 
     const uint xb = pair * K;
-    float a;
+    uint base0 = 0u;
     if (use_shared) {
-        a = qwen4_dot_part(sh0_buf, row * params.index, params.blocks, K, xb,
-                           tid);
+        base0 = row0 * params.index;
     } else {
         int e = selected_buf[t * NS + slot];
         if ((params.flags & 1u) != 0u) {
@@ -216,17 +240,34 @@ void moe_down(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
             if (ts >= 0) e = ts;
         }
         if (e < 0) {
-            if (tid == 0u) out4_buf[pair * M + row] = 0.0f;
+            if (tid == 0u)
+                [unroll] for (uint r = 0u; r < MOE_NR; r++)
+                    if (row0 + r < M) out4_buf[pair * M + row0 + r] = 0.0f;
             return;
         }
-        uint base = ((uint)e * M + row) * params.ratio;
-        a = qwen4_dot_part(w_buf, base, params.rsvd3, K, xb, tid);
+        base0 = ((uint)e * M + row0) * params.ratio;
     }
-    moe_down_red[tid] = a;
+
+    float a[MOE_NR];
+    [unroll] for (uint r = 0u; r < MOE_NR; r++) a[r] = 0.0f;
+    [unroll] for (uint r = 0u; r < MOE_NR; r++) {
+        if (row0 + r >= M) break;
+        if (use_shared) {
+            a[r] = qwen4_dot_part(sh0_buf, base0 + r * params.index, params.blocks, K, xb, tid);
+        } else {
+            a[r] = qwen4_dot_part(w_buf, base0 + r * params.ratio, params.rsvd3, K, xb, tid);
+        }
+    }
+    [unroll] for (uint r = 0u; r < MOE_NR; r++) moe_down_red[r][tid] = a[r];
     GroupMemoryBarrierWithGroupSync();
     for (uint st = 128u; st > 0u; st >>= 1u) {
-        if (tid < st) moe_down_red[tid] += moe_down_red[tid + st];
+        if (tid < st) {
+            [unroll] for (uint r = 0u; r < MOE_NR; r++)
+                moe_down_red[r][tid] += moe_down_red[r][tid + st];
+        }
         GroupMemoryBarrierWithGroupSync();
     }
-    if (tid == 0u) out4_buf[pair * M + row] = moe_down_red[0];
+    if (tid == 0u)
+        [unroll] for (uint r = 0u; r < MOE_NR; r++)
+            if (row0 + r < M) out4_buf[pair * M + row0 + r] = moe_down_red[r][0];
 }

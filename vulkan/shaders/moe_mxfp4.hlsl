@@ -33,6 +33,11 @@ RWStructuredBuffer<int> tbl_buf : register(u5); /* expert->slot table (pool) */
 groupshared float moe_gate_red[256];
 groupshared float moe_up_red[256];
 groupshared float moe_down_red[256];
+/* v2 multi-row scratch: one reduction tree serves every row of the
+ * workgroup (host autotune caps rows/workgroup at 8). */
+groupshared float moe_gate_red_mr[8][256];
+groupshared float moe_up_red_mr[8][256];
+groupshared float moe_down_red_mr[8][256];
 
 /* One block per (row, pair): gate[slot][row] and up[slot][row] are MXFP4 dots
  * of the selected expert's row against x, mid gets the clamped SwiGLU scaled
@@ -156,9 +161,17 @@ static float mxfp4_partial_dot(ByteAddressBuffer w, uint bbase,
                                StructuredBuffer<float> x, uint xb,
                                uint b0, uint bc) {
     float d = e8m0_to_f32(q8_byte_at(w, bbase, 0u));
+    uint off = bbase + 1u + b0;
+    uint sb = off & 3u;
+    uint w0 = w.Load(off & ~3u);
+    uint w1 = w.Load((off & ~3u) + 4u);
+    uint w2 = w.Load((off & ~3u) + 8u);
     float acc = 0.0f;
     for (uint jj = 0u; jj < bc; jj++) {
-        uint q = q8_byte_at(w, bbase + 1u, b0 + jj);
+        uint kb = sb + jj;
+        uint q = kb < 4u ? ((w0 >> ((kb & 3u) * 8u)) & 0xffu)
+               : kb < 8u ? ((w1 >> ((kb & 3u) * 8u)) & 0xffu)
+               : ((w2 >> ((kb & 3u) * 8u)) & 0xffu);
         acc += d * mxfp4_value(q & 0xfu) * x[xb + b0 + jj];
         acc += d * mxfp4_value(q >> 4u) * x[xb + b0 + jj + 16u];
     }
@@ -197,34 +210,46 @@ void moe_gate_up_mid_mxfp4_v2(uint3 gid_grp : SV_GroupID,
     }
     uint R = params.rsvd2;
     if (R == 0u) R = 1u;
+    if (R > 8u) R = 8u;   /* LDS capacity; the host autotune caps R at 8 */
     uint b = tid >> 1u;
     uint h = tid & 1u;
+    /* One pass over the rows: per-row lane partials go straight to LDS and a
+     * single reduction tree serves every row.  The per-row trees cost 8
+     * barriers each and dominated the kernel at decode shapes (~1 ms for
+     * ~35 us of weight traffic).  Per-row summation order is unchanged. */
     for (uint rr = 0u; rr < R; rr++) {
         uint row = gid_grp.x * R + rr;
-        if (row >= mid_dim) break;
-        uint gbase = expert * expert_bytes + row * row_bytes;
         float gacc = 0.0f;
         float uacc = 0.0f;
-        for (uint bb = b; bb < blocks; bb += 128u) {
-            uint xb = tok * params.in_dim + bb * 32u;
-            gacc += mxfp4_partial_dot(w_buf, gbase + bb * 17u, a_buf, xb,
-                                      h * 8u, 8u);
-            uacc += mxfp4_partial_dot(up_w_buf, gbase + bb * 17u, a_buf, xb,
-                                      h * 8u, 8u);
-        }
-        moe_gate_red[tid] = gacc;
-        moe_up_red[tid] = uacc;
-        GroupMemoryBarrierWithGroupSync();
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (tid < stride) {
-                moe_gate_red[tid] += moe_gate_red[tid + stride];
-                moe_up_red[tid] += moe_up_red[tid + stride];
+        if (row < mid_dim) {
+            uint gbase = expert * expert_bytes + row * row_bytes;
+            for (uint bb = b; bb < blocks; bb += 128u) {
+                uint xb = tok * params.in_dim + bb * 32u;
+                gacc += mxfp4_partial_dot(w_buf, gbase + bb * 17u, a_buf, xb,
+                                          h * 8u, 8u);
+                uacc += mxfp4_partial_dot(up_w_buf, gbase + bb * 17u, a_buf, xb,
+                                          h * 8u, 8u);
             }
-            GroupMemoryBarrierWithGroupSync();
         }
-        if (tid == 0u) {
-            float g = moe_gate_red[0];
-            float u = moe_up_red[0];
+        moe_gate_red_mr[rr][tid] = gacc;
+        moe_up_red_mr[rr][tid] = uacc;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            for (uint rr = 0u; rr < R; rr++) {
+                moe_gate_red_mr[rr][tid] += moe_gate_red_mr[rr][tid + stride];
+                moe_up_red_mr[rr][tid] += moe_up_red_mr[rr][tid + stride];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        for (uint rr = 0u; rr < R; rr++) {
+            uint row = gid_grp.x * R + rr;
+            if (row >= mid_dim) break;
+            float g = moe_gate_red_mr[rr][0];
+            float u = moe_up_red_mr[rr][0];
             if (params.clamp > 1.0e-6f) {
                 g = min(g, params.clamp);
                 u = min(max(u, -params.clamp), params.clamp);
@@ -267,28 +292,37 @@ void moe_down_mxfp4_v2(uint3 gid_grp : SV_GroupID,
     }
     uint R = params.rsvd2;
     if (R == 0u) R = 1u;
+    if (R > 8u) R = 8u;   /* LDS capacity; the host autotune caps R at 8 */
     uint b = tid >> 2u;
     uint h = tid & 3u;
+    /* Single reduction tree for all rows, as in the gate/up v2. */
     for (uint rr = 0u; rr < R; rr++) {
         uint row = gid_grp.x * R + rr;
-        if (row >= out_dim) break;
-        uint bbase = expert * expert_bytes + row * row_bytes;
         float acc = 0.0f;
-        for (uint bb = b; bb < blocks; bb += 64u) {
-            uint xb = apair * params.in_dim + bb * 32u;
-            acc += mxfp4_partial_dot(w_buf, bbase + bb * 17u, a_buf, xb,
-                                     h * 4u, 4u);
-        }
-        moe_down_red[tid] = acc;
-        GroupMemoryBarrierWithGroupSync();
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (tid < stride) {
-                moe_down_red[tid] += moe_down_red[tid + stride];
+        if (row < out_dim) {
+            uint bbase = expert * expert_bytes + row * row_bytes;
+            for (uint bb = b; bb < blocks; bb += 64u) {
+                uint xb = apair * params.in_dim + bb * 32u;
+                acc += mxfp4_partial_dot(w_buf, bbase + bb * 17u, a_buf, xb,
+                                         h * 4u, 4u);
             }
-            GroupMemoryBarrierWithGroupSync();
         }
-        if (tid == 0u) {
-            out4_buf[apair * out_dim + row] = moe_down_red[0];
+        moe_down_red_mr[rr][tid] = acc;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            for (uint rr = 0u; rr < R; rr++) {
+                moe_down_red_mr[rr][tid] += moe_down_red_mr[rr][tid + stride];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0u) {
+        for (uint rr = 0u; rr < R; rr++) {
+            uint row = gid_grp.x * R + rr;
+            if (row >= out_dim) break;
+            out4_buf[apair * out_dim + row] = moe_down_red_mr[rr][0];
         }
     }
 }
