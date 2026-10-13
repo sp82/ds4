@@ -103,69 +103,66 @@ void hc_norm(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
     }
 }
 
-/* params: rows=T, in_dim=E, out_dim=hc, index=rank, rsvd3=type. */
+/* params: rows=T, in_dim=E, out_dim=hc, index=rank, rsvd3=type.
+ *
+ * r-parallel (coalesced) decode path: one 256-thread block splits into
+ * subgroups; each subgroup owns whole output rows d and reduces its
+ * lane-strided r partial with one WaveActiveSum (no LDS/barriers, same idiom
+ * as moe_mxfp4 v3).  Lane reads are coalesced (consecutive lanes -> consecutive
+ * r).  silu(lo[r]/hc) is hoisted once per block.  The per-row total is a f32
+ * tree reduction -- a different association from the old serial loop, well
+ * inside the 2e-5 test tolerance; each output row depends only on its own
+ * token, so T=1/2/3 rows stay mutually consistent. */
 [numthreads(256, 1, 1)]
 void hc_gate_mix(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
-    uint d = gid_grp.x * 256u + tid;
     uint t = gid_grp.y;
     uint E = params.in_dim, hc = params.out_dim, rank = params.index;
     uint type = params.rsvd3;
 
-    /* silu(lo[r]/hc) is independent of d: compute each r once per workgroup
-     * instead of once per (d, s, r).  Same formula -> same f32 values. */
+    const uint wsize = WaveGetLaneCount();
+    const uint nsg = max(1u, 256u / wsize);
+    const uint sg = tid / wsize;
+    const uint lane = tid - sg * wsize;
+
+    /* Workgroup-level guard (uniform across the block) so the barrier below is
+     * legal even when the whole block has no output row to write. */
+    const bool active = (gid_grp.x * nsg < E);
     const bool slo_ok = (rank <= (uint)HC_GATE_SLO_MAX);
-    if (slo_ok) {
+    if (active && slo_ok) {
         for (uint r = tid; r < rank; r += 256u)
             hc_gate_slo[r] = qwen4_silu(c_buf[t * rank + r] / (float)hc);
     }
     GroupMemoryBarrierWithGroupSync();
+    if (!active) return;
+
+    const uint d = gid_grp.x * nsg + sg;
     if (d >= E || t >= params.rows) return;
 
     float m = 0.0f;
     for (uint s = 0u; s < hc; s++) {
-        float acc = 0.0f;
         const uint row = s * E + d;
-        if (slo_ok && type == 1u && (params.flags & 1u) != 0u &&
-            (rank & 7u) == 0u) {
-            /* f16 fast path: read 8 halves per 16-byte uint4 load instead of
-             * one f16_at per element (4-byte loads).  Same element order and
-             * the same f16->f32 values as qwen4_dense_scalar.  Only used when
-             * the weight row base is 16-byte aligned (host sets flags bit 0). */
+        float acc = 0.0f;
+        if (slo_ok && type == 1u && (rank & 1u) == 0u) {
+            /* f16: one 4-byte load carries two halves -> coalesced and half
+             * the load count.  Two products per step (associativity differs
+             * from the generic scalar loop, well inside tolerance). */
             const uint rowb = row * (rank * 2u);
-            for (uint r = 0u; r < rank; r += 8u) {
-                const uint4 wv = b_buf.Load4(rowb + r * 2u);
-                acc += f16tof32(wv.x & 0xffffu) * hc_gate_slo[r + 0u];
-                acc += f16tof32(wv.x >> 16u) * hc_gate_slo[r + 1u];
-                acc += f16tof32(wv.y & 0xffffu) * hc_gate_slo[r + 2u];
-                acc += f16tof32(wv.y >> 16u) * hc_gate_slo[r + 3u];
-                acc += f16tof32(wv.z & 0xffffu) * hc_gate_slo[r + 4u];
-                acc += f16tof32(wv.z >> 16u) * hc_gate_slo[r + 5u];
-                acc += f16tof32(wv.w & 0xffffu) * hc_gate_slo[r + 6u];
-                acc += f16tof32(wv.w >> 16u) * hc_gate_slo[r + 7u];
-            }
-        } else if (slo_ok && type == 8u && (rank & 31u) == 0u) {
-            /* q8_0 fast path: 32 elements per 34-byte block.  Hoist the block
-             * scale (one f16 load per 32 elements instead of per element) and
-             * read the quantised payload with q8_s8_at.  Element order and the
-             * per-element value are identical to qwen4_dense_scalar. */
-            const uint rb = (rank >> 5u) * 34u;
-            const uint rowb = row * rb;
-            for (uint b = 0u; b < (rank >> 5u); b++) {
-                const uint bb = rowb + b * 34u;
-                const float sc = q8_scale_at(b_buf, bb);
-                for (uint j = 0u; j < 32u; j++)
-                    acc += sc * (float)q8_s8_at(b_buf, bb, j) *
-                           hc_gate_slo[b * 32u + j];
+            for (uint r = 2u * lane; r < rank; r += 2u * wsize) {
+                const uint w2 = b_buf.Load(rowb + r * 2u);
+                acc += f16tof32(w2 & 0xffffu) * hc_gate_slo[r] +
+                       f16tof32(w2 >> 16u) * hc_gate_slo[r + 1u];
             }
         } else {
-            for (uint r = 0u; r < rank; r++)
+            for (uint r = lane; r < rank; r += wsize)
                 acc += qwen4_dense_scalar(b_buf, row * rank + r, type) *
                        (slo_ok ? hc_gate_slo[r]
                                : qwen4_silu(c_buf[t * rank + r] / (float)hc));
         }
-        m += qwen4_sigmoid(acc) * a_buf[(t * hc + s) * E + d];
+        acc = WaveActiveSum(acc);
+        if (WaveIsFirstLane())
+            m += qwen4_sigmoid(acc) * a_buf[(t * hc + s) * E + d];
     }
-    out_buf[t * E + d] = m / (float)hc;
+    if (WaveIsFirstLane()) out_buf[t * E + d] = m / (float)hc;
 }
 
 /* params: rows=T, in_dim=E, out_dim=hc, index=hc. */

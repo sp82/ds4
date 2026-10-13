@@ -1331,8 +1331,6 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     p.out_dim = n_hc;
     p.index = n_rank;
     p.rsvd3 = weight_type;
-    /* flags bit 0: f16 weight rows are 16-byte aligned -> vectorised path. */
-    p.flags = ((up_offset % 16u) == 0u && (n_rank % 8u) == 0u) ? 1u : 0u;
     struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
     uint32_t nb = 0;
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, xn);
@@ -1340,7 +1338,7 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_C, lo);
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, mixed);
     return vulkan_dispatch(g_pipes[DS4_PIPE_QWEN4_HC_GATE_MIX], &p, sizeof(p),
-                           binds, nb, (n_embd + 255u) / 256u, n_tokens, 1u);
+                           binds, nb, n_embd, n_tokens, 1u);
 }
 
 int ds4_gpu_qwen4_hc_combine_tensor(ds4_gpu_tensor *R,
