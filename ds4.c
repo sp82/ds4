@@ -60259,6 +60259,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         const char *tv = getenv("DS4_QWEN4_TIMING");
         timing = tv ? (atoi(tv) >= 3 ? 3 : (atoi(tv) >= 2 ? 2 : 1)) : 0;
     }
+    const double t_ent = now_sec();
     /* Start the GPU while the host encodes the rest of the trunk. The
      * command queue preserves layer order; zero restores one submission.
      * Multi-GPU keeps one submission per tier (the tier switch already
@@ -60576,10 +60577,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             /* Prefill: one wide forward -- report it immediately (the rolling
              * average only fires every 50 decode calls). */
             fprintf(stderr,
-                    "ds4: prefill fwd(T=%u) ms: stage %.1f post/head %.1f gpu %.1f "
-                    "read %.1f\n",
+                    "ds4: prefill fwd(T=%u) ms: stage %.1f loop+head %.1f gpu %.1f "
+                    "read %.1f | total %.1f\n",
                     T, 1e3 * (t1 - t0), 1e3 * (t2 - t1), 1e3 * (t3 - t2),
-                    1e3 * (now_sec() - t3));
+                    1e3 * (now_sec() - t3), 1e3 * (now_sec() - t_ent));
         } else if (++n_calls % 50 == 0) {
             fprintf(stderr, "ds4: Qwen3.8 forward(T=%u) avg ms: stage %.3f encode %.3f gpu %.3f read %.3f\n", T,
                     1e3 * acc[0] / 50, 1e3 * acc[1] / 50, 1e3 * acc[2] / 50, 1e3 * acc[3] / 50);
@@ -61008,8 +61009,12 @@ static int generate_qwen4_metal_argmax(
     for (int i = 0; i < prompt->len && ok;) {
         uint32_t chunk = (uint32_t)(prompt->len - i);
         if (chunk > g->cap_tokens) chunk = g->cap_tokens;
+        const double c0 = now_sec();
         ok = qwen4_graph_forward_tokens(g, model, weights, prompt->v + i, chunk,
                                         i + (int)chunk == prompt->len ? logits : NULL, false);
+        if (chunk > 8u)
+            fprintf(stderr, "ds4: prefill chunk T=%u wall %.1f ms\n", chunk,
+                    (now_sec() - c0) * 1000.0);
         i += (int)chunk;
         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
     }
@@ -77896,6 +77901,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * may leave it as the live session. Every completed chunk needs
              * its own logits as well as recurrent/KV state. */
             s->checkpoint_valid = false;
+            const double qc0 = now_sec();
             if (!qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
                                             prompt->v + i, chunk, s->logits, false)) {
                 snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
@@ -77903,6 +77909,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 prefill_rc = 1;
                 break;
             }
+            if (chunk > 8u)
+                fprintf(stderr, "ds4: prefill chunk T=%u wall %.1f ms\n", chunk,
+                        (now_sec() - qc0) * 1000.0);
             for (uint32_t j = 0; j < chunk; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
             i += (int)chunk;
             s->checkpoint_valid = true;
