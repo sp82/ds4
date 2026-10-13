@@ -60572,7 +60572,15 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         static double acc[4];
         static int n_calls;
         acc[0] += t1 - t0; acc[1] += t2 - t1; acc[2] += t3 - t2; acc[3] += now_sec() - t3;
-        if (++n_calls % 50 == 0) {
+        if (T > 8u) {
+            /* Prefill: one wide forward -- report it immediately (the rolling
+             * average only fires every 50 decode calls). */
+            fprintf(stderr,
+                    "ds4: prefill fwd(T=%u) ms: stage %.1f post/head %.1f gpu %.1f "
+                    "read %.1f\n",
+                    T, 1e3 * (t1 - t0), 1e3 * (t2 - t1), 1e3 * (t3 - t2),
+                    1e3 * (now_sec() - t3));
+        } else if (++n_calls % 50 == 0) {
             fprintf(stderr, "ds4: Qwen3.8 forward(T=%u) avg ms: stage %.3f encode %.3f gpu %.3f read %.3f\n", T,
                     1e3 * acc[0] / 50, 1e3 * acc[1] / 50, 1e3 * acc[2] / 50, 1e3 * acc[3] / 50);
             memset(acc, 0, sizeof(acc));
