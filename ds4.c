@@ -25076,7 +25076,7 @@ static unsigned metal_graph_vk_split_count = 0;
                 if (!ok && getenv("DS4_VULKAN_DEBUG_FAIL") != NULL)
                     fprintf(stderr, "ds4: DBG fail step=hc_pre_rms il=%u\n", il);
 #endif
-                if (ok) {
+    if (ok) {
                     ok = metal_graph_matmul_plain_tensor(
                             metal_graph_hc_mix(g), model, layer->hc_attn_fn,
                             hc_dim, mix_hc, metal_graph_flat_hc(g), 1);
@@ -40632,13 +40632,14 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx);
 #endif
 static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
 #if defined(DS4_VULKAN_BUILD)
-    /* On a large-BAR Vulkan GPU the chunked-prefill workspace (R/xn/mixed/
-     * part/moe_lists, sized for this many rows) is host-visible and therefore
-     * lives in VRAM.  An 8192-row workspace costs ~4 GiB per tier and overflows
-     * the resident weights, which then spill to GTT (slow PCIe).  Match the
-     * DeepSeek prefill cap (512): the workspace stays in VRAM and prefill
-     * throughput is unchanged (measured 13.6 t/s at 32k). */
-    const unsigned long default_chunk = 512ul;
+    /* The chunked-prefill workspace (R/xn/mixed/part/moe_lists, sized for this
+     * many rows) is host-visible and on a large-BAR GPU lives in VRAM, sharing
+     * the heap with the resident weights.  The packer now reserves it per tier
+     * (engine_per_tier_graph_overhead_bytes -> engine_qwen4_workspace_bytes), so
+     * a larger chunk no longer spills weights to GTT.  2048 keeps that
+     * reservation (~0.5 GiB/tier at ctx 16k) inside the all-resident budget
+     * while cutting the number of chunk boundaries for long prompts. */
+    const unsigned long default_chunk = 2048ul;
 #else
     const unsigned long default_chunk = 8192ul;
 #endif
@@ -58557,6 +58558,76 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
     *count = n;
     return spans;
 }
+
+/* Per-session VRAM footprint of the Qwen chunked-prefill workspace: the exact
+ * sum of the QWEN4_ALLOC list in qwen4_graph_alloc plus the per-tier extras
+ * (pos3, logits, PLE/MTP stage buffers).  It declares the workspace's true
+ * need with NO self-imposed margin -- the layer packer leaves the headroom via
+ * safety_margin_bytes.  The per-layer KV/state is NOT included: it is charged
+ * per layer by engine_qwen4_per_layer_kv_bytes_planner.  Defined outside the
+ * DS4_HAS_QWEN4_GPU guard so the DS4_NO_GPU planner tests can price it; the
+ * DS4_QWEN4_VERIFY_RESERVE check in qwen4_graph_alloc catches any future
+ * allocation that outgrows this sum. */
+#ifndef DS4_QWEN4_HC_CHUNKS
+#define DS4_QWEN4_HC_CHUNKS 8  /* Qwen4 constant; ds4_gpu.h declares it on GPU builds */
+#endif
+static uint64_t engine_qwen4_workspace_formula(uint32_t ctx, uint32_t cap_tokens,
+                                               bool mtp) {
+    const uint64_t E = DS4_N_EMBD;
+    const uint64_t hc = DS4_N_HC;
+    const uint64_t hc_dim = E * hc;
+    const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t iq_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t n_block_cap = (uint64_t)ctx / 4u + 1u;
+    const uint64_t k_blocks = DS4_N_INDEXER_TOP_K / 4u;
+    const uint64_t sel_stride = k_blocks * 4u + 4u;
+    const uint64_t T = cap_tokens;
+
+    uint64_t f = 0;                                    /* floats */
+    f += 2u * T * hc_dim;                              /* R, xn */
+    f += 2u * T * DS4_N_HC_LOWRANK;                    /* lo, hc_lo_act */
+    f += 2u * T * hc * DS4_QWEN4_HC_CHUNKS * hc;       /* inj, inj_alt */
+    f += 2u * T * E;                                   /* mixed, blk */
+    f += T * conv_dim;                                 /* qkv */
+    f += 2u * T * v_dim;                               /* z, lin_o */
+    f += 2u * T * DS4_N_LIN_V_HEAD;                    /* ga, gb */
+    f += 2u * T * E;                                   /* ple_emb, ple_val */
+    f += 3u * T * hc_dim;                              /* ple_key, ple_gated, ple_normed */
+    f += 5u * T * q_dim;                               /* qg(2x), q, gate, attn_o */
+    f += 2u * T * kv_dim;                              /* kp, vp */
+    f += 2u * T * iq_dim;                              /* iq, iqn */
+    f += T * DS4_N_INDEXER_HEAD_DIM;                   /* ik */
+    f += (uint64_t)3u * DS4_N_HEAD * 64u * (DS4_N_HEAD_DIM + 2u); /* attn_part (fixed) */
+    f += T * (n_block_cap + (n_block_cap / 8u + 1u) + k_blocks + sel_stride + 1u);
+                                                       /* score, tile_max, sel_blocks, sel_tokens, n_sel */
+    f += T * DS4_N_EXPERT;                             /* router */
+    f += 2u * T * DS4_N_EXPERT_USED;                   /* selected, weights */
+    f += T * (DS4_N_EXPERT_USED + 1u) * (DS4_N_FF_EXP + E); /* mid + part */
+    f += T;                                            /* sh_gate_logit */
+    f += T * DS4_N_EXPERT;                             /* moe_lists */
+    f += DS4_N_EXPERT;                                 /* moe_counts (fixed) */
+    f += T * (3u * DS4_N_FF_EXP + E);                  /* sh_gate, sh_up, sh_mid, sh_out */
+    f += T * hc_dim;                                   /* hc_u */
+
+    /* Per-tier extras (allocated in qwen4_graph_alloc's private_state block). */
+    f += (uint64_t)ctx * 4u;                           /* pos3 */
+    f += (mtp ? 3u : 1u) * (uint64_t)DS4_N_VOCAB;      /* logits */
+    f += (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim; /* ple_hist */
+    if (mtp) {
+        f += (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim; /* snap_ple_hist */
+        f += 3u * E;                                   /* mtp_e */
+        f += 3u * (hc + 1u) * 2u * E;                  /* mtp_cat */
+        f += 3u * (hc + 1u) * E;                       /* mtp_proj */
+        f += 3u * hc_dim;                              /* mtp_R */
+        f += 1u;                                       /* mtp_argmax */
+        f += ((uint64_t)DS4_N_VOCAB + 4095u) / 4096u * 2u; /* mtp_argmax_tmp */
+    }
+    return f * sizeof(float);
+}
+
 #ifdef DS4_HAS_QWEN4_GPU
 /* ------------------------------------------------------------------------
  * Qwen3.8-Flash-Next GPU graph.  One command batch per forward; f32
@@ -59238,6 +59309,29 @@ private_state:
         qwen4_graph_free(g);
         return false;
     }
+    /* Guard the packer reservation: the planner must reserve at least the
+     * actual workspace the graph just allocated, or a large prefill chunk
+     * could spill resident weights to GTT again. */
+    if (getenv("DS4_QWEN4_VERIFY_RESERVE") != NULL) {
+        const uint64_t actual = qwen4_graph_scratch_bytes(g);
+        const uint64_t est =
+            engine_qwen4_workspace_formula(ctx_cap, (uint32_t)T, mtp);
+        if (getenv("DS4_QWEN4_DUMP_SCRATCH") != NULL) {
+#define QWEN4_DUMP(field_) \
+            fprintf(stderr, "ds4: scratch %-14s %llu\n", #field_, \
+                    (unsigned long long)ds4_gpu_tensor_bytes(g->field_));
+            DS4_QWEN4_SCRATCH_FIELDS(QWEN4_DUMP)
+#undef QWEN4_DUMP
+        }
+        if (actual > est) {
+            fprintf(stderr,
+                    "ds4: WARNING Qwen workspace reserve under-estimated: "
+                    "graph scratch %.2f GiB > planner estimate %.2f GiB "
+                    "(ctx %u cap %u)\n",
+                    (double)actual / 1073741824.0,
+                    (double)est / 1073741824.0, ctx_cap, (uint32_t)T);
+        }
+    }
     return true;
 }
 
@@ -59766,6 +59860,82 @@ static bool g_qwen4_streaming = false;
  * (vulkan_set_span_windows destroys + re-uploads the windows per call). */
 static bool g_qwen4_static_decode_mapped = false;
 
+/* Phase 4 (progress_qwen.md, Round 4): every prefill layer staging replaces the
+ * window of the tier that owns it (vulkan_set_span_windows destroys and
+ * re-uploads the windows).  Once the chunk's trunk is recorded, re-install each
+ * DYNAMIC tier's decode slice (its non-expert tensors, plus the off-slab MTP
+ * experts) so the first decode token finds them in the window instead of
+ * staging them lazily one offset at a time.  Static tiers keep their experts in
+ * the device-local weight cache and are left unchanged. */
+static bool qwen4_restore_dynamic_decode_spans(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                               const ds4_weights *w) {
+    const int back = g->active_tier;
+    bool ended = false;
+    for (int t = 0; t < (int)g->n_tiers && t < DS4_MAX_GPUS; t++) {
+        if (g_tier_weights_resident[t]) continue;
+        int ls = -1, le = -1;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (g->placement[il + 1u] == t) {
+                if (ls < 0) ls = (int)il;
+                le = (int)il;
+            }
+        }
+        if (ls < 0) continue;
+        const bool inc_tok = g->placement[0] == t;
+        const bool inc_out = g->placement[DS4_N_LAYER + 1u] == t;
+        ds4_model_map_span_vec spans;
+        const bool built = g_qwen4_mtp_active
+            ? weights_model_map_decode_runtime_slice_spans(w, (uint32_t)ls, (uint32_t)le,
+                                                           inc_tok, inc_out, &spans)
+            : weights_model_map_decode_static_slice_spans(w, (uint32_t)ls, (uint32_t)le,
+                                                          inc_tok, inc_out, &spans);
+        if (!built) return false;
+        if (!ended) {
+            if (!ds4_gpu_end_commands()) { free(spans.v); return false; }
+            ended = true;
+        }
+        bool ok = ds4_gpu_set_current_device(t) == 0;
+        if (ok) ok = metal_graph_install_model_spans(m, &spans, "dynamic tier decode");
+        free(spans.v);
+        if (!ok) return false;
+    }
+    if (!ended) return true;
+    if (ds4_gpu_set_current_device(back) != 0) return false;
+    qwen4_alias_tier(g, back);
+    return ds4_gpu_begin_commands();
+}
+
+/* Debug probe (progress_qwen.md, 2026-10-12): at the chosen layer, close the scope,
+ * drain WITHOUT the descriptor-pool reset, read the first values of the layer's
+ * working buffers and report NaN/Inf/large values, then reopen the scope.  The
+ * first non-finite buffer in data-flow order locates the failing sub-stage. */
+static void qwen4_probe_layer_buffers(ds4_qwen4_gpu_graph *g, uint32_t il, const char *tag) {
+    if (!ds4_gpu_end_commands()) return;
+#if defined(DS4_VULKAN_BUILD)
+    extern void ds4_vulkan_drain_no_pool_reset(void);
+    ds4_vulkan_drain_no_pool_reset();
+#endif
+    const struct { const char *name; ds4_gpu_tensor *t; } bufs[] = {
+        {"xn", g->xn}, {"q", g->q}, {"kp", g->kp}, {"vp", g->vp},
+        {"attn_o", g->attn_o}, {"blk", g->blk}, {"R", g->R}, {"mixed", g->mixed},
+    };
+    for (uint32_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) {
+        float v[64];
+        memset(v, 0, sizeof(v));
+        const int ok = bufs[i].t && ds4_gpu_tensor_read(bufs[i].t, 0, v, sizeof(v)) != 0;
+        int nonfinite = 0;
+        float maxabs = 0.0f;
+        for (int k = 0; k < 64; k++) {
+            if (!isfinite(v[k])) nonfinite++;
+            else if (fabsf(v[k]) > maxabs) maxabs = fabsf(v[k]);
+        }
+        fprintf(stderr, "PROBE %s il=%u %-6s read=%d nonfinite=%d/64 maxabs=%g first=%g %g %g %g\n",
+                tag, il, bufs[i].name, ok, nonfinite, (double)maxabs,
+                v[0], v[1], v[2], v[3]);
+    }
+    (void)ds4_gpu_begin_commands();
+}
+
 /* P7: seed the device-local expert pool for a decode batch (T<=8) from the
  * router's selected expert ids; the Qwen MoE dispatchers then bind the pool. */
 static bool qwen4_moe_stream_seed(ds4_qwen4_gpu_graph *g, const ds4_model *m,
@@ -59782,8 +59952,27 @@ static bool qwen4_moe_stream_seed(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     int32_t ids[8u * DS4_N_EXPERT_USED];
     if (n_ids > sizeof(ids) / sizeof(ids[0])) return false;
     if (!ds4_gpu_end_commands()) return false;
+#if defined(DS4_VULKAN_BUILD)
+    extern void ds4_vulkan_drain_no_pool_reset(void);
+    /* Drain WITHOUT the descriptor-pool reset before the host readback: the
+     * reset inside the plain tensor read (vulkan_device_wait) invalidates
+     * descriptor sets that later submissions still reference and the next
+     * layers then compute NaN (the same corruption documented at the per-layer
+     * boundary above).  With the queue drained and `dirty` cleared, the read
+     * below takes the plain mapped-memcpy path. */
+    ds4_vulkan_drain_no_pool_reset();
+#endif
     bool ok = ds4_gpu_tensor_read(g->selected, 0, ids,
                                   n_ids * sizeof(ids[0])) != 0;
+    if (getenv("DS4_QWEN4_DEBUG") != NULL) {
+        float rl[2] = {0}, mx[2] = {0}, rr[2] = {0};
+        ds4_gpu_tensor_read(g->router, 0, rl, sizeof(rl));
+        ds4_gpu_tensor_read(g->mixed, 0, mx, sizeof(mx));
+        ds4_gpu_tensor_read(g->R, 0, rr, sizeof(rr));
+        fprintf(stderr, "DBG seed ids il=%u T=%u tier=%d: %d %d %d %d %d | router=%g %g mixed=%g %g R=%g %g\n",
+                il, T, g->active_tier, ids[0], ids[1], ids[2], ids[3], ids[4],
+                rl[0], rl[1], mx[0], mx[1], rr[0], rr[1]);
+    }
     if (!ok && getenv("DS4_QWEN4_DEBUG"))
         fprintf(stderr, "DBG moe_seed il=%u T=%u selected read failed\n", il, T);
     if (ok) {
@@ -59800,6 +59989,8 @@ static bool qwen4_moe_stream_seed(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             fprintf(stderr, "DBG moe_seed il=%u T=%u seed failed\n", il, T);
     }
     if (!ds4_gpu_begin_commands()) ok = false;
+    if (getenv("DS4_QWEN4_DEBUG"))
+        fprintf(stderr, "DBG moe_seed il=%u T=%u ok=%d\n", il, T, ok ? 1 : 0);
     return ok;
 }
 
@@ -59812,7 +60003,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
                qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
-    if (ok && g_qwen4_streaming && T <= 8u) {
+    if (ok && g_qwen4_streaming && T <= 8u &&
+        getenv("DS4_QWEN4_NO_SEED") == NULL &&
+        (getenv("DS4_QWEN4_SEED_DYNAMIC_ONLY") == NULL ||
+         g->active_tier == g->n_tiers - 1)) {
         /* A seed failure is not fatal: the off-slab layers (the MTP layer 48,
          * a different per-expert size class) can never be served by the
          * single-size-class pool, so their experts live in the mapped model
@@ -59917,6 +60111,35 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                    DS4_N_FF_EXP, DS4_N_EMBD);
     } else
 #endif
+    /* DS4_QWEN4_DEBUG=2: residual probe before the routed MoE — runs in every
+     * path (pool/cache/windows), so trajectories can be compared A/B.  The
+     * read uses the no-pool-reset drain (a plain tensor read would
+     * synchronize+reset the descriptor pool mid-scope and corrupt the next
+     * layers — this probe is otherwise invasive). */
+    if (getenv("DS4_QWEN4_DEBUG") != NULL &&
+        getenv("DS4_QWEN4_DEBUG")[0] == '2' && T <= 8u) {
+        float rp[3] = {0};
+#if defined(DS4_VULKAN_BUILD)
+        extern void ds4_vulkan_drain_no_pool_reset(void);
+        /* DS4_QWEN4_PROBE_MODE bisects the probe itself:
+         * 0 = split the scope only (end+begin)
+         * 1 = split + drain the queue (no pool reset)
+         * 2 = split + drain + host readback (default) */
+        const int probe_mode = getenv("DS4_QWEN4_PROBE_MODE")
+            ? atoi(getenv("DS4_QWEN4_PROBE_MODE")) : 2;
+        const bool probe_open = ds4_gpu_end_commands() != 0;
+        if (probe_mode >= 1) ds4_vulkan_drain_no_pool_reset();
+        bool probe_read = false;
+        if (probe_mode >= 2)
+            probe_read = ds4_gpu_tensor_read(g->R, 0, rp, sizeof(rp)) != 0;
+        if (probe_open) (void)ds4_gpu_begin_commands();
+        if (!probe_read) rp[0] = rp[1] = rp[2] = 0.0f;
+#else
+        (void)ds4_gpu_tensor_read(g->R, 0, rp, sizeof(rp));
+#endif
+        fprintf(stderr, "DBG R il=%u T=%u tier=%d: %g %g %g\n",
+                il, T, g->active_tier, rp[0], rp[1], rp[2]);
+    }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
@@ -60133,7 +60356,20 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
              * synchronize is NOT needed and costs the encode/execute
              * pipelining (113 vs 170 t/s at T=365).  DS4_QWEN4_DRAIN_SYNC
              * adds the host sync back for debugging only. */
-            if (!ds4_gpu_end_commands() || !ds4_gpu_begin_commands()) {
+            if (!ds4_gpu_end_commands()) {
+                ok = false;
+                break;
+            }
+            /* Experiment (progress_qwen.md, 2026-10-12): reset the descriptor pool
+             * at every layer boundary, BEFORE the next scope opens.  No scope is
+             * open here, so the synchronize waits for all submitted work and the
+             * reset frees only sets nothing still uses.  DeepSeek multi-tier does
+             * the equivalent by restaging its windows per layer. */
+            if (getenv("DS4_QWEN4_RESET_EACH_LAYER") != NULL && !ds4_gpu_synchronize()) {
+                ok = false;
+                break;
+            }
+            if (!ds4_gpu_begin_commands()) {
                 ok = false;
                 break;
             }
@@ -60193,6 +60429,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok) {
             /* GDN and full attention both project into the same E-wide blk
              * stream before the hyper-connection residual combine. */
+            if (T == 1u && getenv("DS4_QWEN4_PROBE_LAYER") != NULL &&
+                (uint32_t)atoi(getenv("DS4_QWEN4_PROBE_LAYER")) == il) {
+                qwen4_probe_layer_buffers(g, il, "after_attn");
+            }
             if (g->dump_prompt_rows) qwen4_graph_dump_last_attn(g, il, T);
             ok = qwen4_graph_apply_steering_attn(g, il, T);
         }
@@ -60226,7 +60466,27 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         /* Submit this prefix while the host encodes the remaining layers.
          * Flush keeps the same ordered queue and retains pending buffers;
          * end_commands below waits for both batches before inputs are reused. */
+        if (ok && T == 1u && getenv("DS4_QWEN4_TRACE_R") != NULL) {
+            /* Debug only: close the scope and read the residual of this layer.
+             * Syncing does not change the values (checked with DRAIN_SYNC). */
+            float rv[4] = {0};
+            ok = ds4_gpu_end_commands();
+#if defined(DS4_VULKAN_BUILD)
+            if (ok) {
+                /* Drain without the descriptor-pool reset: the plain read below
+                 * would otherwise reset the pool while later submits still use it. */
+                extern void ds4_vulkan_drain_no_pool_reset(void);
+                ds4_vulkan_drain_no_pool_reset();
+            }
+#endif
+            ok = ok && ds4_gpu_tensor_read(g->R, 0, rv, sizeof(rv)) != 0 &&
+                 ds4_gpu_begin_commands();
+            fprintf(stderr, "TRACE pos=%u layer=%u tier=%d R=%g %g %g %g\n",
+                    pos0, il, g->active_tier, rv[0], rv[1], rv[2], rv[3]);
+        }
         if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
+        if (!ok && getenv("DS4_QWEN4_DEBUG"))
+            fprintf(stderr, "DBG fail in layer il=%u T=%u\n", il, T);
     }
     /* NOTE: a chunk-end end+synchronize+begin here looked like the missing
      * prefill->decode ordering point, but it REGRESSES the working cases
@@ -60264,6 +60524,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             ok = false;
         }
         if (ok && !ds4_gpu_begin_commands()) ok = false;
+    }
+    if (ok && qwen_stage_layer && g->multi_tier && g_qwen4_streaming) {
+        ok = qwen4_restore_dynamic_decode_spans(g, m, w);
     }
     if (ok && logits_out && all_rows) {
         ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
@@ -61194,6 +61457,62 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
     return bytes;
 }
 
+/* Qwen per-layer KV/state footprint that lives in VRAM, mirroring the graph's
+ * per-layer allocations in qwen4_graph_alloc:
+ *  - attention layers: f16 K and V caches, the f32 indexer key cache and the
+ *    f16 pooled block keys;
+ *  - linear (GDN) layers: the recurrent state and conv history, counted x3 to
+ *    cover the live copy plus the two MTP rollback snapshots (matches
+ *    ds4_context_memory_estimate_with_prefill_mode).
+ * Charged per layer so the packer prices it on the owning tier, not on every
+ * tier (which is what forced the old per-tier Qwen overhead to zero). */
+static size_t engine_qwen4_per_layer_kv_bytes_planner(uint32_t il, int ctx_size,
+                                                      uint32_t sessions) {
+    if (ctx_size <= 0 || il >= DS4_N_LAYER) return 0;
+    const uint64_t ctx = (uint64_t)(uint32_t)ctx_size;
+    uint64_t bytes;
+    if (ds4_qwen4_layer_is_linear(il)) {
+        const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+        const uint64_t hist =
+            (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM;
+        bytes = 3u * (v_dim * DS4_N_LIN_HEAD_DIM + hist) * sizeof(float);
+    } else {
+        const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+        const uint64_t n_block_cap = ctx / 4u + 1u;
+        bytes = ctx * kv_dim * 2u * 2u;                        /* K + V, f16 */
+        bytes += ctx * DS4_N_INDEXER_HEAD_DIM * sizeof(float); /* ik cache */
+        bytes += n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u;    /* block keys */
+    }
+    return engine_size_mul_sat(bytes > SIZE_MAX ? SIZE_MAX : (size_t)bytes,
+                               sessions);
+}
+
+/* Per-tier VRAM the Qwen graph reserves on EVERY tier: the chunked-prefill
+ * workspace (replicated per tier) x session count.  The per-layer KV/state is
+ * charged separately (engine_qwen4_per_layer_kv_bytes_planner) so it is priced
+ * once on the owning tier rather than on every tier. */
+static size_t engine_qwen4_workspace_bytes(const ds4_engine *e) {
+    const int est_ctx = (e && e->placement_ctx_hint > 0)
+        ? e->placement_ctx_hint : 4096;
+    const uint32_t ctx = (uint32_t)est_ctx;
+    /* Mirror the graph's effective chunk (qwen4_graph_alloc / session_create). */
+    uint32_t cap;
+    if (e && e->prefill_chunk && e->prefill_chunk < ctx) {
+        cap = e->prefill_chunk;
+    } else {
+#if defined(DS4_HAS_QWEN4_GPU)
+        cap = qwen4_prefill_chunk_tokens(ctx);
+#else
+        cap = ctx < 8192u ? ctx : 8192u;  /* non-GPU build: matches the default */
+#endif
+    }
+    const uint64_t per_session =
+        engine_qwen4_workspace_formula(ctx, cap, e && e->glm_mtp);
+    return engine_size_mul_sat(
+        per_session > SIZE_MAX ? SIZE_MAX : (size_t)per_session,
+        engine_placement_session_count(e));
+}
+
 /* Per-used-tier Class-P graph overhead estimate. Mirrors the
  * `*_by_tier[t]` allocations in
  * metal_graph_alloc_raw_cap (ds4.c:10664-10686 + 10760-10800 + 10806-10816
@@ -61225,15 +61544,12 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
  * Visible in both GPU and DS4_NO_GPU builds. */
 static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     if (ds4_model_is_qwen4()) {
-        /* Qwen currently uses one device and independent session workspaces.
-         * Reserve its whole graph here, not DeepSeek's per-layer KV layout. */
-        const int ctx = e && e->placement_ctx_hint > 0 ?
-            e->placement_ctx_hint : 4096;
-        const ds4_context_memory mem = ds4_context_memory_estimate_with_prefill(
-                DS4_BACKEND_CUDA, ctx, e ? e->prefill_chunk : 0);
-        const size_t bytes = mem.total_bytes > SIZE_MAX ?
-            SIZE_MAX : (size_t)mem.total_bytes;
-        return engine_size_mul_sat(bytes, engine_placement_session_count(e));
+        /* Qwen: reserve the per-tier-replicated chunked-prefill workspace.
+         * The per-layer KV/state is charged per layer by
+         * engine_qwen4_per_layer_kv_bytes_planner (see engine_compute_entry_bytes),
+         * so it is not counted here.  On a large-BAR GPU this workspace is
+         * host-visible VRAM, so it must be reserved from the VRAM budget. */
+        return engine_qwen4_workspace_bytes(e);
     }
 #ifndef DS4_NO_GPU
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -66072,7 +66388,10 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    /* Qwen decodes through its own graph (ds4_session_eval); the DeepSeek
+     * greedy kernels below have no Qwen dispatch and failed every token. */
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s) ||
+        ds4_session_is_qwen4(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -69222,7 +69541,17 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         }
         ds4_gpu_tensor_free(g->logits);
         g->n_logit_rows = g->cap_tokens;
+#if defined(DS4_VULKAN_BUILD)
+        /* Logits are produced by the head tier and read once per token by the
+         * host: device-local there, read back through GTT staging.  A host-mapped
+         * VRAM-BAR row of ~1 MB costs about a second per token at BAR read rates. */
+        extern ds4_gpu_tensor *ds4_vulkan_tensor_alloc_device_local_on(int tier, uint64_t bytes);
+        g->logits = ds4_vulkan_tensor_alloc_device_local_on(
+            g->multi_tier && g->placement ? g->placement[DS4_N_LAYER + 1u] : 0,
+            (uint64_t)g->n_logit_rows * DS4_N_VOCAB * sizeof(float));
+#else
         g->logits = qwen4_graph_alloc_f32((uint64_t)g->n_logit_rows * DS4_N_VOCAB);
+#endif
         if (!g->logits) {
             qwen4_graph_free(g); free(g); fclose(lf);
             return 1;
@@ -70735,9 +71064,19 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
 
     if (ds4_model_is_qwen4()) {
         /* Vision weights are shared; the disk-only n-grams above are not
-         * resident. Session caches/scratch are reserved together per tier. */
+         * resident.  Charge the per-layer KV/state here so the packer prices
+         * it on the owning tier; the replicated chunked-prefill workspace is
+         * reserved separately by engine_per_tier_graph_overhead_bytes. */
         out[0] = out[0] > SIZE_MAX - e->vision_model.size ?
             SIZE_MAX : out[0] + e->vision_model.size;
+        const int est_ctx = (e->placement_ctx_hint > 0) ? e->placement_ctx_hint : 4096;
+        const uint32_t sessions = engine_placement_session_count(e);
+        for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+            const size_t cache_bytes =
+                engine_qwen4_per_layer_kv_bytes_planner(il, est_ctx, sessions);
+            out[il + 1] = out[il + 1] > SIZE_MAX - cache_bytes ?
+                SIZE_MAX : out[il + 1] + cache_bytes;
+        }
         return 0;
     }
 
@@ -70817,6 +71156,101 @@ static void engine_compute_layer_bytes(const ds4_engine *e,
             out[entry - 1].dense_bytes += t->bytes;
         }
     }
+}
+
+/* Qwen expert-pool budget for the dynamic tiers (progress_qwen.md, Round 4,
+ * Fase 1).  The pool owns the VRAM a dynamic tier has left after the dense
+ * weights, the embedding/output head it may hold, and the per-layer KV of the
+ * layers the plan puts there.  The budget is the residual of a dense-only
+ * probe placement, not the --gpu-vram auto 40% guess (zero with explicit
+ * budgets).  The KV is added to the layer costs first, so the planner charges
+ * it on the owner tier.  The second plan reproduces the probe placement: its
+ * dynamic-tier remainder equals the dense cost exactly. */
+static int engine_qwen4_plan_dynamic_pools(ds4_engine *e, ds4_mgpu_layer_bytes *lb,
+                                           ds4_mgpu_tier *tiers,
+                                           size_t embedding_bytes, size_t output_bytes,
+                                           char *err, size_t errlen) {
+    const int n_gpus = e->gpu_cfg.n_gpus;
+    const int est_ctx = (e->placement_ctx_hint > 0) ? e->placement_ctx_hint : 4096;
+    const uint32_t sessions = engine_placement_session_count(e);
+    /* Prefill stages a whole layer (experts included) into the dynamic tier's
+     * windows, device-local, one layer at a time: that peak is not part of the
+     * dense cost, so it is reserved on each dynamic tier as well. */
+    size_t stage_peak = 0;
+    for (int il = 0; il < (int)DS4_N_LAYER; il++) {
+        const size_t full = lb[il].dense_bytes + lb[il].expert_bytes;
+        if (full > stage_peak) stage_peak = full;
+    }
+    for (int il = 0; il < (int)DS4_N_LAYER; il++) {
+        lb[il].dense_bytes += engine_qwen4_per_layer_kv_bytes_planner(
+            (uint32_t)il, est_ctx, sessions);
+    }
+
+    ds4_mgpu_tier probe_tiers[DS4_LAYER_PACK_MAX_GPUS];
+    memcpy(probe_tiers, tiers, sizeof(probe_tiers));
+    for (int d = 0; d < n_gpus; d++) {
+        probe_tiers[d].expert_cache_bytes = probe_tiers[d].mode == 1 ? stage_peak : 0;
+    }
+    /* This placement is the final one: the pool is the residue after it, so
+     * no second plan can disagree with the budget the pool was sized from. */
+    if (ds4_mgpu_plan(NULL, probe_tiers, n_gpus, lb, (int)DS4_N_LAYER,
+                      embedding_bytes, output_bytes, e->placement, err, errlen) != 0) {
+        return 1;
+    }
+
+    size_t used[DS4_LAYER_PACK_MAX_GPUS];
+    memset(used, 0, sizeof(used));
+    for (int il = 0; il < (int)DS4_N_LAYER; il++) {
+        const int d = e->placement[il + 1];
+        if (d >= 0 && d < n_gpus) used[d] += lb[il].dense_bytes;
+    }
+    if (e->placement[0] >= 0 && e->placement[0] < n_gpus) used[e->placement[0]] += embedding_bytes;
+    if (e->placement[DS4_N_LAYER + 1] >= 0 && e->placement[DS4_N_LAYER + 1] < n_gpus) {
+        used[e->placement[DS4_N_LAYER + 1]] += output_bytes;
+    }
+
+    for (int d = 0; d < n_gpus; d++) {
+        size_t reserve = 0;
+        size_t pool = 0;
+        if (tiers[d].mode == 1) {
+            const size_t free_bytes = tiers[d].budget_bytes > used[d]
+                                    ? tiers[d].budget_bytes - used[d] : 0;
+            /* The final plan reserves everything but the dense cost, so its
+             * dynamic-tier remainder equals `used` and the placement is the one
+             * the probe found. */
+            reserve = free_bytes;
+            pool = free_bytes > stage_peak ? free_bytes - stage_peak : 0;
+            if (pool == 0) {
+                fprintf(stderr,
+                        "ds4: Qwen dynamic tier %d (GPU%d) has no VRAM left for the "
+                        "expert pool after its dense layers (%.2f GiB used of %.2f GiB)\n",
+                        d, e->gpu_cfg.device_indices[d],
+                        (double)used[d] / 1073741824.0,
+                        (double)tiers[d].budget_bytes / 1073741824.0);
+            }
+        }
+        tiers[d].expert_cache_bytes = reserve;
+        e->gpu_cfg.dev_expert_cache_bytes[d] = pool;
+    }
+#if defined(DS4_VULKAN_BUILD)
+    if (getenv("DS4_VULKAN_DEBUG_BUDGET") != NULL) {
+        const double gib = 1073741824.0;
+        fprintf(stderr, "ds4: DBG qwen pools: stage_peak=%.3f emb=%.3f out=%.3f GiB\n",
+                (double)stage_peak / gib, (double)embedding_bytes / gib,
+                (double)output_bytes / gib);
+        for (int d = 0; d < n_gpus; d++) {
+            fprintf(stderr, "ds4: DBG tier %d mode=%d budget=%.3f GiB used=%.3f GiB\n",
+                    d, tiers[d].mode, (double)tiers[d].budget_bytes / gib,
+                    (double)used[d] / gib);
+        }
+        for (int il = 0; il < (int)DS4_N_LAYER; il++) {
+            fprintf(stderr, "ds4: DBG layer %d tier %d dense+kv=%.3f GiB expert=%.3f GiB\n",
+                    il, e->placement[il + 1], (double)lb[il].dense_bytes / gib,
+                    (double)lb[il].expert_bytes / gib);
+        }
+    }
+#endif
+    return 0;
 }
 
 static bool engine_cuda_tp_decode_requested(const ds4_engine *e) {
@@ -71089,11 +71523,11 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
      * runs. The reservation flows into the packer via e->gpu_cfg (NOT
      * the caller's cfg) — see the budget loop below. */
     const size_t per_tier_overhead = engine_per_tier_graph_overhead_bytes(e);
-    /* Qwen's graph transients and KV are host-visible (GTT), not device-local,
-     * so they never consume VRAM: reserving them from the VRAM budget only
-     * starves the packer and leaves the static tiers' caches underfilled. */
-    const size_t per_tier_vram_overhead =
-        ds4_model_is_qwen4() ? 0 : per_tier_overhead;
+    /* Qwen reserves its replicated chunked-prefill workspace here; its KV and
+     * linear state are charged per layer by engine_compute_entry_bytes.  On a
+     * large-BAR GPU the workspace is host-visible VRAM, so it must come out of
+     * the VRAM budget (otherwise a large prefill chunk spills weights to GTT). */
+    const size_t per_tier_vram_overhead = per_tier_overhead;
     for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
         if (e->gpu_cfg.vram_bytes[d] <= per_tier_vram_overhead) {
             fprintf(stderr,
@@ -71163,30 +71597,56 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     int placement_rc;
     bool qwen_static = false;
     if (ds4_model_is_qwen4() && !cuda_tp_ep) {
-        /* The Qwen trunk (every layer + the head, minus the disk-only n-gram
-         * embeddings) often fits the GPUs' VRAM entirely.  Prefer an
-         * all-resident static layout -- no runtime expert streaming -- and
-         * fall back to the asymmetric slow=static/fast=dynamic plan only when
-         * it does not fit. */
-        int tmp[DS4_MAX_LAYER + 2];
-        if (ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg, tmp) == 0) {
-            int spill = 0;
-            for (int i = 0; i < (int)(DS4_N_LAYER + 2); i++) {
-                if (tmp[i] == DS4_LAYER_PACK_CPU) { spill = 1; break; }
-            }
-            if (!spill) {
+        if (!e->ssd_streaming) {
+            /* WITHOUT --ssd-streaming the only valid Qwen placement is
+             * all-resident: never fall back to dynamic expert streaming.  If
+             * the trunk does not fit, warn and keep the static layout (CPU
+             * spill -> the engine refuses cleanly). */
+            int tmp[DS4_MAX_LAYER + 2];
+            if (ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg, tmp) == 0) {
+                int spill = 0;
+                for (int i = 0; i < (int)(DS4_N_LAYER + 2); i++) {
+                    if (tmp[i] == DS4_LAYER_PACK_CPU) { spill = 1; break; }
+                }
                 memcpy(e->placement, tmp, sizeof(tmp));
-                for (int d = 0; d < e->gpu_cfg.n_gpus; d++) e->gpu_cfg.dev_mode[d] = 0;
+                for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+                    e->gpu_cfg.dev_mode[d] = 0;
+                    e->gpu_cfg.dev_expert_cache_bytes[d] = 0;
+                }
                 mgpu_dynamic = 0;
                 qwen_static = true;
-                fprintf(stderr, "ds4: Qwen multi-GPU: all layers resident "
-                        "(static, no expert streaming)\n");
+                if (!spill) {
+                    fprintf(stderr, "ds4: Qwen multi-GPU: all layers resident "
+                            "(static, no expert streaming)\n");
+                } else {
+                    fprintf(stderr,
+                            "ds4: WARNING Qwen without --ssd-streaming must be "
+                            "all-resident; the requested context/prefill chunk does "
+                            "not fit in VRAM and layers will spill (very slow). "
+                            "Enable --ssd-streaming (or lower -c / "
+                            "DS4_QWEN4_PREFILL_CHUNK).\n");
+                }
+            }
+        } else if (!mgpu_dynamic) {
+            /* WITH --ssd-streaming the all-resident plan is NOT allowed: Qwen
+             * must use the dynamic expert-streaming plan, so force at least one
+             * dynamic tier (the fast one, else the last) if the config left
+             * every tier static. */
+            int fast = -1;
+            for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+                if (e->gpu_cfg.dev_is_fast[d]) { fast = d; break; }
+            }
+            if (fast < 0) fast = e->gpu_cfg.n_gpus - 1;
+            if (fast >= 0) {
+                e->gpu_cfg.dev_mode[fast] = 1;
+                mgpu_dynamic = 1;
             }
         }
     }
     if (qwen_static) {
         placement_rc = 0;
-    } else if (!cuda_tp_ep && mgpu_dynamic) {
+    } else if (!cuda_tp_ep && mgpu_dynamic &&
+               (!ds4_model_is_qwen4() || e->ssd_streaming)) {
         /* Asymmetric multi-GPU (SPECS_MGPU.md): slow (static) tiers take the
          * first contiguous layers; the fast (dynamic) tier streams the rest. */
         ds4_mgpu_layer_bytes lb[DS4_MAX_LAYER];
@@ -71203,11 +71663,17 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
             tiers[d].pin_tokens = e->gpu_cfg.dev_pin_tokens[d];
         }
         char perr[160] = {0};
-        placement_rc = ds4_mgpu_plan(NULL, tiers, e->gpu_cfg.n_gpus, lb,
-                                     (int)DS4_N_LAYER,
-                                     entry_bytes[0],
-                                     entry_bytes[DS4_N_LAYER + 1],
-                                     e->placement, perr, sizeof(perr));
+        if (ds4_model_is_qwen4()) {
+            placement_rc = engine_qwen4_plan_dynamic_pools(e, lb, tiers, entry_bytes[0],
+                                                           entry_bytes[DS4_N_LAYER + 1],
+                                                           perr, sizeof(perr));
+        } else {
+            placement_rc = ds4_mgpu_plan(NULL, tiers, e->gpu_cfg.n_gpus, lb,
+                                         (int)DS4_N_LAYER,
+                                         entry_bytes[0],
+                                         entry_bytes[DS4_N_LAYER + 1],
+                                         e->placement, perr, sizeof(perr));
+        }
         if (placement_rc == 0) {
             fprintf(stderr, "ds4: multi-GPU asymmetric placement "
                     "(slow=static / fast=dynamic):\n");
@@ -71216,7 +71682,7 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
                         "  tier %d device %d %s cache=%.1fGiB pin=%d tokens=%d\n",
                         d, tiers[d].physical_index,
                         tiers[d].mode ? "dynamic" : "static",
-                        (double)tiers[d].expert_cache_bytes / 1073741824.0,
+                        (double)e->gpu_cfg.dev_expert_cache_bytes[d] / 1073741824.0,
                         tiers[d].pin_experts, tiers[d].pin_tokens);
             }
         } else {
@@ -72325,6 +72791,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     config_validate_model(&e->model);
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
 #ifdef DS4_HAS_QWEN4_GPU
+        /* Streaming machinery (per-layer model-window staging for prefill,
+         * expert-pool seeding for decode) is required only on the dynamic
+         * placement, which Qwen uses only with --ssd-streaming. */
         g_qwen4_streaming = e->ssd_streaming && e->backend == DS4_BACKEND_VULKAN;
 #endif
         /* Needed before the multi-tier per-device model map install below: the

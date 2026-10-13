@@ -711,8 +711,8 @@ static void test_qwen4_disk_ngram_accounting(void) {
     size_t weights = 0, one = 0, four = 0;
     CHECK(ds4_test_qwen4_placement(80u * gib, 1, &weights, &one) == 1,
           "Qwen fits without charging disk-only n-grams to VRAM");
-    CHECK(weights == 42u * gib + gib / 2u,
-          "Qwen entries contain resident text and vision weights, not DeepSeek KV");
+    CHECK(weights >= 42u * gib + gib / 2u && weights < 44u * gib,
+          "Qwen entries contain resident text/vision weights plus per-layer KV/state");
     CHECK(ds4_test_qwen4_placement(80u * gib, 4, &weights, &four) == 1,
           "Qwen four-session configuration fits");
     CHECK(one > 0 && four == 4u * one,

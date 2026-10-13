@@ -1790,6 +1790,36 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
     check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
+    /* Regression (prefill mm path): the reduce must read the shared expert from
+     * the dedicated buffer the shader declares at register(t10) =
+     * DS4_VK_BINDING_X0.  With shared != NULL the shader takes the flags-bit1
+     * path; if the host binds it elsewhere (W/t3) t10 stays unwritten and, under
+     * VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, the read is undefined - a huge,
+     * run-dependent value in blk.  Passing shared == NULL (all the earlier
+     * checks) never touches t10 and so never caught it. */
+    {
+        float *shout = rand_vec((uint64_t)T * E, 1.0f);
+        double *out_ref2 = malloc((uint64_t)T * E * sizeof(double));
+        require_ok(shout && out_ref2, "reduce shared allocation");
+        for (uint32_t t = 0; t < T; t++)
+            for (uint32_t d = 0; d < E; d++) {
+                double v = 0.0;
+                for (uint32_t s = 0; s < slots; s++)
+                    v += (double)w[t * slots + s] * part[((uint64_t)t * n_out + s) * E + d];
+                v += sigmoid_d(sgate[t]) * (double)shout[(uint64_t)t * E + d];
+                out_ref2[t * E + d] = v;
+            }
+        ds4_gpu_tensor *gshout = upload(shout, (uint64_t)T * E);
+        ds4_gpu_tensor *gout2 = upload(NULL, (uint64_t)T * E);
+        require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout2, gpart, gw, gsg, gshout, gR, ginj,
+                                                   T, slots, n_out, E, 4),
+                   "moe reduce with shared buffer");
+        check_tensor("moe reduce shared buffer (t10/X0) path", gout2, out_ref2,
+                     (uint64_t)T * E, 2e-5);
+        ds4_gpu_tensor_free(gout2);
+        ds4_gpu_tensor_free(gshout);
+        free(out_ref2); free(shout);
+    }
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: mid (+shared)", tier_name, E, F, slots, T);
     check_tensor(name, gmid, mid, (uint64_t)T * n_out * F, 2e-5);

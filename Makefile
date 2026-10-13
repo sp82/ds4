@@ -882,6 +882,12 @@ tests/test_vulkan_smoke: tests/test_vulkan_smoke.o ds4_vulkan.o ds4_vulkan_qwen.
 test-vulkan-smoke: tests/test_vulkan_smoke
 	./tests/test_vulkan_smoke
 
+tests/test_vram_bar_bw.o: tests/test_vram_bar_bw.c ds4_gpu.h
+	gcc $(CFLAGS) -I. -c -o $@ tests/test_vram_bar_bw.c
+
+tests/test_vram_bar_bw: tests/test_vram_bar_bw.o ds4_vulkan.o ds4_vulkan_qwen.o ds4_vulkan_compat.o ds4_vulkan_unavailable.o
+	g++ -std=c++17 -pthread -o $@ $^ -lvulkan -lm
+
 # --- Qwen3.8 kernel parity tests on the Vulkan backend (P0 harness) ---------
 # Same test source as the Metal/CUDA variants (tests/test_qwen4_kernels.c),
 # linked against the Vulkan backend instead of ds4_metal.o / ds4_cuda.o.

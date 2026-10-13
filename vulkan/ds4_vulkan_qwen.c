@@ -894,6 +894,18 @@ static uint64_t qwen4_moe_expert_row_bytes(uint32_t type, uint32_t k) {
                                                  : (uint64_t)k);
 }
 
+/* A model-window bind with range 0 means the offset is in neither the expert
+ * pool nor a staged window of this tier.  Dispatching it would read a zero
+ * binding (garbage or a GPUVM fault), so the MoE fails cleanly instead. */
+static int qwen4_bind_mapped(const struct ds4_vk_bind *b, const char *what,
+                             uint64_t offset) {
+    if (b->range != 0) return 1;
+    fprintf(stderr, "ds4: Vulkan Qwen MoE %s at model offset %llu is neither in "
+            "the expert pool nor in a staged model window of this tier\n",
+            what, (unsigned long long)offset);
+    return 0;
+}
+
 int ds4_gpu_qwen4_moe_mid_tensor(
     ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
     const void *model_map, uint64_t model_size, uint64_t gate_offset,
@@ -933,6 +945,10 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         }
         gbind = vulkan_bind_model(DS4_VK_BINDING_B, gate_offset, expert_bytes);
         ubind = vulkan_bind_model(DS4_VK_BINDING_C, up_offset, expert_bytes);
+        if (!qwen4_bind_mapped(&gbind, "gate experts", gate_offset) ||
+            !qwen4_bind_mapped(&ubind, "up experts", up_offset)) {
+            return 0;
+        }
     }
     uint64_t srb = 0u;
     if (has_shared) {
@@ -969,6 +985,10 @@ int ds4_gpu_qwen4_moe_mid_tensor(
                                         srb * ff_dim);
         binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_X1, shared_up_offset,
                                         srb * ff_dim);
+        if (!qwen4_bind_mapped(&binds[nb - 2], "shared gate", shared_gate_offset) ||
+            !qwen4_bind_mapped(&binds[nb - 1], "shared up", shared_up_offset)) {
+            return 0;
+        }
     } else {
         binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X0, x);
         binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X1, x);
@@ -1011,6 +1031,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
         if (!qwen4_range_ok(down_offset, expert_bytes, model_size)) return 0;
         wbind = vulkan_bind_model(DS4_VK_BINDING_B, down_offset, expert_bytes);
         wbind2 = wbind;
+        if (!qwen4_bind_mapped(&wbind, "down experts", down_offset)) return 0;
     }
     uint64_t srb = 0u;
     if (has_shared) {
@@ -1043,6 +1064,9 @@ int ds4_gpu_qwen4_moe_down_tensor(
     if (has_shared) {
         binds[nb++] = vulkan_bind_model(DS4_VK_BINDING_X0, shared_down_offset,
                                         srb * out_dim);
+        if (!qwen4_bind_mapped(&binds[nb - 1], "shared down", shared_down_offset)) {
+            return 0;
+        }
         binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X1, mid);
     } else {
         binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X0, mid);
@@ -1090,7 +1114,7 @@ int ds4_gpu_qwen4_moe_reduce_tensor(
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_B, weights);
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_C,
                                      shared_gate ? shared_gate : weights);
-    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_W,
+    binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_X0,
                                      shared ? shared : part);
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out);
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT2, n_hc ? R : out);

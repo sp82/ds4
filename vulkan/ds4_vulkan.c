@@ -236,6 +236,15 @@ static void vulkan_device_wait_impl(int reset_pool) {
  * worker uses vulkan_device_wait_impl(0) to drain without touching the pool. */
 static void vulkan_device_wait(void) { vulkan_device_wait_impl(1); }
 
+/* Drain the queue WITHOUT the descriptor-pool reset: the safe flavor for a
+ * mid-scope host readback.  The reset (vulkan_device_wait) would invalidate
+ * descriptor sets that later submissions still reference — the same corruption
+ * documented at the per-layer boundary in ds4.c — so the Qwen expert-pool seed
+ * uses this before reading the router selection back to the host. */
+extern "C" void ds4_vulkan_drain_no_pool_reset(void) {
+    vulkan_device_wait_impl(0);
+}
+
 VkPipeline g_pipes[DS4_VK_PIPE_COUNT];
 static VkShaderModule g_mods[DS4_VK_PIPE_COUNT];
 
@@ -2970,6 +2979,20 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc_device_local(uint64_t bytes) {
 static void vulkan_check_tensor_device(const char *op,
                                        const struct ds4_vulkan_tensor *h);
 
+/* Scope guard for one-shot transfers: a staged copy or a window release cannot
+ * run inside an open command scope, and a recorded but unsubmitted scope may
+ * still reference what is being released.  The guard submits and waits the
+ * open scope, and reopens it when it goes out of scope (every return path). */
+struct vk_scope_suspend {
+    bool open;
+    vk_scope_suspend() : open(g_commands_active) {
+        if (open) (void)ds4_gpu_end_commands();
+    }
+    ~vk_scope_suspend() {
+        if (open) (void)ds4_gpu_begin_commands();
+    }
+};
+
 static int vulkan_upload_to_tensor(ds4_gpu_tensor *t, uint64_t offset,
                                    const void *data, uint64_t bytes) {
     struct ds4_vulkan_tensor *h = vulkan_tensor_handle(t);
@@ -2978,14 +3001,18 @@ static int vulkan_upload_to_tensor(ds4_gpu_tensor *t, uint64_t offset,
     if (h->host_map) {
         /* A host-visible tensor is written through its persistent mapping, so
          * the selected tier is irrelevant (multi-GPU replicates pos3/ple_emb
-         * this way).  No device check needed. */
+         * this way).  No device check needed.  Submitted work may still read
+         * this memory: wait it out (no descriptor-pool reset) before writing. */
+        if (g_vulkan_device_dirty) vulkan_device_wait_impl(0);
         memcpy(h->host_map + h->offset + offset, data, bytes);
         return 1;
     }
     vulkan_check_tensor_device("upload", h);
-    if (g_commands_active) return 0;   /* staging path is one-shot only */
+    vk_scope_suspend suspend;   /* staging is one-shot: suspend an open scope */
     if (!vulkan_compute_init()) return 0;
-    ds4_gpu_tensor *st = ds4_gpu_tensor_alloc(bytes);
+    /* Transfer staging lives in GTT (host RAM), never in VRAM-BAR: CPU writes
+     * into a BAR mapping are slow and the copy then reads it back over PCIe. */
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
     if (!st) return 0;
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
     if (!sh || !sh->host_map) {
@@ -3015,6 +3042,8 @@ static int vulkan_upload_to_tensor(ds4_gpu_tensor *t, uint64_t offset,
     return 1;
 }
 
+static void vulkan_nt_copy_from_staging(void *dst, const void *src, uint64_t bytes);
+
 /* Tensor -> host download.  Direct memcpy when mapped, otherwise a one-shot
  * staging readback (DEVICE_LOCAL -> HOST_STAGING). */
 static int vulkan_download_from_tensor(const ds4_gpu_tensor *t, uint64_t offset,
@@ -3039,9 +3068,9 @@ static int vulkan_download_from_tensor(const ds4_gpu_tensor *t, uint64_t offset,
         return 1;
     }
     vulkan_check_tensor_device("download", h);
-    if (g_commands_active) return 0;
+    vk_scope_suspend suspend;   /* staged readback is one-shot */
     if (!vulkan_compute_init()) return 0;
-    ds4_gpu_tensor *st = ds4_gpu_tensor_alloc(bytes);
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
     if (!st) return 0;
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
     if (!sh || !sh->host_map) {
@@ -3059,7 +3088,7 @@ static int vulkan_download_from_tensor(const ds4_gpu_tensor *t, uint64_t offset,
         ds4_gpu_tensor_free(st);
         return 0;
     }
-    memcpy(data, sh->host_map, bytes);
+    vulkan_nt_copy_from_staging(data, sh->host_map, bytes);
     ds4_gpu_tensor_free(st);
     return 1;
 }
@@ -3285,6 +3314,32 @@ static int vulkan_upload_dma_to_tensor(ds4_gpu_tensor *t, uint64_t offset,
     return 1;
 }
 
+/* Same-tier copy between two BAR-mapped tensors as a GPU copy.  A CPU memmove
+ * over the VRAM-BAR runs at ~1-2 MB/s on these cards.  Inside an open scope the
+ * copy is recorded with ordering barriers; otherwise it is a one-shot submit. */
+static int vulkan_copy_same_tier_gpu(const struct ds4_vulkan_tensor *dh, uint64_t dst_offset,
+                                     const struct ds4_vulkan_tensor *sh, uint64_t src_offset,
+                                     uint64_t bytes) {
+    const VkBufferCopy region = { sh->offset + src_offset, dh->offset + dst_offset, bytes };
+    VkMemoryBarrier pre = {};
+    pre.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    pre.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    pre.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    VkMemoryBarrier post = {};
+    post.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    post.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    post.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    VkCommandBuffer cb = g_commands_active ? g_cmd[g_cmd_i] : vulkan_dispatch_begin();
+    if (!cb) return 0;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &pre, 0, NULL, 0, NULL);
+    vkCmdCopyBuffer(cb, sh->buffer, dh->buffer, 1, &region);
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &post, 0, NULL, 0, NULL);
+    if (g_commands_active) return 1;
+    return vulkan_submit_one_shot();
+}
+
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                         const ds4_gpu_tensor *src, uint64_t src_offset,
                         uint64_t bytes) {
@@ -3312,7 +3367,8 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
      * sides, and the upload carries the transfer->shader barrier. */
     if (g_vk_ctx_count > 1 && dh->tier != sh->tier &&
         sh->device_local && dh->device_local &&
-        bytes <= (64ull << 20)) {
+        bytes <= (64ull << 20) &&
+        getenv("DS4_QWEN4_NO_BOUNCE") == NULL) {
         const int copy_prof2 = getenv("DS4_QWEN4_PLE_PROF") != NULL;
         const double tb0 = copy_prof2 ? vulkan_now_ms() : 0.0;
         if (g_commands_active && !ds4_gpu_end_commands()) return 0;
@@ -3391,6 +3447,9 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     /* Host path: only when both sides are mapped (host-visible or UMA).
      * Otherwise fall back to upload/download staging. */
     if (dh->host_map && sh->host_map) {
+        if (dh->tier == sh->tier) {
+            return vulkan_copy_same_tier_gpu(dh, dst_offset, sh, src_offset, bytes);
+        }
         /* Multi-tier: a cross-device copy (the decode's per-layer hidden-state
          * bounce between tiers) must not read the source mapping while the
          * source device's last submitted commands may still be writing it, nor
@@ -3536,7 +3595,11 @@ static int vulkan_submit_one_shot(void) {
         return 0;
     }
     g_vulkan_device_dirty = 1;
-    vulkan_device_wait();
+    /* Debug (H3 discrimination): DS4_VULKAN_ONESHOT_NORESET keeps the wait but
+     * skips the descriptor-pool reset that vulkan_device_wait() also performs. */
+    static int noreset = -1;
+    if (noreset < 0) noreset = getenv("DS4_VULKAN_ONESHOT_NORESET") != NULL;
+    vulkan_device_wait_impl(noreset ? 0 : 1);
     vkResetCommandBuffer(g_cmd[g_cmd_i], 0);
     return 1;
 }
@@ -3829,7 +3892,8 @@ static int vulkan_worker_download(const ds4_gpu_tensor *t, uint64_t offset,
         return 1;
     }
     if (g_device == VK_NULL_HANDLE) return 0;
-    ds4_gpu_tensor *st = ds4_gpu_tensor_alloc(bytes);
+    /* Transfer staging in GTT, not VRAM-BAR (same rule as the upload path). */
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
     if (!st) return 0;
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
     if (!sh || !sh->host_map || !sh->buffer || !h->buffer) {
@@ -3846,7 +3910,7 @@ static int vulkan_worker_download(const ds4_gpu_tensor *t, uint64_t offset,
             : VK_SUCCESS;
         g_worker_fence_pending = 0;
         pthread_mutex_unlock(&g_worker_mutex);
-        if (rc == VK_SUCCESS) memcpy(data, sh->host_map, bytes);
+        if (rc == VK_SUCCESS) vulkan_nt_copy_from_staging(data, sh->host_map, bytes);
     }
     ds4_gpu_tensor_free(st);
     return ok;
@@ -3857,6 +3921,18 @@ static int vulkan_worker_download(const ds4_gpu_tensor *t, uint64_t offset,
  * thread at a clean command-scope boundary: it ends the open scope and
  * submits it directly with the fence (no separate empty submit), so the
  * worker knows the selection is readable exactly when the fence signals. */
+/* Verifica A (progress_qwen.md, 2026-10-12): the readback fence is shared by the
+ * submissions of both CB slots, and the slot still points at the previous
+ * submission.  Resetting it before that submission completed lets the next
+ * vulkan_cb_acquire wait a fence that tracks a different submit, so a CB can be
+ * re-begun while still executing.  Wait the previous submission first. */
+static VkResult vulkan_readback_fence_reuse(void) {
+    if (vkWaitForFences(g_device, 1, &g_readback_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        return VK_ERROR_UNKNOWN;
+    g_readback_fence_pending = 0;
+    return vkResetFences(g_device, 1, &g_readback_fence);
+}
+
 extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
     if (event_value) *event_value = 1;
     if (g_device == VK_NULL_HANDLE) return 1;
@@ -3884,7 +3960,7 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
                 ret = 0;
                 break;
             }
-        } else if (vkResetFences(g_device, 1, &g_readback_fence) != VK_SUCCESS) {
+        } else if (vulkan_readback_fence_reuse() != VK_SUCCESS) {
             ret = 0;
             break;
         }
@@ -3939,7 +4015,7 @@ extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
             ret = 0;
             break;
         }
-    } else if (vkResetFences(g_device, 1, &g_readback_fence) != VK_SUCCESS) {
+    } else if (vulkan_readback_fence_reuse() != VK_SUCCESS) {
         g_commands_active = false;
         ret = 0;
         break;
@@ -4087,12 +4163,15 @@ static struct ds4_vk_model_window *vulkan_model_window_for(
     }
     if (g_model_map_live && g_vulkan_model_map != NULL && g_device != VK_NULL_HANDLE &&
         offset <= g_vulkan_model_size && bytes <= g_vulkan_model_size - offset) {
-        /* Staging is one-shot and cannot append to an open command scope, so
-         * settle any in-flight scope first (mirrors vulkan_scratch_retire). */
-        if (g_commands_active) {
-            (void)ds4_gpu_flush_commands();
-        }
-        if (vulkan_add_model_window(g_vulkan_model_map, offset, bytes)) {
+        /* Staging is a one-shot copy and refuses to run inside an open scope.
+         * A flush is not enough: it reopens the scope, so the staging failed and
+         * the bind came back NULL (GPUVM fault).  End the scope around the
+         * staging instead, then reopen it. */
+        const int scope_open = g_commands_active;
+        if (scope_open && !ds4_gpu_end_commands()) return NULL;
+        const int staged = vulkan_add_model_window(g_vulkan_model_map, offset, bytes);
+        if (scope_open && !ds4_gpu_begin_commands()) return NULL;
+        if (staged) {
             for (uint32_t i = 0; i < g_model_window_count; i++) {
                 struct ds4_vk_model_window *w = &g_model_windows[i];
                 if (offset < w->base) continue;
@@ -4665,6 +4744,9 @@ extern "C" uint64_t ds4_vulkan_probe_vram_bytes(void) {
  * settle the GPU first, then reclaim the descriptor sets that the completed
  * scopes accumulated (the pool is only otherwise reset at synchronize). */
 static void vulkan_destroy_model_wrapper(void) {
+    /* A recorded scope may still reference these windows: submit and wait it
+     * before any window is released. */
+    vk_scope_suspend suspend;
     vulkan_device_wait();
     for (uint32_t i = 0; i < g_model_window_count; i++) {
         ds4_gpu_tensor_free(g_model_windows[i].tensor);
@@ -5143,6 +5225,7 @@ struct vulkan_par_range {
     uint64_t base;
     uint64_t size;
     VkBuffer buffer;
+    VkDeviceMemory mem;
 };
 
 struct vulkan_par_job {
@@ -5210,8 +5293,14 @@ static void *vulkan_par_job_main(void *arg) {
     VkDevice dev = c->device;
     const uint32_t dmem = c->is_uma ? c->uma_mem_type
                                     : c->device_local_mem_type;
-    const uint32_t hmem = c->host_visible_mem_type != UINT32_MAX
-                          ? c->host_visible_mem_type : 0u;
+    /* Staging lives in host RAM (GTT), never in the device-local heap.  On a
+     * large-BAR GPU the host-visible type is VRAM: one staging copy per tensor
+     * would be a transient VRAM peak the packer does not reserve. */
+    const bool stage_vram = getenv("DS4_VULKAN_CACHE_STAGE_VRAM") != NULL;
+    const uint32_t hmem = (!stage_vram && c->host_ram_mem_type != UINT32_MAX)
+                          ? c->host_ram_mem_type
+                          : (c->host_visible_mem_type != UINT32_MAX
+                                 ? c->host_visible_mem_type : 0u);
     j->ok = 1;
 
     VkCommandPoolCreateInfo pci = {};
@@ -5308,6 +5397,7 @@ static void *vulkan_par_job_main(void *arg) {
         j->out[j->n_out].base = r->source_offset;
         j->out[j->n_out].size = r->bytes;
         j->out[j->n_out].buffer = db;
+        j->out[j->n_out].mem = dm;
         j->n_out++;
     }
 
@@ -5390,21 +5480,38 @@ extern "C" int ds4_vulkan_device_cache_tensors_multi(
             "parallel weight cache load: %.1f ms across %d tiers (parallel)\n",
             load_ms, launched);
 
-    for (int i = 0; i < launched && rc == 0; i++) {
+    /* All-or-nothing: a failed tier must not leave other tiers half-loaded
+     * or leak their device buffers. */
+    int all_ok = rc == 0;
+    for (int i = 0; i < launched && all_ok; i++) {
         struct ds4_vk_dev_ctx *c = jobs[i].ctx;
         if (!jobs[i].ok) {
             fprintf(stderr, DS4_VULKAN_LOG_PREFIX
                     "device_cache_tensors_multi: tier %d staging failed\n",
                     jobs[i].tier);
-            rc = 1;
-            break;
+            all_ok = 0;
+        } else if (c->weight_cache_count + jobs[i].n_out > DS4_VK_MAX_MODEL_WINDOWS) {
+            fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                    "device_cache_tensors_multi: tier %d cache entries exceed %d\n",
+                    jobs[i].tier, DS4_VK_MAX_MODEL_WINDOWS);
+            all_ok = 0;
         }
+    }
+    if (!all_ok) {
+        for (int i = 0; i < launched; i++) {
+            struct ds4_vk_dev_ctx *c = jobs[i].ctx;
+            for (uint32_t k = 0; k < jobs[i].n_out; k++) {
+                vkDestroyBuffer(c->device, jobs[i].out[k].buffer, NULL);
+                vkFreeMemory(c->device, jobs[i].out[k].mem, NULL);
+            }
+            jobs[i].n_out = 0;
+        }
+        rc = 1;
+    }
+    for (int i = 0; i < launched && all_ok; i++) {
+        struct ds4_vk_dev_ctx *c = jobs[i].ctx;
         uint64_t total = 0;
         for (uint32_t k = 0; k < jobs[i].n_out; k++) {
-            if (c->weight_cache_count >= DS4_VK_MAX_MODEL_WINDOWS) {
-                rc = 1;
-                break;
-            }
             struct ds4_vk_model_window *w =
                 &c->weight_cache[c->weight_cache_count++];
             w->buffer = jobs[i].out[k].buffer;
@@ -8457,6 +8564,12 @@ static int vulkan_pool_seed_remap(struct ds4_vk_pool_layer *l,
         fprintf(stderr, "ds4: Vulkan debug pool seed: layer=%u n_ids=%u miss=%u\n",
                 (unsigned)(l - g_pool_layers), n_ids, n_missing);
     }
+    if (getenv("DS4_QWEN4_DEBUG") != NULL) {
+        fprintf(stderr,
+                "DBG remap pre layer=%u n_slots=%u n_used=%u miss=%u slot0=%d\n",
+                (unsigned)(l - g_pool_layers), l->n_slots, l->n_used, n_missing,
+                (int)l->slots[0]);
+    }
     /* Drain BEFORE writing the pool (a previous token's MoE may still read
      * it); the caller's read of the selection has already drained, so this
      * is normally ~0.  Skipped on the async worker path: the worker copy is
@@ -8489,6 +8602,54 @@ static int vulkan_pool_seed_remap(struct ds4_vk_pool_layer *l,
         if (!vulkan_upload_to_tensor(l->meta, 0, l->table_host,
                                      vulkan_pool_meta_bytes())) {
             return -1;
+        }
+        /* DS4_QWEN4_POOL_VERIFY: read the first stored expert back from the
+         * pool and compare it with the model-map bytes the store copied. */
+        if (!async && getenv("DS4_QWEN4_POOL_VERIFY") != NULL) {
+            const int32_t ve = missing[0];
+            const int vslot = vulkan_pool_slot_for(l, ve);
+            const uint8_t *gsrc =
+                vulkan_expert_src(table, table->part_mask_gate, ve);
+            const uint8_t *usrc =
+                vulkan_expert_src(table, table->part_mask_up, ve);
+            const uint8_t *dsrc =
+                vulkan_expert_src(table, table->part_mask_down, ve);
+            const uint64_t vb_g = l->gate_expert_bytes;
+            const uint64_t vb_d = l->down_expert_bytes;
+            const uint64_t bases[3] = {
+                vulkan_pool_gate_base(l) + (uint64_t)vslot * vb_g,
+                vulkan_pool_up_base(l) + (uint64_t)vslot * vb_g,
+                vulkan_pool_down_base(l) + (uint64_t)vslot * vb_d,
+            };
+            const uint64_t lens[3] = {vb_g, vb_g, vb_d};
+            const uint8_t *srcs[3] = {
+                gsrc + table->gate_offset + (uint64_t)ve * vb_g,
+                usrc + table->up_offset + (uint64_t)ve * vb_g,
+                dsrc + table->down_offset + (uint64_t)ve * vb_d,
+            };
+            const char *names[3] = {"gate", "up", "down"};
+            fprintf(stderr, "ds4: pool verify layer=%u expert=%d slot=%d\n",
+                    (unsigned)(l - g_pool_layers), ve, vslot);
+            for (int part = 0; part < 3; part++) {
+                uint8_t *got = (uint8_t *)malloc((size_t)lens[part]);
+                if (!got) continue;
+                const int rd = vulkan_download_from_tensor(
+                        l->tensor, bases[part], got, lens[part]);
+                uint64_t diff = (uint64_t)-1;
+                if (rd) {
+                    for (uint64_t b = 0; b < lens[part]; b++) {
+                        if (got[b] != srcs[part][b]) { diff = b; break; }
+                    }
+                }
+                fprintf(stderr,
+                        "ds4: pool verify %s: read=%d bytes=%llu match=%s "
+                        "(src=0x%02x pool=0x%02x @+%llu)\n",
+                        names[part], rd, (unsigned long long)lens[part],
+                        rd && diff == (uint64_t)-1 ? "YES" : "NO",
+                        srcs[part][0], got[0],
+                        diff == (uint64_t)-1 ? 0ull : (unsigned long long)diff);
+                free(got);
+            }
         }
     }
     if (getenv("DS4_VULKAN_DEBUG_POOL_HIT") != NULL) {
@@ -8610,6 +8771,20 @@ static void vulkan_require_layer_tier(uint32_t layer, const char *op) {
 
 static uint32_t g_qwen_moe_pool_layer = UINT32_MAX;
 
+/* A failed seed must not leave the MoE binding the previous layer's pool: the
+ * binds are keyed by g_qwen_moe_pool_layer, so the unseeded layer falls back to
+ * its own model window (or fails cleanly, see ds4_vulkan_qwen.c). */
+static void vulkan_qwen_moe_seed_failed(uint32_t layer, const char *op) {
+    g_qwen_moe_pool_layer = UINT32_MAX;
+    static int reported = 0;
+    if (!reported || getenv("DS4_QWEN4_DEBUG") != NULL) {
+        reported = 1;
+        fprintf(stderr, DS4_VULKAN_LOG_PREFIX
+                "%s failed: layer=%u tier=%d; the MoE falls back to the model window\n",
+                op, layer, g_vk_ctx_active);
+    }
+}
+
 extern "C" int ds4_vulkan_stream_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *ids, uint32_t n_selected) {
@@ -8622,13 +8797,17 @@ extern "C" int ds4_vulkan_stream_seed_selected(
     g_qwen_moe_pool_layer = table->layer;
     if (vulkan_weight_cache_covers_experts(table)) return 1;
     struct ds4_vk_pool_layer *l = vulkan_pool_layer(table->layer);
-    if (!l) return 0;
+    if (!l) {
+        vulkan_qwen_moe_seed_failed(table->layer, "pool layer lookup");
+        return 0;
+    }
     if (!vulkan_pool_layer_ensure(l, table->gate_expert_bytes,
                                   table->down_expert_bytes, n_selected,
                                   n_selected, 1)) {
         if (getenv("DS4_QWEN4_DEBUG") != NULL)
             fprintf(stderr, "DBG seed layer=%u pool ensure failed total=%.2fGiB\n",
                     table->layer, (double)g_pool_total_bytes / 1073741824.0);
+        vulkan_qwen_moe_seed_failed(table->layer, "pool ensure");
         return 0;
     }
     vulkan_pool_hotness_note_selected(l, ids, n_selected);
@@ -8636,8 +8815,14 @@ extern "C" int ds4_vulkan_stream_seed_selected(
     {
         const int rr = vulkan_pool_seed_remap(l, table, ids, n_selected, remap,
                                               0, DS4_GPU_EXPERT_PHASE_DECODE);
-        if (rr < 0 && getenv("DS4_QWEN4_DEBUG") != NULL)
-            fprintf(stderr, "DBG seed layer=%u remap failed\n", table->layer);
+        if (getenv("DS4_QWEN4_DEBUG") != NULL)
+            fprintf(stderr, "DBG seed layer=%u tier=%d rr=%d n_used=%u\n",
+                    table->layer, g_vk_ctx_active, rr, l->n_used);
+        if (rr < 0) {
+            if (getenv("DS4_QWEN4_DEBUG") != NULL)
+                fprintf(stderr, "DBG seed layer=%u remap failed\n", table->layer);
+            vulkan_qwen_moe_seed_failed(table->layer, "pool remap");
+        }
         return rr >= 0;
     }
 }
@@ -8704,12 +8889,16 @@ extern "C" int ds4_vulkan_stream_seed_batch(
     if (!vulkan_pool_layer_ensure(l, table->gate_expert_bytes,
                                   table->down_expert_bytes, n_ids,
                                   distinct, 1)) {
+        vulkan_qwen_moe_seed_failed(table->layer, "batch pool ensure");
         return 0;
     }
     vulkan_pool_hotness_note_selected(l, seen, distinct);
     int32_t remap[DS4_VK_POOL_SEL_CAP];
     if (vulkan_pool_seed_remap(l, table, ids, n_ids, remap, 0,
-                               DS4_GPU_EXPERT_PHASE_PREFILL) < 0) return 0;
+                               DS4_GPU_EXPERT_PHASE_PREFILL) < 0) {
+        vulkan_qwen_moe_seed_failed(table->layer, "batch pool remap");
+        return 0;
+    }
     return 1;
 }
 
@@ -8799,6 +8988,15 @@ extern "C" int vulkan_qwen_moe_pool_binds(
         struct ds4_vk_bind *sel_b, struct ds4_vk_bind *tbl_b) {
     if (!g_vulkan_ssd_streaming || g_qwen_moe_pool_layer == UINT32_MAX) return 0;
     struct ds4_vk_pool_layer *l = vulkan_pool_layer(g_qwen_moe_pool_layer);
+    if (getenv("DS4_QWEN4_DEBUG") != NULL) {
+        fprintf(stderr,
+                "DBG pool_binds which=%u layer=%u tier=%d active=%d tensor=%d meta=%d n_used=%u gate=%llu want=%llu\n",
+                which, g_qwen_moe_pool_layer, g_vk_ctx_active,
+                l ? l->active : -1, (l && l->tensor) ? 1 : 0,
+                (l && l->meta) ? 1 : 0, l ? l->n_used : 0u,
+                (unsigned long long)(l ? l->gate_expert_bytes : 0),
+                (unsigned long long)expert_bytes);
+    }
     if (!l || !l->active || !l->tensor || !l->meta || l->n_used == 0) return 0;
     if (which == 0) {
         if (l->gate_expert_bytes != expert_bytes) return 0;
