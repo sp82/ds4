@@ -82729,14 +82729,10 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     if (e->backend == DS4_BACKEND_CUDA) {
         return ds4_sessions_eval_batch_cuda(items, count, err, errlen);
     }
-#ifdef DS4_VULKAN_BUILD
-    if (e->backend == DS4_BACKEND_VULKAN) {
-        if (err && errlen) {
-            snprintf(err, errlen, "Vulkan batched decode is not implemented yet");
-        }
-        return 1;
-    }
-#endif
+    /* Vulkan: nessun grafo di batch multi-sessione nativo → si cade nel
+     * percorso serializzato sotto, con la stessa semantica di CUDA (Qwen) e
+     * CPU: N sessioni residenti, decode serializzato per sessione, prefille
+     * interlacciati. Vedi SPECS_SERVER_VULKAN_PARITY.md (V-P1). */
     if (ds4_sessions_eval_batch_metal_supported(items, count, e)) {
         return ds4_sessions_eval_batch_native(items, count, e, NULL, NULL, err, errlen);
     }
@@ -82813,15 +82809,9 @@ int ds4_sessions_eval_batch_with_prefill(
         return ds4_sessions_eval_batch_with_prefill_cuda(
                 items, count, prefill_session, prefill_prompt, err, errlen);
     }
-#ifdef DS4_VULKAN_BUILD
-    if (prefill_session->engine->backend == DS4_BACKEND_VULKAN) {
-        if (err && errlen) {
-            snprintf(err, errlen,
-                     "Vulkan mixed prefill decode is not implemented yet");
-        }
-        return 1;
-    }
-#endif
+    /* Vulkan: nessun batch misto prefill+decode nativo → si cade nel percorso
+     * serializzato sotto (ds4_session_sync + ds4_sessions_eval_batch), stessa
+     * semantica di CUDA/CPU. Vedi SPECS_SERVER_VULKAN_PARITY.md (V-P1). */
     if (ds4_sessions_eval_batch_with_prefill_metal_supported(
                 items, count, prefill_session, prefill_prompt)) {
         return ds4_sessions_eval_batch_with_prefill_metal(
