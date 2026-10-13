@@ -99,10 +99,10 @@ float qwen4_q2k_sub_dot(ByteAddressBuffer w, uint bbase, uint sub, uint xb) {
  * x[xb..xb+K).  `tid` is the thread index; one 32-value sub-block per thread
  * for the block formats, a strided slice for the element-wise formats. */
 float qwen4_dot_part(ByteAddressBuffer w, uint base, uint type, uint K,
-                     uint xb, uint tid) {
+                     uint xb, uint lane, uint wsize) {
     if (type == 0u || type == 1u || type == 30u) {
         float acc = 0.0f;
-        for (uint i = tid; i < K; i += 256u) {
+        for (uint i = lane; i < K; i += wsize) {
             float wv = (type == 0u) ? asfloat(w.Load(base + i * 4u))
                      : (type == 1u) ? f16_at(w, base + i * 2u)
                                     : bf16_at(w, base + i * 2u);
@@ -112,35 +112,34 @@ float qwen4_dot_part(ByteAddressBuffer w, uint base, uint type, uint K,
     }
     uint nsub = (type == 10u || type == 12u || type == 16u)
               ? ((K + 31u) >> 5u) : (K >> 5u);
-    if (tid >= nsub) return 0.0f;
-    const uint sb = tid;
-    const uint xb32 = xb + sb * 32u;
-    if (type == 16u)
-        return qwen4_iq2_sub_dot(w, base + (sb >> 3u) * 66u + 2u +
-                                    8u * (sb & 7u),
-                                 f16_at(w, base + (sb >> 3u) * 66u), xb32);
-    if (type == 10u)
-        return qwen4_q2k_sub_dot(w, base + (sb >> 3u) * 84u, sb & 7u, xb32);
-    if (type == 12u)
-        return q4k_sub_dot(w, base + (sb >> 3u) * 144u, sb & 7u, a_buf, xb32);
-    if (type == 39u)
-        return mxfp4_block_dot(w, base + sb * 17u, a_buf, xb32);
-    if (type == 8u) {
-        uint bb = base + sb * 34u;
-        float d = q8_scale_at(w, bb);
-        float acc = 0.0f;
-        for (uint i = 0u; i < 32u; i++)
-            acc += d * (float)q8_s8_at(w, bb, i) * a_buf[xb32 + i];
-        return acc;
-    }
-    /* Q4_0 */
-    uint bb = base + sb * 18u;
-    float d = f16_at(w, bb);
     float acc = 0.0f;
-    for (uint j = 0u; j < 16u; j++) {
-        uint packed = q8_byte_at(w, bb + 2u, j);
-        acc += d * ((float)(packed & 0xfu) - 8.0f) * a_buf[xb32 + j];
-        acc += d * ((float)(packed >> 4u) - 8.0f) * a_buf[xb32 + j + 16u];
+    for (uint sb = lane; sb < nsub; sb += wsize) {
+        const uint xb32 = xb + sb * 32u;
+        if (type == 16u)
+            acc += qwen4_iq2_sub_dot(w, base + (sb >> 3u) * 66u + 2u +
+                                        8u * (sb & 7u),
+                                     f16_at(w, base + (sb >> 3u) * 66u), xb32);
+        else if (type == 10u)
+            acc += qwen4_q2k_sub_dot(w, base + (sb >> 3u) * 84u, sb & 7u, xb32);
+        else if (type == 12u)
+            acc += q4k_sub_dot(w, base + (sb >> 3u) * 144u, sb & 7u, a_buf, xb32);
+        else if (type == 39u)
+            acc += mxfp4_block_dot(w, base + sb * 17u, a_buf, xb32);
+        else if (type == 8u) {
+            uint bb = base + sb * 34u;
+            float d = q8_scale_at(w, bb);
+            for (uint i = 0u; i < 32u; i++)
+                acc += d * (float)q8_s8_at(w, bb, i) * a_buf[xb32 + i];
+        } else {
+            /* Q4_0 */
+            uint bb = base + sb * 18u;
+            float d = f16_at(w, bb);
+            for (uint j = 0u; j < 16u; j++) {
+                uint packed = q8_byte_at(w, bb + 2u, j);
+                acc += d * ((float)(packed & 0xfu) - 8.0f) * a_buf[xb32 + j];
+                acc += d * ((float)(packed >> 4u) - 8.0f) * a_buf[xb32 + j + 16u];
+            }
+        }
     }
     return acc;
 }
@@ -181,38 +180,30 @@ void moe_mid(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
         base0 = ((uint)e * M + row0) * params.ratio;
     }
 
-    float ga[MOE_NR], ua[MOE_NR];
-    [unroll] for (uint r = 0u; r < MOE_NR; r++) { ga[r] = 0.0f; ua[r] = 0.0f; }
-    [unroll] for (uint r = 0u; r < MOE_NR; r++) {
-        if (row0 + r >= M) break;
+    const uint wsize = WaveGetLaneCount();
+    const uint nsg = max(1u, 256u / wsize);
+    const uint sg = tid / wsize;
+    const uint lane = tid - sg * wsize;
+
+    for (uint rr = sg; rr < MOE_NR; rr += nsg) {
+        const uint row = row0 + rr;
+        if (row >= M) break;
+        float ga, ua;
         if (use_shared) {
-            ga[r] = qwen4_dot_part(sh0_buf, base0 + r * params.index, params.blocks, K, xb, tid);
-            ua[r] = qwen4_dot_part(sh1_buf, base0 + r * params.index, params.blocks, K, xb, tid);
+            ga = qwen4_dot_part(sh0_buf, base0 + rr * params.index,
+                                params.blocks, K, xb, lane, wsize);
+            ua = qwen4_dot_part(sh1_buf, base0 + rr * params.index,
+                                params.blocks, K, xb, lane, wsize);
         } else {
-            uint base = base0 + r * params.ratio;
-            ga[r] = qwen4_dot_part(w_buf, base, params.rsvd3, K, xb, tid);
-            ua[r] = qwen4_dot_part(up_w_buf, base, params.rsvd3, K, xb, tid);
+            const uint base = base0 + rr * params.ratio;
+            ga = qwen4_dot_part(w_buf, base, params.rsvd3, K, xb, lane, wsize);
+            ua = qwen4_dot_part(up_w_buf, base, params.rsvd3, K, xb, lane, wsize);
         }
+        ga = WaveActiveSum(ga);
+        ua = WaveActiveSum(ua);
+        if (WaveIsFirstLane())
+            out4_buf[pair * M + row] = qwen4_silu(ga) * ua;
     }
-    [unroll] for (uint r = 0u; r < MOE_NR; r++) {
-        moe_gate_red[r][tid] = ga[r];
-        moe_up_red[r][tid] = ua[r];
-    }
-    GroupMemoryBarrierWithGroupSync();
-    for (uint st = 128u; st > 0u; st >>= 1u) {
-        if (tid < st) {
-            [unroll] for (uint r = 0u; r < MOE_NR; r++) {
-                moe_gate_red[r][tid] += moe_gate_red[r][tid + st];
-                moe_up_red[r][tid] += moe_up_red[r][tid + st];
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    if (tid == 0u)
-        [unroll] for (uint r = 0u; r < MOE_NR; r++)
-            if (row0 + r < M)
-                out4_buf[pair * M + row0 + r] =
-                    qwen4_silu(moe_gate_red[r][0]) * moe_up_red[r][0];
 }
 
 [numthreads(256, 1, 1)]
@@ -248,26 +239,22 @@ void moe_down(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
         base0 = ((uint)e * M + row0) * params.ratio;
     }
 
-    float a[MOE_NR];
-    [unroll] for (uint r = 0u; r < MOE_NR; r++) a[r] = 0.0f;
-    [unroll] for (uint r = 0u; r < MOE_NR; r++) {
-        if (row0 + r >= M) break;
-        if (use_shared) {
-            a[r] = qwen4_dot_part(sh0_buf, base0 + r * params.index, params.blocks, K, xb, tid);
-        } else {
-            a[r] = qwen4_dot_part(w_buf, base0 + r * params.ratio, params.rsvd3, K, xb, tid);
-        }
+    const uint wsize = WaveGetLaneCount();
+    const uint nsg = max(1u, 256u / wsize);
+    const uint sg = tid / wsize;
+    const uint lane = tid - sg * wsize;
+
+    for (uint rr = sg; rr < MOE_NR; rr += nsg) {
+        const uint row = row0 + rr;
+        if (row >= M) break;
+        float a;
+        if (use_shared)
+            a = qwen4_dot_part(sh0_buf, base0 + rr * params.index,
+                               params.blocks, K, xb, lane, wsize);
+        else
+            a = qwen4_dot_part(w_buf, base0 + rr * params.ratio, params.rsvd3,
+                               K, xb, lane, wsize);
+        a = WaveActiveSum(a);
+        if (WaveIsFirstLane()) out4_buf[pair * M + row] = a;
     }
-    [unroll] for (uint r = 0u; r < MOE_NR; r++) moe_down_red[r][tid] = a[r];
-    GroupMemoryBarrierWithGroupSync();
-    for (uint st = 128u; st > 0u; st >>= 1u) {
-        if (tid < st) {
-            [unroll] for (uint r = 0u; r < MOE_NR; r++)
-                moe_down_red[r][tid] += moe_down_red[r][tid + st];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    if (tid == 0u)
-        [unroll] for (uint r = 0u; r < MOE_NR; r++)
-            if (row0 + r < M) out4_buf[pair * M + row0 + r] = moe_down_red[r][0];
 }
