@@ -23,6 +23,9 @@ RWStructuredBuffer<float> out2_buf : register(u1);
 
 groupshared float hc_red[128];
 groupshared float hc_acc[4][128];
+/* hc_gate_mix: silu(lo/hc) hoisted once per workgroup (shared by all d). */
+#define HC_GATE_SLO_MAX 512
+groupshared float hc_gate_slo[HC_GATE_SLO_MAX];
 
 float qwen4_sigmoid(float x) {
     const float e = exp(-abs(x));
@@ -107,14 +110,59 @@ void hc_gate_mix(uint3 gid_grp : SV_GroupID, uint tid : SV_GroupThreadID) {
     uint t = gid_grp.y;
     uint E = params.in_dim, hc = params.out_dim, rank = params.index;
     uint type = params.rsvd3;
+
+    /* silu(lo[r]/hc) is independent of d: compute each r once per workgroup
+     * instead of once per (d, s, r).  Same formula -> same f32 values. */
+    const bool slo_ok = (rank <= (uint)HC_GATE_SLO_MAX);
+    if (slo_ok) {
+        for (uint r = tid; r < rank; r += 256u)
+            hc_gate_slo[r] = qwen4_silu(c_buf[t * rank + r] / (float)hc);
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (d >= E || t >= params.rows) return;
 
     float m = 0.0f;
     for (uint s = 0u; s < hc; s++) {
         float acc = 0.0f;
-        for (uint r = 0u; r < rank; r++)
-            acc += qwen4_dense_scalar(b_buf, (s * E + d) * rank + r, type) *
-                   qwen4_silu(c_buf[t * rank + r] / (float)hc);
+        const uint row = s * E + d;
+        if (slo_ok && type == 1u && (params.flags & 1u) != 0u &&
+            (rank & 7u) == 0u) {
+            /* f16 fast path: read 8 halves per 16-byte uint4 load instead of
+             * one f16_at per element (4-byte loads).  Same element order and
+             * the same f16->f32 values as qwen4_dense_scalar.  Only used when
+             * the weight row base is 16-byte aligned (host sets flags bit 0). */
+            const uint rowb = row * (rank * 2u);
+            for (uint r = 0u; r < rank; r += 8u) {
+                const uint4 wv = b_buf.Load4(rowb + r * 2u);
+                acc += f16tof32(wv.x & 0xffffu) * hc_gate_slo[r + 0u];
+                acc += f16tof32(wv.x >> 16u) * hc_gate_slo[r + 1u];
+                acc += f16tof32(wv.y & 0xffffu) * hc_gate_slo[r + 2u];
+                acc += f16tof32(wv.y >> 16u) * hc_gate_slo[r + 3u];
+                acc += f16tof32(wv.z & 0xffffu) * hc_gate_slo[r + 4u];
+                acc += f16tof32(wv.z >> 16u) * hc_gate_slo[r + 5u];
+                acc += f16tof32(wv.w & 0xffffu) * hc_gate_slo[r + 6u];
+                acc += f16tof32(wv.w >> 16u) * hc_gate_slo[r + 7u];
+            }
+        } else if (slo_ok && type == 8u && (rank & 31u) == 0u) {
+            /* q8_0 fast path: 32 elements per 34-byte block.  Hoist the block
+             * scale (one f16 load per 32 elements instead of per element) and
+             * read the quantised payload with q8_s8_at.  Element order and the
+             * per-element value are identical to qwen4_dense_scalar. */
+            const uint rb = (rank >> 5u) * 34u;
+            const uint rowb = row * rb;
+            for (uint b = 0u; b < (rank >> 5u); b++) {
+                const uint bb = rowb + b * 34u;
+                const float sc = q8_scale_at(b_buf, bb);
+                for (uint j = 0u; j < 32u; j++)
+                    acc += sc * (float)q8_s8_at(b_buf, bb, j) *
+                           hc_gate_slo[b * 32u + j];
+            }
+        } else {
+            for (uint r = 0u; r < rank; r++)
+                acc += qwen4_dense_scalar(b_buf, row * rank + r, type) *
+                       (slo_ok ? hc_gate_slo[r]
+                               : qwen4_silu(c_buf[t * rank + r] / (float)hc));
+        }
         m += qwen4_sigmoid(acc) * a_buf[(t * hc + s) * E + d];
     }
     out_buf[t * E + d] = m / (float)hc;

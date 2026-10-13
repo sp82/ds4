@@ -1317,12 +1317,22 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     if (rb == 0u) return 0;
     const uint64_t wb = rb * (uint64_t)n_embd * n_hc;
     if (!qwen4_range_ok(up_offset, wb, model_size)) return 0;
+    static int hc_dbg_once = 0;
+    if (!hc_dbg_once && getenv("DS4_QWEN4_HC_DEBUG") != NULL) {
+        hc_dbg_once = 1;
+        fprintf(stderr,
+                "ds4: hc_gate_mix type=%u T=%u E=%u hc=%u rank=%u (rb=%llu)\n",
+                weight_type, n_tokens, n_embd, n_hc, n_rank,
+                (unsigned long long)rb);
+    }
     struct ds4_vk_params p = {};
     p.rows = n_tokens;
     p.in_dim = n_embd;
     p.out_dim = n_hc;
     p.index = n_rank;
     p.rsvd3 = weight_type;
+    /* flags bit 0: f16 weight rows are 16-byte aligned -> vectorised path. */
+    p.flags = ((up_offset % 16u) == 0u && (n_rank % 8u) == 0u) ? 1u : 0u;
     struct ds4_vk_bind binds[DS4_VK_MAX_BINDS];
     uint32_t nb = 0;
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, xn);
