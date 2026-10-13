@@ -15888,7 +15888,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-server: %s\n", gpu_err);
             return 2;
         }
-        cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
+        if (skip_cuda) {
+            cfg.engine.backend = DS4_BACKEND_CPU;
+        } else if (cfg.engine.backend != DS4_BACKEND_VULKAN) {
+            /* Preserve an explicit Vulkan request, as the CLI does
+             * (ds4_cli.c, main branch). Without --vulkan/--backend vulkan
+             * this stays CUDA, exactly as before. */
+            cfg.engine.backend = DS4_BACKEND_CUDA;
+        }
         if (skip_cuda) {
             if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
         } else {
