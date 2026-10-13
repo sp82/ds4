@@ -137,8 +137,11 @@ typedef struct {
  * dense_bytes + expert_bytes per layer; dynamic tiers are charged
  * dense_bytes only (experts stream). tiers[] is consumed in order: the
  * caller orders it so the slow tiers come first (auto-layout) or matches the
- * JSON device order (explicit). cfg may be NULL (pure auto). Returns 0 on
- * success, nonzero on error (err populated). */
+ * JSON device order (explicit). With a single dynamic tier that tier takes
+ * every layer past the static prefix (historic behaviour); with several the
+ * remaining layers are split across all of them proportionally to their
+ * residual dense budget, as contiguous chunks. cfg may be NULL (pure auto).
+ * Returns 0 on success, nonzero on error (err populated). */
 int ds4_mgpu_plan(const ds4_mgpu_config *cfg,
                   const ds4_mgpu_tier *tiers, int n_tiers,
                   const ds4_mgpu_layer_bytes *layer_bytes, int n_layers,

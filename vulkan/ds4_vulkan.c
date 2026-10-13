@@ -2876,6 +2876,19 @@ static ds4_gpu_tensor *vulkan_tensor_alloc_host_ram(uint64_t bytes) {
     return vulkan_tensor_wrap_buffer(buffer, mem, map, bytes);
 }
 
+/* Transfer staging.  Default GTT (host RAM): the CPU side of the copy is fast
+ * and the GPU reads it over PCIe, whereas VRAM-BAR staging forces the CPU to
+ * write through the BAR (measured 0.7-3 GB/s) before an in-VRAM copy.
+ * DS4_VULKAN_STAGE_VRAM=1 forces the old VRAM-BAR staging so the two memory
+ * types can be A/B compared on the same binary. */
+static ds4_gpu_tensor *vulkan_tensor_alloc_staging(uint64_t bytes) {
+    static int stage_in_vram = -1;
+    if (stage_in_vram < 0)
+        stage_in_vram = getenv("DS4_VULKAN_STAGE_VRAM") != NULL;
+    return stage_in_vram ? ds4_gpu_tensor_alloc(bytes)
+                         : vulkan_tensor_alloc_host_ram(bytes);
+}
+
 /* Allocate a host-visible tensor on a specific logical tier and restore the
  * previously active tier.  Used by the engine's multi-tier allocations
  * (SPECS_MGPU.md M4). */
@@ -3012,7 +3025,7 @@ static int vulkan_upload_to_tensor(ds4_gpu_tensor *t, uint64_t offset,
     if (!vulkan_compute_init()) return 0;
     /* Transfer staging lives in GTT (host RAM), never in VRAM-BAR: CPU writes
      * into a BAR mapping are slow and the copy then reads it back over PCIe. */
-    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_staging(bytes);
     if (!st) return 0;
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
     if (!sh || !sh->host_map) {
@@ -3070,7 +3083,7 @@ static int vulkan_download_from_tensor(const ds4_gpu_tensor *t, uint64_t offset,
     vulkan_check_tensor_device("download", h);
     vk_scope_suspend suspend;   /* staged readback is one-shot */
     if (!vulkan_compute_init()) return 0;
-    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_staging(bytes);
     if (!st) return 0;
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
     if (!sh || !sh->host_map) {
@@ -3238,7 +3251,7 @@ static int vulkan_download_dma_from_tensor(const ds4_gpu_tensor *t,
     if (!vulkan_compute_init()) return 0;
     /* GTT (cached system RAM) staging: ds4_gpu_tensor_alloc prefers the
      * device BAR, and CPU reads of uncached BAR memory run at ~2-10 MB/s. */
-    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_staging(bytes);
     if (!st) return 0;
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
     if (!sh || !sh->host_map) {
@@ -3284,7 +3297,7 @@ static int vulkan_upload_dma_to_tensor(ds4_gpu_tensor *t, uint64_t offset,
     if (g_commands_active) return 0;
     if (!vulkan_compute_init()) return 0;
     /* GTT staging, see the download helper. */
-    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_staging(bytes);
     if (!st) return 0;
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
     if (!sh || !sh->host_map) {
@@ -3893,7 +3906,7 @@ static int vulkan_worker_download(const ds4_gpu_tensor *t, uint64_t offset,
     }
     if (g_device == VK_NULL_HANDLE) return 0;
     /* Transfer staging in GTT, not VRAM-BAR (same rule as the upload path). */
-    ds4_gpu_tensor *st = vulkan_tensor_alloc_host_ram(bytes);
+    ds4_gpu_tensor *st = vulkan_tensor_alloc_staging(bytes);
     if (!st) return 0;
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(st);
     if (!sh || !sh->host_map || !sh->buffer || !h->buffer) {
@@ -8447,7 +8460,7 @@ static int vulkan_pool_store_batch(struct ds4_vk_pool_layer *l,
         g_pool_staging = NULL;
     }
     if (!g_pool_staging) {
-        g_pool_staging = ds4_gpu_tensor_alloc(total);
+        g_pool_staging = vulkan_tensor_alloc_staging(total);
         if (!g_pool_staging) return 0;
     }
     struct ds4_vulkan_tensor *sh = vulkan_tensor_handle(g_pool_staging);

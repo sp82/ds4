@@ -721,10 +721,52 @@ static void test_qwen4_disk_ngram_accounting(void) {
           "Qwen still refuses a budget smaller than its resident weights");
 }
 
+/* Case 3 coverage: one static tier (prefix) + TWO dynamic tiers that must
+ * both participate.  The hardware cannot classify 2-fast/1-slow with a single
+ * link threshold, so the modes are driven directly here. */
+static void test_forced_two_dynamic_one_static(void) {
+    fprintf(stderr, "RUN: test_forced_two_dynamic_one_static\n");
+    ds4_test_fake_tensor tensors[256];
+    int n = build_synthetic_model(tensors, 256);
+    CHECK(n > 0, "synthetic model built");
+    if (n <= 0) return;
+
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 3;
+    for (int d = 0; d < 3; d++) cfg.device_indices[d] = d;
+    cfg.vram_bytes[0] = (size_t)26ull * 1024ull * 1024ull * 1024ull;
+    cfg.vram_bytes[1] = (size_t)40ull * 1024ull * 1024ull * 1024ull;
+    cfg.vram_bytes[2] = (size_t)40ull * 1024ull * 1024ull * 1024ull;
+    cfg.safety_margin_bytes = 0;
+    cfg.dev_mode[0] = 0;   /* static prefix */
+    cfg.dev_mode[1] = 1;   /* dynamic */
+    cfg.dev_mode[2] = 1;   /* dynamic */
+    cfg.dev_is_fast[1] = cfg.dev_is_fast[2] = 1;
+    cfg.dev_expert_cache_bytes[1] = (size_t)8ull * 1024ull * 1024ull * 1024ull;
+    cfg.dev_expert_cache_bytes[2] = (size_t)8ull * 1024ull * 1024ull * 1024ull;
+
+    int placement[DS4_N_ENTRIES];
+    int multi_tier = 0, n_entries = 0;
+    int rc = ds4_test_classify_multi_tier(tensors, n, &cfg,
+                                          placement, &multi_tier, &n_entries);
+    CHECK(rc == 0, "classify rc");
+    CHECK(multi_tier == 1, "multi_tier set");
+    int used[3] = {0, 0, 0};
+    for (int i = 1; i <= DS4_N_LAYER_LOCAL; i++) {
+        CHECK(placement[i] >= 0 && placement[i] < 3, "layer on a GPU tier");
+        CHECK(placement[i] >= placement[i - 1], "monotonic placement");
+        if (placement[i] >= 0 && placement[i] < 3) used[placement[i]]++;
+    }
+    CHECK(used[0] > 0, "static tier carries the prefix");
+    CHECK(used[1] > 0 && used[2] > 0, "both dynamic tiers carry layers");
+}
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
     test_forced_two_tier_no_spill();
+    test_forced_two_dynamic_one_static();
     test_cpu_spill();
     test_zero_budget_guard();
     test_placement_ctx_hint_scales();

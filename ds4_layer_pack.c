@@ -482,8 +482,14 @@ int ds4_mgpu_plan(const ds4_mgpu_config *cfg,
     }
 
     /* Auto: greedy monotonic fill.  Slow (static) tiers come first in the
-     * caller-provided order, so they take the first contiguous layers; the
-     * dynamic tier only pays for dense weights, so it absorbs the rest. */
+     * caller-provided order, so they take the first contiguous layers at
+     * dense+expert cost; the dynamic tiers only pay for dense weights, so
+     * they share the rest.  With a single dynamic tier this is the historic
+     * "static prefix / dynamic tail" plan.  With several dynamic tiers the
+     * remaining layers are split across them proportionally to their
+     * residual dense budget, as contiguous chunks, so every participating
+     * GPU carries dense compute (and an expert pool) instead of collapsing
+     * onto the first dynamic tier. */
     size_t rem[DS4_LAYER_PACK_MAX_GPUS];
     for (int t = 0; t < n_tiers; t++) {
         rem[t] = tiers[t].budget_bytes;
@@ -508,18 +514,71 @@ int ds4_mgpu_plan(const ds4_mgpu_config *cfg,
     placement_out[0] = 0;
     rem[0] -= embedding_bytes;
 
+    /* Phase 1: the leading static tiers take the first contiguous layers. */
     int t = 0;
-    for (int il = 0; il < n_layers; il++) {
-        const size_t cost = (tiers[t].mode == 0)
-            ? layer_bytes[il].dense_bytes + layer_bytes[il].expert_bytes
-            : layer_bytes[il].dense_bytes;
-        while (t < n_tiers && cost > rem[t]) t++;
-        if (t >= n_tiers) {
-            placement_out[il + 1] = DS4_LAYER_PACK_CPU;
-            continue;
-        }
+    int il = 0;
+    for (; il < n_layers; il++) {
+        const size_t cost =
+            layer_bytes[il].dense_bytes + layer_bytes[il].expert_bytes;
+        while (t < n_tiers && tiers[t].mode == 0 && cost > rem[t]) t++;
+        if (t >= n_tiers || tiers[t].mode != 0) break;  /* dynamic phase */
         placement_out[il + 1] = t;
         rem[t] -= cost;
+    }
+
+    /* Phase 2: share the remaining layers over the dynamic tiers.  Quotas
+     * are the integer largest-remainder split of the residual dense bytes, so
+     * budgets of equal size get an (almost) equal, contiguous layer block.
+     * A single dynamic tier reproduces the historic plan exactly. */
+    if (il < n_layers) {
+        int dyn[DS4_LAYER_PACK_MAX_GPUS];
+        int n_dyn = 0;
+        size_t dyn_rem_total = 0;
+        for (int d = t; d < n_tiers; d++) {
+            if (tiers[d].mode == 1) {
+                dyn[n_dyn] = d;
+                dyn_rem_total += rem[d];
+                n_dyn++;
+            }
+        }
+        const int left = n_layers - il;
+        if (n_dyn > 0 && dyn_rem_total > 0) {
+            int quota[DS4_LAYER_PACK_MAX_GPUS];
+            size_t frac[DS4_LAYER_PACK_MAX_GPUS];
+            int assigned = 0;
+            for (int j = 0; j < n_dyn; j++) {
+                const size_t num = (size_t)left * rem[dyn[j]];
+                quota[j] = (int)(num / dyn_rem_total);
+                frac[j] = num % dyn_rem_total;
+                assigned += quota[j];
+            }
+            while (assigned < left) {
+                int best = 0;
+                for (int j = 1; j < n_dyn; j++) {
+                    if (frac[j] > frac[best]) best = j;
+                }
+                quota[best]++;
+                frac[best] = 0;   /* consumed: never picked again */
+                assigned++;
+            }
+            int pos = il;
+            for (int j = 0; j < n_dyn && pos < n_layers; j++) {
+                const int d = dyn[j];
+                int cnt = quota[j];
+                while (cnt > 0 && pos < n_layers) {
+                    const size_t cost = layer_bytes[pos].dense_bytes;
+                    if (cost > rem[d]) break;   /* tier full: next one */
+                    placement_out[pos + 1] = d;
+                    rem[d] -= cost;
+                    pos++;
+                    cnt--;
+                }
+                /* Carry any unused quota forward so a heterogeneous layer
+                 * still finds room on a later dynamic tier instead of
+                 * spilling off the plan while budget remains. */
+                if (j + 1 < n_dyn) quota[j + 1] += cnt;
+            }
+        }
     }
     placement_out[n_layers + 1] = head_tier;
     return 0;

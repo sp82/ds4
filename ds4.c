@@ -60332,7 +60332,6 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ple_prof && now_sec() - tsw0 > 0.001)
             fprintf(stderr, "ds4: switch layer=%u: %.1f ms\n", il,
                     (now_sec() - tsw0) * 1000.0);
-        if (!qwen4_switch_layer_tier(g, il, T)) { ok = false; break; }
         /* Static decode map: the per-layer scopes would otherwise overlap
          * across submissions and RADV does not order shader writes against
          * the next submission's reads (a barrier inside the next CB does not
@@ -69541,17 +69540,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         }
         ds4_gpu_tensor_free(g->logits);
         g->n_logit_rows = g->cap_tokens;
-#if defined(DS4_VULKAN_BUILD)
-        /* Logits are produced by the head tier and read once per token by the
-         * host: device-local there, read back through GTT staging.  A host-mapped
-         * VRAM-BAR row of ~1 MB costs about a second per token at BAR read rates. */
-        extern ds4_gpu_tensor *ds4_vulkan_tensor_alloc_device_local_on(int tier, uint64_t bytes);
-        g->logits = ds4_vulkan_tensor_alloc_device_local_on(
-            g->multi_tier && g->placement ? g->placement[DS4_N_LAYER + 1u] : 0,
-            (uint64_t)g->n_logit_rows * DS4_N_VOCAB * sizeof(float));
-#else
         g->logits = qwen4_graph_alloc_f32((uint64_t)g->n_logit_rows * DS4_N_VOCAB);
-#endif
         if (!g->logits) {
             qwen4_graph_free(g); free(g); fclose(lf);
             return 1;
@@ -71597,49 +71586,74 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     int placement_rc;
     bool qwen_static = false;
     if (ds4_model_is_qwen4() && !cuda_tp_ep) {
+        /* Probe the all-resident (static, no streaming) layout once: it tells
+         * us whether the model fits entirely in VRAM at the requested
+         * context/prefill chunk, which drives both the no-streaming refusal
+         * and the informative notice when streaming is unnecessary. */
+        int resident_tmp[DS4_MAX_LAYER + 2];
+        const bool resident_ok =
+            ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg,
+                                        resident_tmp) == 0;
+        int resident_spill = 0;
+        if (resident_ok) {
+            for (int i = 0; i < (int)(DS4_N_LAYER + 2); i++) {
+                if (resident_tmp[i] == DS4_LAYER_PACK_CPU) {
+                    resident_spill = 1;
+                    break;
+                }
+            }
+        }
         if (!e->ssd_streaming) {
             /* WITHOUT --ssd-streaming the only valid Qwen placement is
              * all-resident: never fall back to dynamic expert streaming.  If
-             * the trunk does not fit, warn and keep the static layout (CPU
-             * spill -> the engine refuses cleanly). */
-            int tmp[DS4_MAX_LAYER + 2];
-            if (ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg, tmp) == 0) {
-                int spill = 0;
-                for (int i = 0; i < (int)(DS4_N_LAYER + 2); i++) {
-                    if (tmp[i] == DS4_LAYER_PACK_CPU) { spill = 1; break; }
-                }
-                memcpy(e->placement, tmp, sizeof(tmp));
-                for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
-                    e->gpu_cfg.dev_mode[d] = 0;
-                    e->gpu_cfg.dev_expert_cache_bytes[d] = 0;
-                }
-                mgpu_dynamic = 0;
-                qwen_static = true;
-                if (!spill) {
-                    fprintf(stderr, "ds4: Qwen multi-GPU: all layers resident "
-                            "(static, no expert streaming)\n");
-                } else {
-                    fprintf(stderr,
-                            "ds4: WARNING Qwen without --ssd-streaming must be "
-                            "all-resident; the requested context/prefill chunk does "
-                            "not fit in VRAM and layers will spill (very slow). "
-                            "Enable --ssd-streaming (or lower -c / "
-                            "DS4_QWEN4_PREFILL_CHUNK).\n");
-                }
+             * the trunk does not fit, refuse upfront with an explicit message
+             * instead of silently producing a CPU-spill layout. */
+            if (!resident_ok || resident_spill) {
+                fprintf(stderr,
+                        "ds4: Qwen without --ssd-streaming is all-resident only, "
+                        "but the model does not fit in VRAM at the requested "
+                        "context/prefill chunk. Enable --ssd-streaming to stream "
+                        "experts from disk, or lower -c / DS4_QWEN4_PREFILL_CHUNK "
+                        "so the trunk fits.\n");
+                return -1;
             }
-        } else if (!mgpu_dynamic) {
-            /* WITH --ssd-streaming the all-resident plan is NOT allowed: Qwen
-             * must use the dynamic expert-streaming plan, so force at least one
-             * dynamic tier (the fast one, else the last) if the config left
-             * every tier static. */
-            int fast = -1;
+            memcpy(e->placement, resident_tmp, sizeof(resident_tmp));
             for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
-                if (e->gpu_cfg.dev_is_fast[d]) { fast = d; break; }
+                e->gpu_cfg.dev_mode[d] = 0;
+                e->gpu_cfg.dev_expert_cache_bytes[d] = 0;
             }
-            if (fast < 0) fast = e->gpu_cfg.n_gpus - 1;
-            if (fast >= 0) {
-                e->gpu_cfg.dev_mode[fast] = 1;
-                mgpu_dynamic = 1;
+            mgpu_dynamic = 0;
+            qwen_static = true;
+            fprintf(stderr, "ds4: Qwen multi-GPU: all layers resident "
+                    "(static, no expert streaming)\n");
+        } else {
+            /* --ssd-streaming requested.  If the whole model would fit
+             * all-resident, say so (streaming experts from SSD is pure
+             * overhead then) but still run the dynamic/static streaming
+             * layout the user asked for. */
+            if (resident_ok && !resident_spill) {
+                fprintf(stderr,
+                        "ds4: note: Qwen fits entirely in VRAM at this "
+                        "context/prefill chunk; --ssd-streaming is then only "
+                        "overhead (experts would be re-read from SSD every "
+                        "token). Continuing with the dynamic/static streaming "
+                        "layout; drop --ssd-streaming for the faster "
+                        "all-resident plan.\n");
+            }
+            if (!mgpu_dynamic) {
+                /* WITH --ssd-streaming the all-resident plan is NOT allowed:
+                 * Qwen must use the dynamic expert-streaming plan, so force at
+                 * least one dynamic tier (the fast one, else the last) if the
+                 * config left every tier static. */
+                int fast = -1;
+                for (int d = 0; d < e->gpu_cfg.n_gpus; d++) {
+                    if (e->gpu_cfg.dev_is_fast[d]) { fast = d; break; }
+                }
+                if (fast < 0) fast = e->gpu_cfg.n_gpus - 1;
+                if (fast >= 0) {
+                    e->gpu_cfg.dev_mode[fast] = 1;
+                    mgpu_dynamic = 1;
+                }
             }
         }
     }

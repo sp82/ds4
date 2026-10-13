@@ -106,6 +106,76 @@ static void test_auto_plan(void) {
     CHECK(placement[8] == 3, "last layer on fast tier");
 }
 
+static int tier_histogram(const int *placement, int n_layers, int n_tiers,
+                          int *used) {
+    for (int i = 0; i < n_tiers; i++) used[i] = 0;
+    for (int i = 1; i <= n_layers; i++) {
+        if (placement[i] >= 0 && placement[i] < n_tiers) used[placement[i]]++;
+    }
+    return 0;
+}
+
+/* All tiers dynamic: the layer fill must spread over every dynamic tier, not
+ * collapse onto tier 0, and stay monotonic-contiguous. */
+static void test_auto_plan_all_dynamic(void) {
+    ds4_mgpu_tier tiers[3];
+    memset(tiers, 0, sizeof(tiers));
+    for (int i = 0; i < 3; i++) {
+        tiers[i].physical_index = i;
+        tiers[i].is_fast = (i == 2);
+        tiers[i].mode = 1;              /* dynamic */
+        tiers[i].budget_bytes = 1000;
+        tiers[i].pin_tokens = 3;
+    }
+    ds4_mgpu_layer_bytes lb[8];
+    for (int i = 0; i < 8; i++) { lb[i].dense_bytes = 10; lb[i].expert_bytes = 90; }
+
+    int placement[10];
+    char err[128] = {0};
+    int rc = ds4_mgpu_plan(NULL, tiers, 3, lb, 8, 50, 50, placement, err, sizeof(err));
+    CHECK(rc == 0, "all-dynamic plan rc");
+    int used[3];
+    tier_histogram(placement, 8, 3, used);
+    CHECK(used[0] > 0 && used[1] > 0 && used[2] > 0,
+          "every dynamic tier carries layers");
+    for (int i = 1; i <= 8; i++) {
+        CHECK(placement[i] >= 0 && placement[i] < 3, "layer on a dynamic tier");
+        CHECK(placement[i] >= placement[i - 1], "monotonic placement");
+    }
+    CHECK(placement[9] == 2, "output head on the last dynamic tier");
+}
+
+/* One static prefix + two dynamic tiers: the static tier takes the first
+ * contiguous layers, both dynamic tiers share the rest. */
+static void test_auto_plan_two_dynamic_one_static(void) {
+    ds4_mgpu_tier tiers[3];
+    memset(tiers, 0, sizeof(tiers));
+    tiers[0].physical_index = 0; tiers[0].is_fast = 0; tiers[0].mode = 0;
+    tiers[0].budget_bytes = 200; tiers[0].pin_experts = 1;
+    tiers[1].physical_index = 1; tiers[1].is_fast = 1; tiers[1].mode = 1;
+    tiers[1].budget_bytes = 1000;
+    tiers[2].physical_index = 2; tiers[2].is_fast = 1; tiers[2].mode = 1;
+    tiers[2].budget_bytes = 1000;
+
+    ds4_mgpu_layer_bytes lb[8];
+    for (int i = 0; i < 8; i++) { lb[i].dense_bytes = 10; lb[i].expert_bytes = 90; }
+
+    int placement[10];
+    char err[128] = {0};
+    int rc = ds4_mgpu_plan(NULL, tiers, 3, lb, 8, 50, 50, placement, err, sizeof(err));
+    CHECK(rc == 0, "mixed plan rc");
+    CHECK(placement[0] == 0, "embedding on static tier0");
+    CHECK(placement[1] == 0, "layer0 on static tier0");
+    int used[3];
+    tier_histogram(placement, 8, 3, used);
+    CHECK(used[0] > 0, "static tier carries the prefix");
+    CHECK(used[1] > 0 && used[2] > 0, "both dynamic tiers carry layers");
+    for (int i = 1; i <= 8; i++) {
+        CHECK(placement[i] >= placement[i - 1], "monotonic placement");
+    }
+    CHECK(placement[9] == 2, "output head on the last tier");
+}
+
 static void test_explicit_plan(void) {
     const char *json =
         "{\"placement\": \"explicit\", \"devices\": ["
@@ -136,6 +206,8 @@ int main(void) {
     test_parse_explicit();
     test_parse_errors();
     test_auto_plan();
+    test_auto_plan_all_dynamic();
+    test_auto_plan_two_dynamic_one_static();
     test_explicit_plan();
     if (g_fail) {
         fprintf(stderr, "=== FAILED (%d) ===\n", g_fail);
