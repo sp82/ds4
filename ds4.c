@@ -58360,6 +58360,13 @@ static int generate_glm_metal_argmax(
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 
+static uint64_t g_ngram_rows = 0, g_ngram_bytes = 0;
+static void qwen4_ngram_io_report(void) {
+    fprintf(stderr, "ds4: io[dbg] ngram rows=%llu read=%.2f MiB\n",
+            (unsigned long long)g_ngram_rows,
+            (double)g_ngram_bytes / 1048576.0);
+}
+
 static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     const ds4_tensor *t = m->ngram_tensor;
     if (!t || m->ngram_fd < 0 || !out || row >= t->dim[1] ||
@@ -58369,6 +58376,14 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     }
     uint8_t raw[320];
     const uint32_t bytes = (uint32_t)t->dim[0] * 2u;
+    {
+        static int io_dbg = -1;
+        if (io_dbg < 0) {
+            io_dbg = getenv("DS4_VULKAN_IO_DEBUG") != NULL;
+            if (io_dbg) atexit(qwen4_ngram_io_report);
+        }
+        if (io_dbg) { g_ngram_rows++; g_ngram_bytes += bytes; }
+    }
     const uint64_t offset = t->abs_offset + (uint64_t)row * bytes;
     uint32_t done = 0;
     while (done < bytes) {
@@ -60242,7 +60257,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     static int timing = -1;
     if (timing < 0) {
         const char *tv = getenv("DS4_QWEN4_TIMING");
-        timing = tv ? (atoi(tv) >= 2 ? 2 : 1) : 0;
+        timing = tv ? (atoi(tv) >= 3 ? 3 : (atoi(tv) >= 2 ? 2 : 1)) : 0;
     }
     /* Start the GPU while the host encodes the rest of the trunk. The
      * command queue preserves layer order; zero restores one submission.
@@ -60281,7 +60296,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
      * report GPU ms per group (adds sync overhead; diagnostics only) */
     double prof[6] = {0};
-    const bool prof_on = timing == 2 && T > 1u;
+    /* Timing == 3 profiles every forward (decode included): the per-stage
+     * summary then reports per-token host time.  Diagnostic only. */
+    const bool prof_on = (timing >= 3) || (timing == 2 && T > 1u);
     double prof_last = prof_on ? now_sec() : 0.0;
     /* P7 decode: stage the all-layers non-expert decode map ONCE.  The Vulkan
      * span setter destroys + re-uploads the windows on every call, so

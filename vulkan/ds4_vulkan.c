@@ -3701,7 +3701,8 @@ static void vulkan_ts_report(const char *tag) {
                                   (double)g_ts_period / 1e6;
                 const uint32_t p = g_ts_pipe[i];
                 fprintf(stderr, "ds4: gpu-pipe %-28s %.4f ms\n",
-                        p < 96 ? g_pipe_names[p] : "?", dt);
+                        p < (uint32_t)DS4_VK_PIPE_COUNT ? g_pipe_names[p]
+                                                        : "?", dt);
             }
         }
         g_ts_started = 0;
@@ -4780,11 +4781,24 @@ static void vulkan_destroy_model_wrapper(void) {
  * staging copy.  Returns 0 on allocation failure (the caller keeps the
  * previous windows); returns 1 when the window is too large to stage (the
  * streaming path covers it per layer instead). */
+static uint64_t g_io_win_calls = 0, g_io_win_bytes = 0;
+static void vulkan_io_report(void) {
+    fprintf(stderr, "ds4: io[dbg] window_staging calls=%llu staged=%.2f MiB\n",
+            (unsigned long long)g_io_win_calls,
+            (double)g_io_win_bytes / 1048576.0);
+}
+
 static int vulkan_add_model_window(const void *host_ptr, uint64_t base,
                                    uint64_t size) {
     if (g_device == VK_NULL_HANDLE || host_ptr == NULL || size == 0) return 0;
     if (size > DS4_VK_MAX_STAGED_WINDOW) return 1;
     if (g_model_window_count >= DS4_VK_MAX_MODEL_WINDOWS) return 0;
+    static int io_dbg = -1;
+    if (io_dbg < 0) {
+        io_dbg = getenv("DS4_VULKAN_IO_DEBUG") != NULL;
+        if (io_dbg) atexit(vulkan_io_report);
+    }
+    if (io_dbg) { g_io_win_calls++; g_io_win_bytes += size; }
 
     ds4_gpu_tensor *t = ds4_gpu_tensor_alloc_device_local(size);
     if (!t) return 0;
