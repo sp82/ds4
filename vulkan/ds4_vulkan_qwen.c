@@ -147,6 +147,21 @@ static int qwen4_dense_bind(ds4_gpu_tensor *out, struct ds4_vk_bind wbind,
     VkPipeline pipe = qwen4_dense_pipe(type, in_dim, &blocks);
     if (pipe == VK_NULL_HANDLE) return 0;
 
+    if (getenv("DS4_QWEN4_DENSE_DEBUG") != NULL) {
+        static uint32_t seen[64][3]; static int nseen = 0;
+        uint32_t key[3] = { type, in_dim, out_rows };
+        int found = 0;
+        for (int i = 0; i < nseen; i++)
+            if (seen[i][0] == key[0] && seen[i][1] == key[1] &&
+                seen[i][2] == key[2]) { found = 1; break; }
+        if (!found && nseen < 64) {
+            seen[nseen][0] = key[0]; seen[nseen][1] = key[1];
+            seen[nseen][2] = key[2]; nseen++;
+            fprintf(stderr, "ds4: dense type=%u T=%u in=%u out=%u\n", type,
+                    n_tokens, in_dim, out_rows);
+        }
+    }
+
     struct ds4_vk_params p = {};
     p.in_dim = in_dim;
     p.out_dim = out_rows;
@@ -157,7 +172,7 @@ static int qwen4_dense_bind(ds4_gpu_tensor *out, struct ds4_vk_bind wbind,
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_A, x);
     binds[nb++] = wbind;
     binds[nb++] = vulkan_bind_tensor(DS4_VK_BINDING_OUT, out);
-    /* matmul_q8_0_f32 tiles Q8F32_NR output rows per workgroup. */
+    /* matmul_q8_0_f32 tiles Q8F32_NR (=4) output rows per workgroup. */
     uint32_t gx = out_rows;
     if (type == 8u || type == 1u) gx = (out_rows + 3u) / 4u;
     return vulkan_dispatch(pipe, &p, sizeof(p), binds, nb, gx, n_tokens,

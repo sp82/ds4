@@ -3025,6 +3025,7 @@ typedef struct {
 static int bench_q8_small(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_q8_0_tensor(c->t[1], c->a->base, c->a->size, c->off[0], 2560, 48, c->t[0], 1); }
 static int bench_q8_big(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_q8_0_tensor(c->t[1], c->a->base, c->a->size, c->off[1], 2560, 6144, c->t[0], 1); }
 static int bench_q8_big2(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_q8_0_tensor(c->t[1], c->a->base, c->a->size, c->off[1], 2560, 6144, c->t[0], 2); }
+static int bench_q8_qwen(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_dense_mm_tensor(c->t[1], c->t[0], c->a->base, c->a->size, c->off[1], 8u, 1, 2560, 6144); }
 static int bench_combine(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_combine_tensor(c->t[2], c->t[0], c->t[3], 1, 2560, 4); }
 static int bench_hc_norm(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_norm_tensor(c->t[4], c->t[3], c->t[2], c->a->base, c->a->size, c->off[2], c->off[4], 1u, 1, 2560, 4, 4, 1e-6f); }
 static int bench_hc_down(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_f16_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 10240, 320, c->t[4], 1); }
@@ -3293,6 +3294,7 @@ static void bench_dispatch(arena_t *a) {
     bench_run("q8 gemv 48x2560", bench_q8_small, &c, 200);
     bench_run("q8 gemv 6144x2560 T=1", bench_q8_big, &c, 200);
     bench_run("q8 gemv 6144x2560 T=2", bench_q8_big2, &c, 200);
+    bench_run("q8 qwen dense 6144x2560 (decode path)", bench_q8_qwen, &c, 200);
     bench_run("hc_norm (+inject partials)", bench_hc_norm, &c, 200);
     bench_run("hc down gemv f16 320x10240", bench_hc_down, &c, 200);
     bench_run("hc_gate_mix f16", bench_hc_mix, &c, 200);
