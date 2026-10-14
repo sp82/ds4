@@ -90,6 +90,10 @@ __pycache__/
 /tests/test_q8_prefill_variants
 /vulkan/AGENTS.md
 /vulkan/docs/*.md
+# asset grafici dei docs (diagrammi draw.io e export): versionati solo in
+# /home/sp82/git/ds4-vulkan-docs, mai nel fork
+/vulkan/docs/*.drawio
+/vulkan/docs/*.drawio.png
 /vulkan/shaders/ds4_vulkan_shaders.inc
 /vkbench
 /kbench
